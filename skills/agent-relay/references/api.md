@@ -10,7 +10,8 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
 { "ok": true, "agents": 3, "tasks": 0,
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
-              "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4 } }
+              "maxOutputBytes": 262144, "maxTasks": 1000, "maxSessions": 500,
+              "maxActive": 4 } }
 ```
 
 `maxTimeoutMs` is `null` when no hard cap is configured.
@@ -39,7 +40,8 @@ Body:
 | --- | --- | --- |
 | `agentId` | yes | Must match a registry id. |
 | `input` | yes | Non-empty string; bounded by body and (for `command`) command-input limits. |
-| `sessionId` | no | ≤128 chars; correlation tag. Defaults to a new UUID. |
+| `sessionId` | no | ≤128 chars; correlation tag. Defaults to a new UUID. A session is bound to the first agent that used it; reusing it with another agent returns `409 session_agent_mismatch`. |
+| `sessionName` | no | ≤128 chars. Applied only when this call creates the session; rename later with `PATCH /v1/sessions/:id`. |
 | `requestId` | no | ≤128 chars; idempotency key scoped per agent. |
 | `timeoutMs` | no | Positive integer. Overrides the agent/global timeout; rejected if above `A2A_RELAY_MAX_TIMEOUT_MS`. |
 | `cwd` | no | Absolute or relative path. Must be inside the agent's `allowedRoots` (or equal to its `cwd`), else `400 cwd_not_allowed`. |
@@ -80,6 +82,33 @@ Returns `{ "tasks": [ ... ] }`.
 Cancels a `queued` or `running` task and returns it with status `cancelled`. Terminal
 tasks are returned unchanged.
 
+### `GET /v1/sessions`
+
+Lists sessions, most recently active first. A session is created automatically by the
+first task that uses its `sessionId`; it is bound to that task's agent and working
+directory. Query parameters:
+
+| Parameter | Notes |
+| --- | --- |
+| `agentId` | Filter to sessions that used this agent. |
+| `cwd` | Filter to sessions whose working directory is this path. |
+| `limit` | Positive integer, capped at 100 (default 20). |
+
+Returns `{ "sessions": [ ... ] }`. Each session has `id`, `name` (may be `null`),
+`agentId`, `cwd`, `summary` (the first task's input, ≤80 chars), `createdAt`,
+`updatedAt`, `lastTaskAt`, `lastStatus`, and `taskCount`. Sessions are in memory and
+disappear on restart; the store is capped at `A2A_RELAY_MAX_SESSIONS` (default 500),
+evicting the least recently active.
+
+### `GET /v1/sessions/:id`
+
+Returns one session. Unknown ids return `404 unknown_session`.
+
+### `PATCH /v1/sessions/:id`
+
+Renames a session. Body: `{ "name": "..." }` (a string of at most 128 characters; an
+empty string clears the name). Unknown fields return `400 unknown_field`.
+
 ### `POST /v1/admin/reload`
 
 Reloads the registry from disk without dropping in-memory tasks. Accepted only from
@@ -96,11 +125,11 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
-| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_wait`, `invalid_status`, `invalid_limit`, `configuration_error` | Malformed request or registry. |
+| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_session_name`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `invalid_agent_id`, `unknown_field`, `invalid_wait`, `invalid_status`, `invalid_limit`, `configuration_error` | Malformed request or registry. |
 | 403 | `forbidden` | Admin route called from a non-loopback address. |
-| 404 | `unknown_agent`, `unknown_task`, `not_found` | Missing agent/task/route. |
+| 404 | `unknown_agent`, `unknown_task`, `unknown_session`, `not_found` | Missing agent/task/session/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
-| 409 | `idempotency_conflict` | `requestId` reused with different fields. |
+| 409 | `idempotency_conflict`, `session_agent_mismatch` | `requestId` reused with different fields, or a `sessionId` reused with a different agent. |
 | 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
 | 503 | `task_capacity_reached` | Store full of non-terminal tasks. |
@@ -109,18 +138,19 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 
 The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
-- `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo }`
-- `tools/list` → the six tools below
+- `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo, instructions }`
+- `tools/list` → the seven tools below
 - `ping`
 - `tools/call`
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `list_agents` | `{}` | Same payload as `GET /v1/agents`. |
-| `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` | Submitted task; with `waitMs`, the terminal task. |
+| `delegate` | `{ agentId, input, sessionId?, sessionName?, requestId?, timeoutMs?, cwd?, waitMs? }` | Submitted task; with `waitMs`, the terminal task. |
 | `wait_task` | `{ taskId, maxWaitMs? }` | Terminal task, or the current task if the wait elapses. |
 | `get_task` | `{ taskId }` | Current task. |
 | `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
+| `list_sessions` | `{ agentId?, cwd?, limit? }` | `{ sessions: [...] }`. |
 | `cancel_task` | `{ taskId }` | Cancelled task. |
 
 Each result is returned as `content: [{ type: "text", text: "<json>" }]` plus
@@ -138,6 +168,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | --- | --- | --- |
 | `id` | always | Task UUID. |
 | `sessionId` | always | Correlation only; not a native harness session. |
+| `sessionName` | when named | The session's label, if one is set. |
 | `agentId` | always | Registry id. |
 | `input` | always | The submitted prompt. |
 | `status` | always | See status values. |

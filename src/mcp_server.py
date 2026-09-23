@@ -60,7 +60,9 @@ TOOLS = [
                 "input": {"type": "string", "minLength": 1,
                           "description": "Full task text for the target agent. The agent cannot see this conversation. Include the goal, relevant file paths, constraints, and the expected output format."},
                 "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
-                              "description": "Correlation tag for grouping related tasks; not a native harness session, and each task is a fresh invocation. Reuse the value from an earlier task to group work and to filter list_tasks. Omit it and the relay assigns a new UUID (returned in the task result)."},
+                              "description": "Correlation tag for grouping related tasks; not a native harness session, and each task is a fresh invocation. Reuse the value from an earlier task, or a sessionId from list_sessions, to group work and to filter list_tasks. Omit it and the relay assigns a new UUID (returned in the task result)."},
+                "sessionName": {"type": "string", "minLength": 1, "maxLength": 128,
+                                "description": "Human-readable name for the session. Used only when this call creates a new session; rename an existing session with PATCH /v1/sessions/:id."},
                 "requestId": {"type": "string", "minLength": 1, "maxLength": 128,
                               "description": "Idempotency key. When you retry a delegate call after an error or timeout, send the same requestId so the relay returns the existing task instead of starting a second one. Use a new value for each new task."},
                 "timeoutMs": {"type": "integer", "minimum": 1,
@@ -109,6 +111,22 @@ TOOLS = [
                            "description": "Filter by task status."},
                 "limit": {"type": "integer", "minimum": 1,
                           "description": "Maximum number of tasks to return."},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "list_sessions",
+        "description": "List recent relay sessions, newest activity first. Use it to find earlier sessions to reference or report on.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "agentId": {"type": "string", "minLength": 1, "maxLength": 128,
+                            "description": "Filter to sessions that used this agent."},
+                "cwd": {"type": "string", "minLength": 1,
+                        "description": "Filter to sessions whose working directory is this path."},
+                "limit": {"type": "integer", "minimum": 1,
+                          "description": "Maximum number of sessions to return (default 20)."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -296,9 +314,10 @@ def create_http_handler(base_url=None, timeout=None):
                     "opencode, claude) in a shell to do this work. The relay owns task IDs, "
                     "status, timeouts, cancellation, and idempotency. For parallel work, call "
                     "delegate once per task, then wait for each taskId. Reuse the sessionId "
-                    "from an earlier task to group related work for list_tasks; it does not "
-                    "resume the harness session. Omit it to start a new session. If no listed "
-                    "agent fits, tell the user and ask before you run a CLI directly."
+                    "from an earlier task or list_sessions to group related work for "
+                    "list_tasks; it does not resume the harness session. Omit it to start a "
+                    "new session. If no listed agent fits, tell the user and ask before you "
+                    "run a CLI directly."
                 ),
             }
         if method == "tools/list":
@@ -313,12 +332,14 @@ def create_http_handler(base_url=None, timeout=None):
                 _arguments_for(rpc, [])
                 value = _relay_request(base_url, "/v1/agents", timeout=timeout)
             elif name == "delegate":
-                args = _arguments_for(rpc, ["agentId", "input", "sessionId", "requestId",
-                                            "timeoutMs", "cwd", "waitMs"])
+                args = _arguments_for(rpc, ["agentId", "input", "sessionId", "sessionName",
+                                            "requestId", "timeoutMs", "cwd", "waitMs"])
                 _non_empty(args, "agentId", 128)
                 _non_empty(args, "input")
                 if "sessionId" in args:
                     _non_empty(args, "sessionId", 128)
+                if "sessionName" in args:
+                    _non_empty(args, "sessionName", 128)
                 if "requestId" in args:
                     _non_empty(args, "requestId", 128)
                 if "timeoutMs" in args and not _is_positive_int(args["timeoutMs"]):
@@ -328,7 +349,7 @@ def create_http_handler(base_url=None, timeout=None):
                 if "waitMs" in args and not _is_positive_int(args["waitMs"]):
                     _invalid("waitMs must be a positive integer")
                 payload = {"agentId": args["agentId"], "input": args["input"]}
-                for key in ("sessionId", "requestId", "timeoutMs", "cwd"):
+                for key in ("sessionId", "sessionName", "requestId", "timeoutMs", "cwd"):
                     if key in args:
                         payload[key] = args[key]
                 value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
@@ -365,6 +386,21 @@ def create_http_handler(base_url=None, timeout=None):
                         _invalid("limit must be a positive integer")
                     params["limit"] = args["limit"]
                 path = "/v1/tasks" + (f"?{urlencode(params)}" if params else "")
+                value = _relay_request(base_url, path, timeout=timeout)
+            elif name == "list_sessions":
+                args = _arguments_for(rpc, ["agentId", "cwd", "limit"])
+                params = {}
+                if "agentId" in args:
+                    _non_empty(args, "agentId", 128)
+                    params["agentId"] = args["agentId"]
+                if "cwd" in args:
+                    _non_empty(args, "cwd")
+                    params["cwd"] = args["cwd"]
+                if "limit" in args:
+                    if not _is_positive_int(args["limit"]):
+                        _invalid("limit must be a positive integer")
+                    params["limit"] = args["limit"]
+                path = "/v1/sessions" + (f"?{urlencode(params)}" if params else "")
                 value = _relay_request(base_url, path, timeout=timeout)
             elif name == "cancel_task":
                 args = _arguments_for(rpc, ["taskId"])

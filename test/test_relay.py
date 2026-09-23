@@ -331,6 +331,55 @@ class RelayTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_creates_lists_and_renames_named_sessions(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            status, task = relay.submit(agentId="echo", input="first task input",
+                                        sessionName="refactor auth")
+            self.assertEqual(status, 202)
+            session_id = task["sessionId"]
+            self.assertEqual(task["sessionName"], "refactor auth")
+
+            status, listing = relay.request("GET", "/v1/sessions")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(listing["sessions"]), 1)
+            session = listing["sessions"][0]
+            self.assertEqual(session["id"], session_id)
+            self.assertEqual(session["name"], "refactor auth")
+            self.assertEqual(session["agentId"], "echo")
+            self.assertEqual(session["summary"], "first task input")
+            self.assertEqual(session["taskCount"], 1)
+
+            status, renamed = relay.request("PATCH", f"/v1/sessions/{session_id}",
+                                            {"name": "auth cleanup"})
+            self.assertEqual(status, 200)
+            self.assertEqual(renamed["name"], "auth cleanup")
+
+            status, payload = relay.request("PATCH", f"/v1/sessions/{session_id}", {"bogus": 1})
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "unknown_field")
+
+            status, payload = relay.request("GET", "/v1/sessions/missing")
+            self.assertEqual(status, 404)
+            self.assertEqual(payload["error"], "unknown_session")
+        finally:
+            relay.close()
+
+    def test_rejects_a_session_reused_across_agents(self):
+        agents = [
+            {"id": "echo", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]},
+            {"id": "other", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]},
+        ]
+        relay = Relay(agents)
+        try:
+            relay.submit(agentId="echo", input="one", sessionId="shared")
+            status, payload = relay.submit(agentId="other", input="two", sessionId="shared")
+            self.assertEqual(status, 409)
+            self.assertEqual(payload["error"], "session_agent_mismatch")
+        finally:
+            relay.close()
+
     def test_reports_effective_limits_and_agent_timeouts(self):
         relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "print(1)"],
                        "timeoutMs": 60000}, env={"A2A_RELAY_MAX_ACTIVE": "2"})

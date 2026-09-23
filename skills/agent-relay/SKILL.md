@@ -191,11 +191,12 @@ curl -sS -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # cancel
 **Via MCP** tools:
 
 - `list_agents {}` → registered agents.
-- `delegate { agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` → task.
+- `delegate { agentId, input, sessionId?, sessionName?, requestId?, timeoutMs?, cwd?, waitMs? }` → task.
   With `waitMs`, `delegate` long-polls and returns the terminal task.
 - `wait_task { taskId, maxWaitMs? }` → holds the call until terminal or the wait elapses.
 - `get_task { taskId }` → current task state and result.
 - `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
+- `list_sessions { agentId?, cwd?, limit? }` → recent sessions, newest activity first.
 - `cancel_task { taskId }` → cancel a queued or running task.
 
 **Prefer `wait_task` over a `get_task` polling loop** — one call instead of many, and it
@@ -208,6 +209,17 @@ Statuses: `queued` → `running` → one of `completed`, `failed`, `timed_out`, 
 Result fields on a terminal task: `output` (success text), `error` (failure reason),
 `outputTruncated` (bool). `sessionId` is **correlation data only** — it does not resume a
 native harness session, and each task is a fresh invocation.
+
+### Sessions
+
+A session is created automatically by the first task that uses its `sessionId`, and is
+bound to that task's agent and working directory. Name it on that first `delegate` call
+with `sessionName`, or rename it later with `PATCH /v1/sessions/:id` (HTTP only — rename
+is a human action). `list_sessions` finds earlier sessions to reference or report on; pass
+the `sessionId` it returns to a new `delegate` call to group the new task with that work.
+It does not resume the harness session. Reusing a `sessionId` with a different agent is
+rejected with `409 session_agent_mismatch`. Sessions live in memory and disappear on
+restart, like tasks.
 
 Idempotency: send a unique `requestId`; reusing it with the same fields returns the
 original task (`200`), while reusing it with different fields returns `409`. Use it when a

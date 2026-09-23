@@ -29,7 +29,7 @@ INHERITED_ENV = (
 )
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd"}
+TASK_FIELDS = {"agentId", "input", "sessionId", "sessionName", "requestId", "timeoutMs", "cwd"}
 STATUSES = {"queued", "running", "completed", "failed", "timed_out", "cancelled"}
 
 
@@ -82,6 +82,7 @@ MAX_TIMEOUT_MS = _non_negative_int(0, "AGENT_RELAY_MAX_TIMEOUT_MS", "A2A_RELAY_M
 MAX_WAIT_MS = _positive_int(600_000, "AGENT_RELAY_MAX_WAIT_MS", "A2A_RELAY_MAX_WAIT_MS")
 MAX_OUTPUT = _positive_int(262_144, "AGENT_RELAY_MAX_OUTPUT_BYTES", "A2A_RELAY_MAX_OUTPUT_BYTES")
 MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
+MAX_SESSIONS = _positive_int(500, "AGENT_RELAY_MAX_SESSIONS", "A2A_RELAY_MAX_SESSIONS")
 MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
 MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
                                   "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
@@ -91,6 +92,7 @@ LOCK = threading.RLock()
 TASK_CONDITION = threading.Condition(LOCK)
 AGENTS = {}
 TASKS = {}
+SESSIONS = {}
 REQUEST_IDS = {}
 QUEUE = []
 ACTIVE = 0
@@ -102,7 +104,12 @@ def now_iso():
 
 
 def visible(task):
-    return {key: value for key, value in task.items() if not key.startswith("_")}
+    value = {key: item for key, item in task.items() if not key.startswith("_")}
+    with LOCK:
+        session = SESSIONS.get(task.get("sessionId"))
+        if session and session.get("name"):
+            value["sessionName"] = session["name"]
+    return value
 
 
 def default_config_path():
@@ -480,6 +487,11 @@ def _finish(task, status, **fields):
         task.pop("_proc", None)
         if task.pop("_counted", False):
             ACTIVE -= 1
+        session = SESSIONS.get(task.get("sessionId"))
+        if session is not None:
+            session["lastStatus"] = status
+            session["lastTaskAt"] = task["finishedAt"]
+            session["updatedAt"] = task["finishedAt"]
         TASK_CONDITION.notify_all()
     _drain()
 
@@ -567,6 +579,7 @@ def _limits():
         "maxCommandInputBytes": MAX_COMMAND_INPUT,
         "maxOutputBytes": MAX_OUTPUT,
         "maxTasks": MAX_TASKS,
+        "maxSessions": MAX_SESSIONS,
         "maxActive": MAX_ACTIVE,
     }
 
@@ -603,6 +616,36 @@ def _list_tasks(session_id=None, status=None, limit=100):
         tasks = [task for task in tasks if task["status"] == status]
     tasks.sort(key=lambda task: task.get("createdAt") or "", reverse=True)
     return [visible(task) for task in tasks[:limit]]
+
+
+def _session_row(session):
+    with LOCK:
+        count = sum(1 for task in TASKS.values() if task.get("sessionId") == session["id"])
+        return {**session, "taskCount": count}
+
+
+def _session_listing(agent_id=None, cwd=None, limit=20):
+    with LOCK:
+        sessions = list(SESSIONS.values())
+        if agent_id is not None:
+            sessions = [session for session in sessions if session.get("agentId") == agent_id]
+        if cwd is not None:
+            target = os.path.realpath(cwd)
+            sessions = [session for session in sessions
+                        if session.get("cwd") and os.path.realpath(session["cwd"]) == target]
+        sessions.sort(key=lambda session: session.get("lastTaskAt") or "", reverse=True)
+        rows = []
+        for session in sessions[:limit]:
+            count = sum(1 for task in TASKS.values() if task.get("sessionId") == session["id"])
+            rows.append({**session, "taskCount": count})
+        return rows
+
+
+def _make_room_for_session():
+    if len(SESSIONS) < MAX_SESSIONS:
+        return
+    oldest = min(SESSIONS.values(), key=lambda session: session.get("lastTaskAt") or "")
+    SESSIONS.pop(oldest["id"], None)
 
 
 def _wait_for_terminal(task_id, wait_ms):
@@ -672,6 +715,18 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "POST":
                     return self._reload()
                 return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/sessions":
+                if method == "GET":
+                    return self._list_sessions(query)
+                return self._json(405, {"error": "method_not_allowed"})
+            match = re.fullmatch(r"/v1/sessions/([^/]+)", path)
+            if match:
+                session_id = match.group(1)
+                if method == "GET":
+                    return self._get_session(session_id)
+                if method == "PATCH":
+                    return self._rename_session(session_id)
+                return self._json(405, {"error": "method_not_allowed"})
             match = re.fullmatch(r"/v1/tasks/([^/]+)", path)
             if match:
                 task_id = match.group(1)
@@ -708,9 +763,12 @@ class Handler(BaseHTTPRequestHandler):
         input_text = request.get("input")
         if not _valid(input_text, MAX_BODY):
             return self._json(400, {"error": "input_required"})
-        session_id = request.get("sessionId")
-        if session_id is not None and not _valid(session_id):
+        requested_session_id = request.get("sessionId")
+        if requested_session_id is not None and not _valid(requested_session_id):
             return self._json(400, {"error": "invalid_session_id"})
+        session_name = request.get("sessionName")
+        if session_name is not None and not _valid(session_name):
+            return self._json(400, {"error": "invalid_session_name"})
         request_id = request.get("requestId")
         if request_id is not None and not _valid(request_id):
             return self._json(400, {"error": "invalid_request_id"})
@@ -740,16 +798,24 @@ class Handler(BaseHTTPRequestHandler):
             prior = REQUEST_IDS.get(request_key) if request_key else None
             if prior is not None:
                 if (prior["input"] != input_text
-                        or prior.get("_requested_session_id") != session_id
+                        or prior.get("_requested_session_id") != requested_session_id
                         or prior.get("_requested_timeout_ms") != timeout_ms
                         or prior.get("_requested_cwd") != request.get("cwd")):
                     return self._json(409, {"error": "idempotency_conflict"})
                 return self._json(200, visible(prior))
+            effective_session_id = requested_session_id or str(uuid.uuid4())
+            session = SESSIONS.get(effective_session_id)
+            if session is not None and session["agentId"] != agent["id"]:
+                return self._json(409, {
+                    "error": "session_agent_mismatch",
+                    "message": (f"sessionId {effective_session_id} belongs to agent "
+                                f"{session['agentId']}; call list_sessions or omit sessionId"),
+                })
             if not _make_room():
                 return self._json(503, {"error": "task_capacity_reached"})
             task = {
                 "id": str(uuid.uuid4()),
-                "sessionId": session_id or str(uuid.uuid4()),
+                "sessionId": effective_session_id,
                 "agentId": agent["id"],
                 "input": input_text,
                 "status": "queued",
@@ -761,12 +827,25 @@ class Handler(BaseHTTPRequestHandler):
             if request_key:
                 task["requestId"] = request_id
                 task["_request_key"] = request_key
-                task["_requested_session_id"] = session_id
+                task["_requested_session_id"] = requested_session_id
                 task["_requested_timeout_ms"] = timeout_ms
                 task["_requested_cwd"] = request.get("cwd")
                 REQUEST_IDS[request_key] = task
             TASKS[task["id"]] = task
             QUEUE.append(task)
+            if session is None:
+                _make_room_for_session()
+                SESSIONS[effective_session_id] = {
+                    "id": effective_session_id,
+                    "name": session_name,
+                    "agentId": agent["id"],
+                    "cwd": task_cwd or agent.get("cwd"),
+                    "createdAt": task["createdAt"],
+                    "updatedAt": task["createdAt"],
+                    "lastTaskAt": task["createdAt"],
+                    "lastStatus": "queued",
+                    "summary": input_text[:80],
+                }
         self._json(202, visible(task))
         _drain()
 
@@ -811,6 +890,67 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError) as exc:
             return self._json(400, {"error": "configuration_error", "message": str(exc)})
         return self._json(200, {"ok": True, "agents": len(AGENTS), "registry": str(path)})
+
+    def _read_json(self):
+        """Return (value, error); error is a (status, payload) tuple or None."""
+        length_header = self.headers.get("content-length")
+        length = int(length_header) if length_header and length_header.isdigit() else 0
+        if length > MAX_BODY:
+            self.close_connection = True
+            return None, (413, {"error": "request_failed", "message": "body too large"})
+        raw = self.rfile.read(length) if length else b""
+        try:
+            value = json.loads(raw.decode("utf-8") or "{}")
+        except ValueError:
+            return None, (400, {"error": "invalid_json"})
+        if not isinstance(value, dict):
+            return None, (400, {"error": "invalid_request"})
+        return value, None
+
+    def _list_sessions(self, query):
+        agent_id = query.get("agentId", [None])[0]
+        cwd = query.get("cwd", [None])[0]
+        if agent_id is not None and not _valid(agent_id):
+            return self._json(400, {"error": "invalid_agent_id"})
+        if cwd is not None and not cwd:
+            return self._json(400, {"error": "invalid_cwd"})
+        limit = 20
+        limit_raw = query.get("limit", [None])[0]
+        if limit_raw is not None:
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                return self._json(400, {"error": "invalid_limit"})
+            if limit <= 0:
+                return self._json(400, {"error": "invalid_limit"})
+        limit = min(limit, 100)
+        return self._json(200, {"sessions": _session_listing(agent_id, cwd, limit)})
+
+    def _get_session(self, session_id):
+        with LOCK:
+            session = SESSIONS.get(session_id)
+            if session is None:
+                return self._json(404, {"error": "unknown_session"})
+            return self._json(200, _session_row(session))
+
+    def _rename_session(self, session_id):
+        body, error = self._read_json()
+        if error is not None:
+            return self._json(*error)
+        unknown = sorted(set(body) - {"name"})
+        if unknown:
+            return self._json(400, {"error": "unknown_field",
+                                    "message": f"Unknown request field: {unknown[0]}"})
+        name = body.get("name")
+        if not isinstance(name, str) or len(name) > 128:
+            return self._json(400, {"error": "invalid_session_name"})
+        with LOCK:
+            session = SESSIONS.get(session_id)
+            if session is None:
+                return self._json(404, {"error": "unknown_session"})
+            session["name"] = name or None
+            session["updatedAt"] = now_iso()
+            return self._json(200, _session_row(session))
 
     def _cancel(self, task):
         global ACTIVE
