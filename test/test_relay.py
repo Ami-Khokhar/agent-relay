@@ -207,6 +207,174 @@ class RelayTests(unittest.TestCase):
             relay.close()
             stop_http_server(server)
 
+    def test_applies_per_agent_timeout_above_the_global_default(self):
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "print('ok')"],
+                       "timeoutMs": 900000}, env={"A2A_RELAY_TIMEOUT_MS": "1000"})
+        try:
+            task = relay.run_task(agentId="slow", input="x")
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["timeoutMs"], 900000)
+        finally:
+            relay.close()
+
+    def test_request_timeout_overrides_the_agent_and_the_default(self):
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "print('ok')"],
+                       "timeoutMs": 5000}, env={"A2A_RELAY_TIMEOUT_MS": "1000"})
+        try:
+            task = relay.run_task(agentId="slow", input="x", timeoutMs=7000)
+            self.assertEqual(task["timeoutMs"], 7000)
+        finally:
+            relay.close()
+
+    def test_default_timeout_is_fifteen_minutes(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('ok')"]})
+        try:
+            _, submitted = relay.submit(agentId="echo", input="x")
+            self.assertEqual(submitted["timeoutMs"], 900000)
+        finally:
+            relay.close()
+
+    def test_rejects_an_agent_timeout_above_the_configured_max(self):
+        directory = tempfile.mkdtemp(prefix="a2a-maxtimeout-")
+        config = os.path.join(directory, "agents.json")
+        with open(config, "w", encoding="utf-8") as handle:
+            json.dump({"agents": [{"id": "slow", "command": PYTHON,
+                                   "args": ["-c", "print(1)"], "timeoutMs": 5000}]}, handle)
+        proc = subprocess.Popen([PYTHON, SERVER], cwd=ROOT,
+                                env={**os.environ, "A2A_AGENTS_FILE": config,
+                                     "A2A_RELAY_MAX_TIMEOUT_MS": "1000"},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _, stderr = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 1)
+        text = stderr.decode("utf-8")
+        self.assertIn("timeoutMs exceeds", text)
+        self.assertNotIn("Traceback (most recent call last)", text)
+
+    def test_rejects_a_request_timeout_above_the_configured_max(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('ok')"]},
+                      env={"A2A_RELAY_MAX_TIMEOUT_MS": "1000"})
+        try:
+            status, payload = relay.submit(agentId="echo", input="x", timeoutMs=2000)
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_timeout")
+        finally:
+            relay.close()
+
+    def test_allows_per_task_cwd_only_inside_allowed_roots(self):
+        allowed = tempfile.mkdtemp(prefix="a2a-allowed-")
+        outside = tempfile.mkdtemp(prefix="a2a-outside-")
+        relay = Relay({"id": "pwd", "command": PYTHON,
+                       "args": ["-c", "import os; print(os.getcwd())"],
+                       "allowedRoots": [allowed]})
+        try:
+            status, submitted = relay.submit(agentId="pwd", input="x", cwd=allowed)
+            self.assertEqual(status, 202)
+            self.assertEqual(submitted["cwd"], os.path.realpath(allowed))
+            task = relay.wait_task(submitted["id"])
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["output"], os.path.realpath(allowed))
+
+            status, payload = relay.submit(agentId="pwd", input="x", cwd=outside)
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "cwd_not_allowed")
+
+            status, payload = relay.submit(agentId="pwd", input="x", cwd="/tmp")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "cwd_not_allowed")
+        finally:
+            relay.close()
+
+    def test_rejects_unknown_task_request_fields(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('ok')"]})
+        try:
+            status, payload = relay.submit(agentId="echo", input="x", unsupported=True)
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "unknown_field")
+            self.assertIn("unsupported", payload["message"])
+        finally:
+            relay.close()
+
+    def test_long_polls_until_a_task_is_terminal(self):
+        relay = Relay({"id": "later", "command": PYTHON,
+                       "args": ["-c", "import time; time.sleep(0.3); print('done')"]})
+        try:
+            _, submitted = relay.submit(agentId="later", input="x")
+            started = time.monotonic()
+            status, task = relay.request("GET", f"/v1/tasks/{submitted['id']}?waitMs=5000")
+            elapsed = time.monotonic() - started
+            self.assertEqual(status, 200)
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["output"], "done")
+            self.assertGreaterEqual(elapsed, 0.25)
+
+            status, payload = relay.request("GET", f"/v1/tasks/{submitted['id']}?waitMs=0")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_wait")
+        finally:
+            relay.close()
+
+    def test_lists_tasks_by_session_and_rejects_a_bad_status(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            relay.submit(agentId="echo", input="one", sessionId="s-1")
+            relay.submit(agentId="echo", input="two", sessionId="s-1")
+            relay.submit(agentId="echo", input="three", sessionId="s-2")
+            status, listing = relay.request("GET", "/v1/tasks?sessionId=s-1")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(listing["tasks"]), 2)
+            self.assertTrue(all(task["sessionId"] == "s-1" for task in listing["tasks"]))
+
+            status, payload = relay.request("GET", "/v1/tasks?status=bogus")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_status")
+        finally:
+            relay.close()
+
+    def test_reports_effective_limits_and_agent_timeouts(self):
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "print(1)"],
+                       "timeoutMs": 60000}, env={"A2A_RELAY_MAX_ACTIVE": "2"})
+        try:
+            status, health = relay.request("GET", "/healthz")
+            self.assertEqual(status, 200)
+            self.assertEqual(health["limits"]["timeoutMs"], 900000)
+            self.assertEqual(health["limits"]["maxActive"], 2)
+            _, listing = relay.request("GET", "/v1/agents")
+            self.assertEqual(listing["agents"][0]["timeoutMs"], 60000)
+        finally:
+            relay.close()
+
+    def test_reloads_the_registry_without_a_restart(self):
+        relay = Relay({"id": "one", "command": PYTHON, "args": ["-c", "print(1)"]})
+        try:
+            with open(relay.config, "w", encoding="utf-8") as handle:
+                json.dump({"agents": [
+                    {"id": "one", "command": PYTHON, "args": ["-c", "print(1)"]},
+                    {"id": "two", "command": PYTHON, "args": ["-c", "print(2)"]},
+                ]}, handle)
+            status, payload = relay.request("POST", "/v1/admin/reload")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["agents"], 2)
+            _, listing = relay.request("GET", "/v1/agents")
+            self.assertEqual({agent["id"] for agent in listing["agents"]}, {"one", "two"})
+        finally:
+            relay.close()
+
+    def test_reports_port_in_use_without_a_traceback(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]})
+        try:
+            proc = subprocess.Popen([PYTHON, SERVER], cwd=ROOT,
+                                    env={**os.environ, "A2A_RELAY_PORT": str(relay.port),
+                                         "A2A_AGENTS_FILE": relay.config},
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _, stderr = proc.communicate(timeout=10)
+            self.assertEqual(proc.returncode, 1)
+            text = stderr.decode("utf-8")
+            self.assertIn("in use", text)
+            self.assertNotIn("Traceback (most recent call last)", text)
+        finally:
+            relay.close()
+
 
 if __name__ == "__main__":
     unittest.main()

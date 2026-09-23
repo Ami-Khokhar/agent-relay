@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,12 +44,7 @@ class EndToEndTests(unittest.TestCase):
             task_id = delegated["id"]
             self.assertTrue(task_id)
 
-            task = None
-            for _ in range(100):
-                task = client.call_tool("get_task", {"taskId": task_id})["structuredContent"]
-                if task["status"] not in ("queued", "running"):
-                    break
-                time.sleep(0.02)
+            task = client.call_tool("wait_task", {"taskId": task_id, "maxWaitMs": 5000})["structuredContent"]
 
             self.assertEqual(task["status"], "completed")
             self.assertEqual(task["output"], "fake harness completed: review this change")

@@ -53,7 +53,8 @@ class McpHandlerTests(unittest.TestCase):
         try:
             listed = handle({"method": "tools/list"})
             self.assertEqual([tool["name"] for tool in listed["tools"]],
-                             ["list_agents", "delegate", "get_task", "cancel_task"])
+                             ["list_agents", "delegate", "wait_task", "get_task", "list_tasks",
+                              "cancel_task"])
             agents = handle({"method": "tools/call", "params": {"name": "list_agents", "arguments": {}}})
             self.assertEqual(agents["structuredContent"]["agents"][0]["id"], "fake")
             submitted = handle({"method": "tools/call", "params": {
@@ -91,6 +92,70 @@ class McpHandlerTests(unittest.TestCase):
                              {"error": "invalid_relay_response", "message": "invalid_relay_response", "status": 502})
         finally:
             malformed.close()
+
+    def test_maps_wait_task_and_list_tasks_onto_the_relay(self):
+        def responder(method, path, body):
+            if path.startswith("/v1/tasks?"):
+                return 200, {"tasks": [{"id": "task-1", "status": "completed"}]}
+            return 200, {"id": "task-1", "status": "completed", "output": "done"}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            waited = handle({"method": "tools/call", "params": {
+                "name": "wait_task", "arguments": {"taskId": "task-1", "maxWaitMs": 5000}}})
+            self.assertEqual(waited["structuredContent"]["output"], "done")
+            self.assertEqual(upstream.calls[0][0], "GET")
+            self.assertIn("waitMs=5000", upstream.calls[0][1])
+
+            listed = handle({"method": "tools/call", "params": {
+                "name": "list_tasks",
+                "arguments": {"sessionId": "s-1", "status": "completed", "limit": 5}}})
+            self.assertEqual(listed["structuredContent"]["tasks"][0]["id"], "task-1")
+            self.assertIn("sessionId=s-1", upstream.calls[1][1])
+            self.assertIn("status=completed", upstream.calls[1][1])
+            self.assertIn("limit=5", upstream.calls[1][1])
+        finally:
+            upstream.close()
+
+    def test_delegate_passes_cwd_and_can_wait_for_the_result(self):
+        def responder(method, path, body):
+            if method == "POST":
+                return 202, {"id": "task-2", "status": "queued"}
+            return 200, {"id": "task-2", "status": "completed", "output": "ok"}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "delegate",
+                "arguments": {"agentId": "fake", "input": "work", "cwd": "/tmp", "waitMs": 3000}}})
+            self.assertEqual(result["structuredContent"]["status"], "completed")
+            self.assertEqual(upstream.calls[0][2], {"agentId": "fake", "input": "work", "cwd": "/tmp"})
+            self.assertIn("waitMs=3000", upstream.calls[1][1])
+        finally:
+            upstream.close()
+
+    def test_retries_a_loopback_request_after_starting_the_relay(self):
+        calls = []
+
+        def fake_request(base_url, path, method="GET", body=None, timeout=10.0):
+            calls.append(path)
+            if len(calls) == 1:
+                raise mcp_server.RelayError(None, {"error": "relay_request_failed"}, "refused")
+            return {"ok": True}
+
+        original_request = mcp_server._http_request
+        original_start = mcp_server._maybe_start_relay
+        mcp_server._http_request = fake_request
+        mcp_server._maybe_start_relay = lambda base_url: True
+        try:
+            value = mcp_server._relay_request("http://127.0.0.1:1", "/healthz")
+            self.assertEqual(value, {"ok": True})
+            self.assertEqual(calls, ["/healthz", "/healthz"])
+        finally:
+            mcp_server._http_request = original_request
+            mcp_server._maybe_start_relay = original_start
 
     def test_validates_tool_arguments_before_calling_the_relay(self):
         upstream = FakeUpstream(lambda method, path, body: (200, {}))

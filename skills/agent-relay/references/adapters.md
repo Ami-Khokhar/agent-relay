@@ -14,7 +14,7 @@ The relay sends exactly one request document:
     "id": "relay-task-id",
     "sessionId": "correlation-id",
     "input": "do the work",
-    "timeoutMs": 120000
+    "timeoutMs": 900000
   }
 }
 ```
@@ -117,10 +117,20 @@ These are entry points, not a guarantee — verify flags against the installed v
 | Harness | Registry entry |
 | --- | --- |
 | Claude Code | `{ "command": "claude", "args": ["--print"] }` |
-| Codex | `{ "command": "codex", "args": ["exec"] }` |
+| Codex | `{ "command": "codex", "args": ["exec", "--skip-git-repo-check", "-s", "workspace-write"] }` |
 | Pi | `{ "command": "pi", "args": ["--print"] }` |
 | OpenCode | `{ "command": "opencode", "args": ["run", "--dir", "/path", "--agent", "build"] }` |
 | DeepSeek Harness | `{ "command": "dsh", "args": ["--profile", "headless"] }` |
+
+Codex: `--skip-git-repo-check` allows `codex exec` outside a git repository, and
+`-s workspace-write` lifts the default read-only sandbox so a delegated fix can write
+files (checked against codex-cli 0.155.1). Without the second flag, a task can succeed
+while making no changes.
+
+A task can override the working directory with `cwd` on `POST /v1/tasks` / MCP `delegate`.
+The relay resolves the path and accepts it only when it is inside the agent's
+`allowedRoots` (or equal to the agent's `cwd`); otherwise it returns `400 cwd_not_allowed`
+and the adapter never runs.
 
 A `command` adapter appends the task input as the **final argument** (no shell), so it only
 works for CLIs that accept the prompt positionally. If the CLI needs a flag, a file, or

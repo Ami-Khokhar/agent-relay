@@ -2,19 +2,37 @@
 """agent-relay MCP stdio interface.
 
 A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the tools list_agents,
-delegate, get_task, and cancel_task. Set A2A_RELAY_URL to point at a non-default relay.
+delegate, wait_task, get_task, list_tasks, and cancel_task. Set A2A_RELAY_URL to point at a
+non-default relay. When the relay is not reachable and the URL is loopback, the interface
+starts the HTTP service detached on first use.
 """
 from __future__ import annotations
 
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
+import time
+from pathlib import Path
+from urllib.parse import quote, urlencode, urlsplit
 
-RELAY_URL = (os.environ.get("A2A_RELAY_URL") or "http://127.0.0.1:43124").rstrip("/")
-_raw_timeout = os.environ.get("A2A_RELAY_HTTP_TIMEOUT_MS")
-if _raw_timeout is not None and _raw_timeout != "":
+STATUSES = ("queued", "running", "completed", "failed", "timed_out", "cancelled")
+FALSE_VALUES = ("0", "false", "no", "off")
+
+
+def _env(*names, default=None):
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+RELAY_URL = (_env("AGENT_RELAY_URL", "A2A_RELAY_URL") or "http://127.0.0.1:43124").rstrip("/")
+_raw_timeout = _env("AGENT_RELAY_HTTP_TIMEOUT_MS", "A2A_RELAY_HTTP_TIMEOUT_MS")
+if _raw_timeout is not None:
     try:
         REQUEST_TIMEOUT_MS = int(_raw_timeout)
     except ValueError:
@@ -42,9 +60,23 @@ TOOLS = [
                 "sessionId": {"type": "string", "minLength": 1, "maxLength": 128},
                 "requestId": {"type": "string", "minLength": 1, "maxLength": 128},
                 "timeoutMs": {"type": "integer", "minimum": 1},
+                "cwd": {"type": "string", "minLength": 1},
+                "waitMs": {"type": "integer", "minimum": 1},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+    },
+    {
+        "name": "wait_task",
+        "description": "Long-poll until a relay task is terminal or maxWaitMs elapses",
+        "inputSchema": {
+            "type": "object", "required": ["taskId"], "additionalProperties": False,
+            "properties": {
+                "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
+                "maxWaitMs": {"type": "integer", "minimum": 1},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
         "name": "get_task",
@@ -52,6 +84,19 @@ TOOLS = [
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
             "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128}},
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "list_tasks",
+        "description": "List stored relay tasks, optionally filtered by session or status",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "sessionId": {"type": "string", "minLength": 1, "maxLength": 128},
+                "status": {"type": "string", "enum": list(STATUSES)},
+                "limit": {"type": "integer", "minimum": 1},
+            },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
@@ -144,6 +189,80 @@ def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
     return value
 
 
+def _loopback(base_url):
+    hostname = urlsplit(base_url).hostname
+    return hostname in ("127.0.0.1", "localhost", "::1")
+
+
+def _autostart_enabled():
+    return (_env("AGENT_RELAY_AUTOSTART", "A2A_RELAY_AUTOSTART", default="1") or "").lower() \
+        not in FALSE_VALUES
+
+
+_autostart_lock = threading.Lock()
+
+
+def _health_ok(base_url):
+    try:
+        _http_request(base_url, "/healthz", timeout=0.5)
+        return True
+    except RelayError:
+        return False
+
+
+def _maybe_start_relay(base_url):
+    """Start src/server.py detached for a loopback URL. Returns True when it is reachable."""
+    if not _autostart_enabled() or not _loopback(base_url):
+        return False
+    with _autostart_lock:
+        if _health_ok(base_url):
+            return True
+        parsed = urlsplit(base_url)
+        port = parsed.port or 43124
+        server_path = Path(__file__).resolve().parent / "server.py"
+        if not server_path.exists():
+            return False
+        env = dict(os.environ)
+        env.setdefault("AGENT_RELAY_PORT", str(port))
+        env.setdefault("A2A_RELAY_PORT", str(port))
+        if parsed.hostname:
+            env.setdefault("AGENT_RELAY_HOST", parsed.hostname)
+        log_dir = Path.home() / ".local" / "state" / "agent-relay"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log = open(log_dir / "relay.log", "ab")
+        except OSError:
+            return False
+        try:
+            subprocess.Popen(
+                [sys.executable, str(server_path)], cwd=str(server_path.parent.parent), env=env,
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError:
+            return False
+        finally:
+            log.close()
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if _health_ok(base_url):
+                return True
+            time.sleep(0.1)
+        return False
+
+
+def _relay_request(base_url, path, method="GET", body=None, timeout=10.0):
+    """Issue a relay request, starting the HTTP service on demand for loopback URLs."""
+    try:
+        return _http_request(base_url, path, method=method, body=body, timeout=timeout)
+    except RelayError as exc:
+        if exc.status is not None:
+            raise
+        if not _maybe_start_relay(base_url):
+            raise
+        return _http_request(base_url, path, method=method, body=body, timeout=timeout)
+
+
 def create_http_handler(base_url=None, timeout=None):
     base_url = base_url if base_url is not None else RELAY_URL
     timeout = timeout if timeout is not None else REQUEST_TIMEOUT_MS / 1000.0
@@ -154,7 +273,7 @@ def create_http_handler(base_url=None, timeout=None):
             return {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "a2a-relay-http-mcp", "version": "0.1.0"},
+                "serverInfo": {"name": "agent-relay", "version": "0.2.0"},
             }
         if method == "tools/list":
             return {"tools": TOOLS}
@@ -166,9 +285,10 @@ def create_http_handler(base_url=None, timeout=None):
         try:
             if name == "list_agents":
                 _arguments_for(rpc, [])
-                value = _http_request(base_url, "/v1/agents", timeout=timeout)
+                value = _relay_request(base_url, "/v1/agents", timeout=timeout)
             elif name == "delegate":
-                args = _arguments_for(rpc, ["agentId", "input", "sessionId", "requestId", "timeoutMs"])
+                args = _arguments_for(rpc, ["agentId", "input", "sessionId", "requestId",
+                                            "timeoutMs", "cwd", "waitMs"])
                 _non_empty(args, "agentId", 128)
                 _non_empty(args, "input")
                 if "sessionId" in args:
@@ -177,22 +297,54 @@ def create_http_handler(base_url=None, timeout=None):
                     _non_empty(args, "requestId", 128)
                 if "timeoutMs" in args and not _is_positive_int(args["timeoutMs"]):
                     _invalid("timeoutMs must be a positive integer")
+                if "cwd" in args:
+                    _non_empty(args, "cwd")
+                if "waitMs" in args and not _is_positive_int(args["waitMs"]):
+                    _invalid("waitMs must be a positive integer")
                 payload = {"agentId": args["agentId"], "input": args["input"]}
-                for key in ("sessionId", "requestId", "timeoutMs"):
+                for key in ("sessionId", "requestId", "timeoutMs", "cwd"):
                     if key in args:
                         payload[key] = args[key]
-                value = _http_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
+                value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
+                wait_ms = args.get("waitMs")
+                if wait_ms and value.get("status") in ("queued", "running"):
+                    value = _relay_request(
+                        base_url, f"/v1/tasks/{quote(value['id'], safe='')}?waitMs={wait_ms}",
+                        timeout=max(timeout, wait_ms / 1000.0 + 5))
+            elif name == "wait_task":
+                args = _arguments_for(rpc, ["taskId", "maxWaitMs"])
+                _non_empty(args, "taskId", 128)
+                max_wait = args.get("maxWaitMs", 60_000)
+                if not _is_positive_int(max_wait):
+                    _invalid("maxWaitMs must be a positive integer")
+                value = _relay_request(
+                    base_url, f"/v1/tasks/{quote(args['taskId'], safe='')}?waitMs={max_wait}",
+                    timeout=max(timeout, max_wait / 1000.0 + 5))
             elif name == "get_task":
-                from urllib.parse import quote
                 args = _arguments_for(rpc, ["taskId"])
                 _non_empty(args, "taskId", 128)
-                value = _http_request(base_url, "/v1/tasks/" + quote(args["taskId"], safe=""), timeout=timeout)
+                value = _relay_request(base_url, "/v1/tasks/" + quote(args["taskId"], safe=""), timeout=timeout)
+            elif name == "list_tasks":
+                args = _arguments_for(rpc, ["sessionId", "status", "limit"])
+                params = {}
+                if "sessionId" in args:
+                    _non_empty(args, "sessionId", 128)
+                    params["sessionId"] = args["sessionId"]
+                if "status" in args:
+                    if args["status"] not in STATUSES:
+                        _invalid(f"status must be one of {', '.join(STATUSES)}")
+                    params["status"] = args["status"]
+                if "limit" in args:
+                    if not _is_positive_int(args["limit"]):
+                        _invalid("limit must be a positive integer")
+                    params["limit"] = args["limit"]
+                path = "/v1/tasks" + (f"?{urlencode(params)}" if params else "")
+                value = _relay_request(base_url, path, timeout=timeout)
             elif name == "cancel_task":
-                from urllib.parse import quote
                 args = _arguments_for(rpc, ["taskId"])
                 _non_empty(args, "taskId", 128)
-                value = _http_request(base_url, "/v1/tasks/" + quote(args["taskId"], safe=""),
-                                      method="DELETE", timeout=timeout)
+                value = _relay_request(base_url, "/v1/tasks/" + quote(args["taskId"], safe=""),
+                                       method="DELETE", timeout=timeout)
             else:
                 raise RpcError(-32602, f"Unknown tool: {name or ''}")
         except RpcError:

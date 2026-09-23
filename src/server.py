@@ -6,6 +6,7 @@ registry of adapters. See README.md for the HTTP API and the relay.adapter/v1 co
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -19,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ADAPTER_PROTOCOL = "relay.adapter/v1"
 INHERITED_ENV = (
@@ -28,34 +29,66 @@ INHERITED_ENV = (
 )
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd"}
+STATUSES = {"queued", "running", "completed", "failed", "timed_out", "cancelled"}
 
 
-def _positive_int(name, fallback):
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return fallback
+def _env(*names, default=None):
+    """Return the first non-empty environment value among ``names``.
+
+    The canonical prefix is AGENT_RELAY_; the historical A2A_RELAY_ names are kept as
+    aliases so existing setups keep working.
+    """
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _positive_int(default, *names):
+    raw = _env(*names)
+    if raw is None:
+        return default
     try:
         value = int(raw)
     except ValueError:
-        sys.exit(f"{name} must be a positive integer")
+        sys.exit(f"{names[0]} must be a positive integer")
     if value <= 0:
-        sys.exit(f"{name} must be a positive integer")
+        sys.exit(f"{names[0]} must be a positive integer")
     return value
 
 
-HOST = os.environ.get("A2A_RELAY_HOST") or "127.0.0.1"
-CONFIG_PATH = os.environ.get("A2A_AGENTS_FILE") or str(
-    Path(__file__).resolve().parent.parent / "config" / "agents.json"
-)
-PORT = _positive_int("A2A_RELAY_PORT", 43124)
-MAX_BODY = _positive_int("A2A_RELAY_MAX_BODY_BYTES", 1_048_576)
-TIMEOUT_MS = _positive_int("A2A_RELAY_TIMEOUT_MS", 120_000)
-MAX_OUTPUT = _positive_int("A2A_RELAY_MAX_OUTPUT_BYTES", 262_144)
-MAX_TASKS = _positive_int("A2A_RELAY_MAX_TASKS", 1000)
-MAX_ACTIVE = _positive_int("A2A_RELAY_MAX_ACTIVE", 4)
-MAX_COMMAND_INPUT = _positive_int("A2A_RELAY_MAX_COMMAND_INPUT_BYTES", 65_536)
+def _non_negative_int(default, *names):
+    raw = _env(*names)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        sys.exit(f"{names[0]} must be a non-negative integer")
+    if value < 0:
+        sys.exit(f"{names[0]} must be a non-negative integer")
+    return value
+
+
+HOST = _env("AGENT_RELAY_HOST", "A2A_RELAY_HOST", default="127.0.0.1")
+PORT = _positive_int(43124, "AGENT_RELAY_PORT", "A2A_RELAY_PORT")
+MAX_BODY = _positive_int(1_048_576, "AGENT_RELAY_MAX_BODY_BYTES", "A2A_RELAY_MAX_BODY_BYTES")
+# 15 minutes: real coding tasks routinely run for several minutes.
+TIMEOUT_MS = _positive_int(900_000, "AGENT_RELAY_TIMEOUT_MS", "A2A_RELAY_TIMEOUT_MS")
+# 0 disables the hard cap; a positive value rejects larger per-agent/request timeouts.
+MAX_TIMEOUT_MS = _non_negative_int(0, "AGENT_RELAY_MAX_TIMEOUT_MS", "A2A_RELAY_MAX_TIMEOUT_MS")
+MAX_WAIT_MS = _positive_int(600_000, "AGENT_RELAY_MAX_WAIT_MS", "A2A_RELAY_MAX_WAIT_MS")
+MAX_OUTPUT = _positive_int(262_144, "AGENT_RELAY_MAX_OUTPUT_BYTES", "A2A_RELAY_MAX_OUTPUT_BYTES")
+MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
+MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
+MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
+                                  "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
+EXPLICIT_CONFIG = _env("AGENT_RELAY_AGENTS_FILE", "A2A_AGENTS_FILE")
 
 LOCK = threading.RLock()
+TASK_CONDITION = threading.Condition(LOCK)
 AGENTS = {}
 TASKS = {}
 REQUEST_IDS = {}
@@ -70,6 +103,19 @@ def now_iso():
 
 def visible(task):
     return {key: value for key, value in task.items() if not key.startswith("_")}
+
+
+def default_config_path():
+    """Prefer a per-user registry, then the one inside the checkout."""
+    user = Path.home() / ".config" / "agent-relay" / "agents.json"
+    repo = Path(__file__).resolve().parent.parent / "config" / "agents.json"
+    return user if user.exists() else repo
+
+
+def config_path():
+    if EXPLICIT_CONFIG:
+        return Path(EXPLICIT_CONFIG)
+    return default_config_path()
 
 
 def load_registry(path):
@@ -102,6 +148,17 @@ def load_registry(path):
         if agent_timeout is not None and (isinstance(agent_timeout, bool)
                                           or not isinstance(agent_timeout, int) or agent_timeout <= 0):
             raise ValueError(f"Invalid agent timeout: {agent_id}")
+        if agent_timeout is not None and MAX_TIMEOUT_MS and agent_timeout > MAX_TIMEOUT_MS:
+            raise ValueError(
+                f"agent {agent_id} timeoutMs exceeds A2A_RELAY_MAX_TIMEOUT_MS ({MAX_TIMEOUT_MS})")
+        cwd = raw.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ValueError(f"Invalid agent cwd: {agent_id}")
+        allowed_roots = raw.get("allowedRoots")
+        if allowed_roots is not None and (not isinstance(allowed_roots, list)
+                                          or not all(isinstance(item, str) and item
+                                                     for item in allowed_roots)):
+            raise ValueError(f"Invalid allowedRoots: {agent_id}")
         if agent_type == "http":
             url = raw.get("url")
             if not isinstance(url, str) or urlsplit(url).scheme not in ("http", "https"):
@@ -121,6 +178,16 @@ def load_registry(path):
             merged.update(caps)
         agents[agent_id] = {**raw, "type": agent_type, "args": raw.get("args", []), "capabilities": merged}
     return agents
+
+
+def reload_registry():
+    """Reload the registry from disk. Raises on an invalid file; callers keep the old one."""
+    global AGENTS
+    path = config_path()
+    agents = load_registry(str(path))
+    with LOCK:
+        AGENTS = agents
+    return path
 
 
 def environment(agent):
@@ -231,6 +298,10 @@ def _timed_out(exc, started, task):
     return (time.monotonic() - started) * 1000 >= task["timeoutMs"]
 
 
+def _task_cwd(agent, task):
+    return task.get("cwd") or agent.get("cwd")
+
+
 def _run_command(agent, task):
     env = environment(agent)
     env["A2A_TASK_ID"] = task["id"]
@@ -238,7 +309,7 @@ def _run_command(agent, task):
     try:
         proc = subprocess.Popen(
             [agent["command"], *agent["args"], task["input"]],
-            cwd=agent.get("cwd"), env=env,
+            cwd=_task_cwd(agent, task), env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
     except OSError as exc:
@@ -269,7 +340,7 @@ def _run_stdio(agent, task):
     try:
         proc = subprocess.Popen(
             [agent["command"], *agent["args"]],
-            cwd=agent.get("cwd"), env=env,
+            cwd=_task_cwd(agent, task), env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
     except OSError as exc:
@@ -409,6 +480,7 @@ def _finish(task, status, **fields):
         task.pop("_proc", None)
         if task.pop("_counted", False):
             ACTIVE -= 1
+        TASK_CONDITION.notify_all()
     _drain()
 
 
@@ -424,6 +496,7 @@ def _drain():
                 task["status"] = "failed"
                 task["finishedAt"] = now_iso()
                 task["error"] = "unknown_agent"
+                TASK_CONDITION.notify_all()
                 continue
             ACTIVE += 1
             task["_counted"] = True
@@ -443,6 +516,7 @@ def _make_room():
     request_key = terminal.get("_request_key")
     if request_key:
         REQUEST_IDS.pop(request_key, None)
+    TASK_CONDITION.notify_all()
     return True
 
 
@@ -460,6 +534,43 @@ def _is_positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _within(root, candidate):
+    try:
+        return os.path.commonpath([root, candidate]) == root
+    except ValueError:
+        return False
+
+
+def _resolve_task_cwd(agent, requested):
+    """Return (cwd, error). A None cwd means the agent's default applies."""
+    if requested is None:
+        return None, None
+    if not isinstance(requested, str) or not requested:
+        return None, "invalid_cwd"
+    candidate = os.path.realpath(requested)
+    roots = list(agent.get("allowedRoots") or [])
+    if agent.get("cwd"):
+        roots.append(agent["cwd"])
+    if not any(_within(os.path.realpath(root), candidate) for root in roots):
+        return None, "cwd_not_allowed"
+    if not os.path.isdir(candidate):
+        return None, "invalid_cwd"
+    return candidate, None
+
+
+def _limits():
+    return {
+        "timeoutMs": TIMEOUT_MS,
+        "maxTimeoutMs": MAX_TIMEOUT_MS or None,
+        "maxWaitMs": MAX_WAIT_MS,
+        "maxBodyBytes": MAX_BODY,
+        "maxCommandInputBytes": MAX_COMMAND_INPUT,
+        "maxOutputBytes": MAX_OUTPUT,
+        "maxTasks": MAX_TASKS,
+        "maxActive": MAX_ACTIVE,
+    }
+
+
 def _agent_listing():
     listing = []
     for agent in AGENTS.values():
@@ -467,6 +578,7 @@ def _agent_listing():
             "id": agent["id"],
             "name": agent.get("name") or agent["id"],
             "adapter": agent["type"],
+            "timeoutMs": agent.get("timeoutMs") or TIMEOUT_MS,
             "capabilities": {
                 **agent["capabilities"],
                 "cancellation": "request_only" if agent["type"] == "http" else "process_signal",
@@ -474,8 +586,36 @@ def _agent_listing():
         }
         if agent.get("description") is not None:
             entry["description"] = agent["description"]
+        if agent.get("cwd") is not None:
+            entry["cwd"] = agent["cwd"]
+        if agent.get("allowedRoots") is not None:
+            entry["allowedRoots"] = agent["allowedRoots"]
         listing.append(entry)
     return listing
+
+
+def _list_tasks(session_id=None, status=None, limit=100):
+    with LOCK:
+        tasks = list(TASKS.values())
+    if session_id is not None:
+        tasks = [task for task in tasks if task.get("sessionId") == session_id]
+    if status is not None:
+        tasks = [task for task in tasks if task["status"] == status]
+    tasks.sort(key=lambda task: task.get("createdAt") or "", reverse=True)
+    return [visible(task) for task in tasks[:limit]]
+
+
+def _wait_for_terminal(task_id, wait_ms):
+    deadline = time.monotonic() + wait_ms / 1000.0
+    with TASK_CONDITION:
+        while True:
+            task = TASKS.get(task_id)
+            if task is None or task["status"] not in ("queued", "running"):
+                return task
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return task
+            TASK_CONDITION.wait(remaining)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -510,21 +650,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self, method):
         try:
-            path = urlsplit(self.path).path
-            if method == "GET" and path == "/healthz":
-                return self._json(200, {"ok": True, "agents": len(AGENTS), "tasks": len(TASKS)})
-            if method == "GET" and path == "/v1/agents":
-                return self._json(200, {"agents": _agent_listing()})
-            if method == "POST" and path == "/v1/tasks":
-                return self._submit()
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            if path == "/healthz":
+                if method == "GET":
+                    return self._json(200, {"ok": True, "agents": len(AGENTS),
+                                            "tasks": len(TASKS), "limits": _limits()})
+                return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/agents":
+                if method == "GET":
+                    return self._json(200, {"agents": _agent_listing()})
+                return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/tasks":
+                if method == "POST":
+                    return self._submit()
+                if method == "GET":
+                    return self._list(query)
+                return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/admin/reload":
+                if method == "POST":
+                    return self._reload()
+                return self._json(405, {"error": "method_not_allowed"})
             match = re.fullmatch(r"/v1/tasks/([^/]+)", path)
             if match:
-                task = TASKS.get(match.group(1))
+                task_id = match.group(1)
                 if method == "GET":
-                    return self._json(200, visible(task)) if task else self._json(404, {"error": "unknown_task"})
+                    return self._get_task(task_id, query)
                 if method == "DELETE":
-                    return self._cancel(task)
-            if match or path in ("/v1/tasks", "/v1/agents", "/healthz"):
+                    return self._cancel(TASKS.get(task_id))
                 return self._json(405, {"error": "method_not_allowed"})
             return self._json(404, {"error": "not_found"})
         except Exception as exc:  # noqa: BLE001 - never leak a stack trace to the client
@@ -544,6 +698,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "invalid_json"})
         if not isinstance(request, dict):
             return self._json(400, {"error": "invalid_request"})
+        unknown = sorted(set(request) - TASK_FIELDS)
+        if unknown:
+            return self._json(400, {"error": "unknown_field",
+                                    "message": f"Unknown request field: {unknown[0]}"})
         agent = AGENTS.get(request.get("agentId"))
         if agent is None:
             return self._json(404, {"error": "unknown_agent"})
@@ -559,20 +717,36 @@ class Handler(BaseHTTPRequestHandler):
         timeout_ms = request.get("timeoutMs")
         if timeout_ms is not None and not _is_positive_int(timeout_ms):
             return self._json(400, {"error": "invalid_timeout"})
+        task_cwd, cwd_error = _resolve_task_cwd(agent, request.get("cwd"))
+        if cwd_error:
+            message = (f"cwd is not inside an allowed root for agent {agent['id']}"
+                       if cwd_error == "cwd_not_allowed"
+                       else f"cwd is not a directory: {request.get('cwd')}")
+            return self._json(400, {"error": cwd_error, "message": message})
         if agent["type"] == "command" and len(input_text.encode("utf-8")) > MAX_COMMAND_INPUT:
             return self._json(413, {"error": "command_input_too_large"})
+        if timeout_ms is not None:
+            task_timeout = timeout_ms
+        elif agent.get("timeoutMs"):
+            task_timeout = agent["timeoutMs"]
+        else:
+            task_timeout = TIMEOUT_MS
+        if MAX_TIMEOUT_MS and task_timeout > MAX_TIMEOUT_MS:
+            return self._json(400, {
+                "error": "invalid_timeout",
+                "message": f"timeoutMs exceeds A2A_RELAY_MAX_TIMEOUT_MS ({MAX_TIMEOUT_MS})"})
         request_key = None if request_id is None else f"{agent['id']}\0{request_id}"
         with LOCK:
             prior = REQUEST_IDS.get(request_key) if request_key else None
             if prior is not None:
                 if (prior["input"] != input_text
                         or prior.get("_requested_session_id") != session_id
-                        or prior.get("_requested_timeout_ms") != timeout_ms):
+                        or prior.get("_requested_timeout_ms") != timeout_ms
+                        or prior.get("_requested_cwd") != request.get("cwd")):
                     return self._json(409, {"error": "idempotency_conflict"})
                 return self._json(200, visible(prior))
             if not _make_room():
                 return self._json(503, {"error": "task_capacity_reached"})
-            task_timeout = min(timeout_ms or agent.get("timeoutMs") or TIMEOUT_MS, TIMEOUT_MS)
             task = {
                 "id": str(uuid.uuid4()),
                 "sessionId": session_id or str(uuid.uuid4()),
@@ -582,16 +756,61 @@ class Handler(BaseHTTPRequestHandler):
                 "createdAt": now_iso(),
                 "timeoutMs": task_timeout,
             }
+            if task_cwd:
+                task["cwd"] = task_cwd
             if request_key:
                 task["requestId"] = request_id
                 task["_request_key"] = request_key
                 task["_requested_session_id"] = session_id
                 task["_requested_timeout_ms"] = timeout_ms
+                task["_requested_cwd"] = request.get("cwd")
                 REQUEST_IDS[request_key] = task
             TASKS[task["id"]] = task
             QUEUE.append(task)
         self._json(202, visible(task))
         _drain()
+
+    def _get_task(self, task_id, query):
+        wait_raw = query.get("waitMs", [None])[0]
+        if wait_raw is None:
+            task = TASKS.get(task_id)
+        else:
+            try:
+                wait_ms = int(wait_raw)
+            except ValueError:
+                return self._json(400, {"error": "invalid_wait"})
+            if wait_ms <= 0 or wait_ms > MAX_WAIT_MS:
+                return self._json(400, {"error": "invalid_wait"})
+            task = _wait_for_terminal(task_id, wait_ms)
+        return self._json(200, visible(task)) if task else self._json(404, {"error": "unknown_task"})
+
+    def _list(self, query):
+        session_id = query.get("sessionId", [None])[0]
+        status = query.get("status", [None])[0]
+        if session_id is not None and not _valid(session_id):
+            return self._json(400, {"error": "invalid_session_id"})
+        if status is not None and status not in STATUSES:
+            return self._json(400, {"error": "invalid_status"})
+        limit = 100
+        limit_raw = query.get("limit", [None])[0]
+        if limit_raw is not None:
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                return self._json(400, {"error": "invalid_limit"})
+            if limit <= 0:
+                return self._json(400, {"error": "invalid_limit"})
+        limit = min(limit, MAX_TASKS)
+        return self._json(200, {"tasks": _list_tasks(session_id, status, limit)})
+
+    def _reload(self):
+        if self.client_address[0] not in ("127.0.0.1", "::1", "localhost"):
+            return self._json(403, {"error": "forbidden"})
+        try:
+            path = reload_registry()
+        except (OSError, ValueError) as exc:
+            return self._json(400, {"error": "configuration_error", "message": str(exc)})
+        return self._json(200, {"ok": True, "agents": len(AGENTS), "registry": str(path)})
 
     def _cancel(self, task):
         global ACTIVE
@@ -611,6 +830,7 @@ class Handler(BaseHTTPRequestHandler):
                 task["status"] = "cancelled"
                 task["finishedAt"] = now_iso()
                 task.pop("_proc", None)
+                TASK_CONDITION.notify_all()
         self._json(200, visible(task))
         _drain()
 
@@ -631,18 +851,38 @@ def _shutdown(signum, _frame):
     os._exit(0)
 
 
+def _reload_signal(_signum, _frame):
+    try:
+        path = reload_registry()
+    except (OSError, ValueError) as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr, flush=True)
+        return
+    print(f"Reloaded registry from {path} ({len(AGENTS)} agents)", flush=True)
+
+
 def main():
     global AGENTS
+    path = config_path()
     try:
-        AGENTS = load_registry(CONFIG_PATH)
+        AGENTS = load_registry(str(path))
     except (OSError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _reload_signal)
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(f"error: port {PORT} is in use (another relay?); set A2A_RELAY_PORT",
+                  file=sys.stderr)
+            return 1
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     server.daemon_threads = True
-    print(f"A2A relay listening at http://{HOST}:{PORT}", flush=True)
+    print(f"agent-relay listening at http://{HOST}:{PORT} (registry: {path})", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
