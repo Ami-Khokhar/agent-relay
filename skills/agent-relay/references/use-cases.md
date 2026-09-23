@@ -1,24 +1,29 @@
 # Use-case patterns
 
 The relay is a job board, not a shared memory. Each task is a fresh invocation, and results
-come back by polling. Build the user's workflow from these patterns.
+come back by waiting or polling. Build the user's workflow from these patterns.
 
 Before any pattern: confirm the target CLIs exist (`which <command>`), register them, start
 the relay, and verify with `GET /v1/agents`.
 
-Throughout, "delegate" means `POST /v1/tasks` (or the MCP `delegate` tool) followed by
-polling `GET /v1/tasks/:id` (or `get_task`) until the status is terminal.
+Throughout, "delegate" means `POST /v1/tasks` (or the MCP `delegate` tool). Prefer the
+long poll — `GET /v1/tasks/:id?waitMs=<ms>` (or MCP `wait_task`) — over a `get_task` loop:
+one call instead of many, and it does not stop too early. Use `GET /v1/tasks?sessionId=...`
+(or `list_tasks`) to recover task IDs after an orchestrator context reset.
 
 ## 1. Single delegation
 
 The user wants agent A to do a job on agent B.
 
-1. Pick the agent whose `cwd` is the project B should edit.
+1. Pick the agent whose `cwd` is the project B should edit, or pass a per-task `cwd` that
+   is inside the agent's `allowedRoots`.
 2. Submit one task with a self-contained `input` and a `requestId`.
-3. Poll until terminal; report `output` (or `error`).
+3. `wait_task` until terminal; report `output` (or `error`).
 4. If the user changes their mind, `cancel_task`.
 
-Use a generous `timeoutMs` for real coding work (the default is 120s, often too short).
+Use a generous `timeoutMs` for real coding work. The default is 15 minutes; set a
+per-agent `timeoutMs` for tasks that need longer, and `A2A_RELAY_MAX_TIMEOUT_MS` only if
+you want a hard ceiling.
 
 ## 2. Fan-out and compare
 
@@ -27,21 +32,23 @@ Run the same prompt on several agents, then compare.
 - Register each harness, submit one task per `agentId` with the **same** `sessionId` value
   (a correlation tag) and distinct `requestId`s.
 - Keep within `A2A_RELAY_MAX_ACTIVE`; the rest queue automatically.
-- Poll all task IDs, then present a table of agent → status → output.
+- `wait_task` on each task ID (or `list_tasks` for the session), then present a table of
+  agent → status → output.
 
 ```
 sessionId = "compare-<date>"
 for agent in claude codex pi:
-    delegate(agentId=agent, input=PROMPT, sessionId=sessionId, requestId=f"{agent}-compare")
+    task = delegate(agentId=agent, input=PROMPT, sessionId=sessionId,
+                    requestId=f"{agent}-compare", waitMs=600000)
 ```
 
 ## 3. Pipeline / chaining
 
 A produces, B reviews, C fixes. Pass each output into the next `input`.
 
-1. `outA = delegate(A, spec)`
-2. `outB = delegate(B, "Review this and list concrete problems:\n" + outA.output)`
-3. `outC = delegate(C, "Apply these fixes:\n" + outB.output)`
+1. `outA = delegate(A, spec)` → `wait_task`
+2. `outB = delegate(B, "Review this and list concrete problems:\n" + outA.output)` → `wait_task`
+3. `outC = delegate(C, "Apply these fixes:\n" + outB.output)` → `wait_task`
 
 Give the whole chain one `sessionId` for traceability. If an agent is itself wired to the
 relay as an MCP client, it can delegate further on its own — the relay does not need to know.
@@ -60,20 +67,22 @@ Two harnesses checking each other:
 If the harness exposes only an API or needs structured output:
 
 1. Copy `examples/stdio_adapter.py`.
-2. Replace `runHarness` with code that calls the harness and returns text.
+2. Replace `run_harness` with code that calls the harness and returns text.
 3. Register it as `type: "stdio"`.
 4. Test it by piping a request document (see [adapters.md](adapters.md)).
 
 ## 6. Expose delegation to an MCP client
 
-Add the MCP server to the client's config and start the HTTP service alongside it. The
-client then sees `list_agents`, `delegate`, `get_task`, `cancel_task`. Because submission
-is asynchronous, instruct the client to poll `get_task` until terminal.
+Add the MCP server to the client's config and start the HTTP service alongside it (or let
+the MCP process start it on demand). The client then sees `list_agents`, `delegate`,
+`wait_task`, `get_task`, `list_tasks`, `cancel_task`. Because submission is asynchronous,
+use `delegate` with `waitMs` or `wait_task` to block until the result is ready.
 
 ## Choosing limits
 
-- `timeoutMs` per task: sized to the work; the effective value is
-  `min(request.timeoutMs ?? agent.timeoutMs ?? global, global)`.
+- `timeoutMs` per task: sized to the work. A request value wins over the agent value, which
+  wins over the global default (`A2A_RELAY_TIMEOUT_MS`, 900000). A per-agent value is not
+  capped by the default; `A2A_RELAY_MAX_TIMEOUT_MS` is the optional hard cap.
 - `A2A_RELAY_MAX_ACTIVE`: how many run at once (default 4). Raise for fan-out, lower to
   protect a machine.
 - `A2A_RELAY_MAX_OUTPUT_BYTES`: raise if agents return large reports (default 256 KiB).

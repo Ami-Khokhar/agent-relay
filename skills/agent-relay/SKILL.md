@@ -1,12 +1,12 @@
 ---
 name: agent-relay
-description: Set up agent-relay and communicate with other coding agents through it. Use when the user wants cross-harness delegation, fan-out across agents, or agent chaining. Covers installing the relay, registering agents, starting HTTP/MCP, and submitting, polling, and cancelling tasks.
+description: Set up agent-relay and communicate with other coding agents through it. Use when the user wants cross-harness delegation, fan-out across agents, or agent chaining. Covers installing the relay, registering agents, starting HTTP/MCP, and submitting, waiting on, polling, listing, and cancelling tasks.
 ---
 
 # Agent Relay
 
 `agent-relay` is a small local service (Python 3.9+, zero dependencies) that lets one
-agent hand a **new** task to another agent, then inspect, poll, or cancel it. The relay
+agent hand a **new** task to another agent, then wait on, inspect, or cancel it. The relay
 owns task IDs, queueing, status, timeouts, cancellation, idempotency, and a registry of
 adapters. It speaks HTTP as its core transport and exposes the same service as MCP tools
 for orchestrating agents.
@@ -30,7 +30,8 @@ Use it when the user wants to:
 - run the same job on several agents and compare results;
 - chain agents (A writes → B reviews → C fixes);
 - wrap a harness that has no convenient CLI behind a small adapter;
-- give an MCP client the tools `list_agents`, `delegate`, `get_task`, `cancel_task`.
+- give an MCP client the tools `list_agents`, `delegate`, `wait_task`, `get_task`,
+  `list_tasks`, `cancel_task`.
 
 ## Prerequisites
 
@@ -43,25 +44,32 @@ Use it when the user wants to:
 Run the bundled setup script (idempotent):
 
 ```bash
-bash scripts/setup.sh
+bash scripts/setup.sh              # clones to ~/.local/share/agent-relay by default
+bash scripts/setup.sh --install-skill   # also link the skill into agent skill dirs
 ```
 
-It verifies Python 3.9+, locates an existing checkout or clones the repo, copies
-`config/agents.example.json` to `config/agents.json` if missing, and runs a self-test.
+It verifies Python 3.9+, locates an existing checkout or clones the repo to a stable
+per-user path, scaffolds the registry, runs a self-test, and prints copy-paste MCP
+registration for each client. `--install-skill` symlinks `skills/agent-relay` into
+`~/.claude/skills/`, `~/.codex/skills/`, and `~/.agents/skills/`.
+
 Override with env vars: `AGENT_RELAY_SOURCE` (use an existing checkout),
-`AGENT_RELAY_DIR` (clone target, default `agent-relay`), `AGENT_RELAY_REPO` (git URL).
+`AGENT_RELAY_DIR` (install dir, default `~/.local/share/agent-relay`),
+`AGENT_RELAY_REPO` (git URL), `AGENT_RELAY_INSTALL_SKILL=1`.
 
 To do it manually:
 
 ```bash
-git clone https://github.com/Ami-Khokhar/agent-relay.git && cd agent-relay
-cp config/agents.example.json config/agents.json
+git clone https://github.com/Ami-Khokhar/agent-relay.git ~/.local/share/agent-relay
+mkdir -p ~/.config/agent-relay
+cp ~/.local/share/agent-relay/config/agents.example.json ~/.config/agent-relay/agents.json
 ```
 
 ## 2. Write the agent registry
 
-Edit `config/agents.json`. Each entry is one target agent. Choose the adapter by how the
-harness is invoked:
+The relay reads, in order: `A2A_AGENTS_FILE` when set, then
+`~/.config/agent-relay/agents.json` when it exists, then `config/agents.json` in the
+checkout. Each entry is one target agent. Choose the adapter by how the harness is invoked:
 
 | Adapter | Use when | Required fields |
 | --- | --- | --- |
@@ -75,7 +83,7 @@ Common harnesses (verify flags against the installed version first):
 {
   "agents": [
     { "id": "claude",   "name": "Claude Code", "command": "claude",   "args": ["--print"], "cwd": "/path/to/project" },
-    { "id": "codex",    "name": "Codex",       "command": "codex",    "args": ["exec"],    "cwd": "/path/to/git/project" },
+    { "id": "codex",    "name": "Codex",       "command": "codex",    "args": ["exec", "--skip-git-repo-check", "-s", "workspace-write"], "cwd": "/path/to/git/project", "allowedRoots": ["/path/to/git/project"] },
     { "id": "pi",       "name": "Pi",          "command": "pi",       "args": ["--print"], "cwd": "/path/to/project" },
     { "id": "opencode", "name": "OpenCode",    "command": "opencode", "args": ["run"],     "cwd": "/path/to/project" },
     { "id": "dsh",      "name": "DeepSeek",    "command": "dsh",      "args": ["--profile", "headless"] },
@@ -85,10 +93,23 @@ Common harnesses (verify flags against the installed version first):
 }
 ```
 
-Per-agent optional fields: `description`, `cwd`, `env` (extra env for the child),
-`inheritEnv` (names of relay env vars to pass through, e.g. credentials), `timeoutMs`.
-`capabilities` may only declare what is true; the relay rejects `nativeSessions: true`,
-`streaming: true`, and `newTasks: false` in this version.
+Per-agent optional fields:
+
+- `timeoutMs` — this agent's timeout. It is the effective value; the global
+  `A2A_RELAY_TIMEOUT_MS` is only the default for agents that omit it. Set
+  `A2A_RELAY_MAX_TIMEOUT_MS` for a hard cap (a per-agent value above it is a startup error).
+- `cwd` — default working directory, and always an allowed per-task target.
+- `allowedRoots` — directories a caller may pass as a per-task `cwd`. A `cwd` outside every
+  root is rejected with `400 cwd_not_allowed`.
+- `env` / `inheritEnv` — extra child environment, or names of relay env vars to pass
+  through (for example a credential).
+- `description` — free text shown by `GET /v1/agents`.
+- `capabilities` may only declare what is true; the relay rejects `nativeSessions: true`,
+  `streaming: true`, and `newTasks: false` in this version.
+
+Codex note: `codex exec` fails outside a git repo without `--skip-git-repo-check`, and it
+runs read-only unless `-s workspace-write` is added. Both flags are shown above (checked
+against codex-cli 0.155.1).
 
 **Security:** command/stdio agents inherit only basic env vars (`PATH`, `HOME`, `USER`,
 `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, Windows equivalents). To pass a credential, list its
@@ -101,10 +122,20 @@ python3 src/server.py     # HTTP API on http://127.0.0.1:43124
 python3 src/mcp_server.py # MCP stdio server, in a second process
 ```
 
-The HTTP service is the core; MCP is a thin client over it, so start HTTP first. `SIGTERM`
-or `SIGINT` cancels running tasks and waits briefly for adapters to stop.
+The HTTP service is the core; MCP is a thin client over it. You do not have to start HTTP
+yourself: when the MCP process cannot reach a loopback relay it starts `server.py`
+detached (log: `~/.local/state/agent-relay/relay.log`). To keep it up across reboots, run
+`bash scripts/install-service.sh`. `SIGTERM` or `SIGINT` cancels running tasks and waits
+briefly for adapters to stop.
 
-Register the MCP server in the orchestrating client (point `args` at the absolute path):
+Register the MCP server in the orchestrating client (point `args` at the absolute path).
+The setup script prints these for your checkout:
+
+```bash
+claude mcp add --scope user agent-relay \
+  -e A2A_RELAY_URL=http://127.0.0.1:43124 \
+  -- python3 /abs/path/to/agent-relay/src/mcp_server.py
+```
 
 ```json
 { "mcpServers": { "agent-relay": {
@@ -114,39 +145,48 @@ Register the MCP server in the orchestrating client (point `args` at the absolut
 } } }
 ```
 
+Codex uses `[mcp_servers.agent-relay]` in `~/.codex/config.toml`; OpenCode uses an
+`"mcp"` entry in `opencode.json`. See the README for both.
+
 ## 4. Verify
 
 ```bash
 curl -sS http://127.0.0.1:43124/healthz
 curl -sS http://127.0.0.1:43124/v1/agents
+bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints the result
 ```
 
-`/v1/agents` should list your entries with `adapter` and `capabilities`. If it is empty,
-the registry did not parse — the relay prints `Configuration error: ...` and exits on a
-bad registry, so check the server log.
+`/v1/agents` lists your entries with `adapter`, effective `timeoutMs`, and `capabilities`.
+If it is empty, the registry did not parse — the relay prints `Configuration error: ...`
+and exits on a bad registry, so check the server log.
 
 ## 5. Delegate work
 
-**Via HTTP** (submit returns `202` immediately; then poll):
+**Via HTTP** (submit returns `202` immediately; then long-poll):
 
 ```bash
 TASK=$(curl -sS http://127.0.0.1:43124/v1/tasks \
   -H 'content-type: application/json' \
-  -d '{"agentId":"claude","requestId":"review-1","input":"Inspect this repo and list the top 3 risks"}')
+  -d '{"agentId":"claude","requestId":"review-1","input":"Inspect this repo and list the top 3 risks","cwd":"/path/to/project"}')
 echo "$TASK"
 ID=$(printf '%s' "$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-curl -sS "http://127.0.0.1:43124/v1/tasks/$ID"
-curl -sS -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"   # cancel
+curl -sS "http://127.0.0.1:43124/v1/tasks/$ID?waitMs=600000"   # blocks until terminal
+curl -sS "http://127.0.0.1:43124/v1/tasks?sessionId=review-1"   # list by session
+curl -sS -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # cancel
 ```
 
 **Via MCP** tools:
 
 - `list_agents {}` → registered agents.
-- `delegate { agentId, input, sessionId?, requestId?, timeoutMs? }` → task.
+- `delegate { agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` → task.
+  With `waitMs`, `delegate` long-polls and returns the terminal task.
+- `wait_task { taskId, maxWaitMs? }` → holds the call until terminal or the wait elapses.
 - `get_task { taskId }` → current task state and result.
+- `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
 - `cancel_task { taskId }` → cancel a queued or running task.
 
-**Always poll `get_task` until the status is terminal** — there is no push notification.
+**Prefer `wait_task` over a `get_task` polling loop** — one call instead of many, and it
+does not stop polling too early.
 
 ## Task lifecycle
 
@@ -165,10 +205,11 @@ submission response may have been lost. Without a `requestId`, do not auto-retry
 1. **Identify the target agent(s)** the user means, and confirm their CLIs exist (`which`).
 2. **Pick the adapter**: `command` for a simple prompt-as-final-arg CLI; `stdio`/`http`
    when the harness needs a wrapper or returns structured data.
-3. **Register** them in `config/agents.json`, set `cwd` to the project each should edit.
-4. **Choose limits**: `timeoutMs` per task/agent, and the global concurrency via
-   `A2A_RELAY_MAX_ACTIVE` (default 4; extra tasks queue).
-5. **Submit, poll, and present** the `output`/`error` to the user. Cancel if they change
+3. **Register** them in the registry, set `cwd` to the project each should edit, and add
+   `allowedRoots` if the caller must target more than one project directory.
+4. **Choose limits**: `timeoutMs` per task/agent (default 15 minutes), and the global
+   concurrency via `A2A_RELAY_MAX_ACTIVE` (default 4; extra tasks queue).
+5. **Submit, wait, and present** the `output`/`error` to the user. Cancel if they change
    their mind. For multi-agent patterns and worked examples, read
    [references/use-cases.md](references/use-cases.md).
 
@@ -202,11 +243,15 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   exposes an unauthenticated service that can run your coding agents — never do it without
   an authenticated HTTPS boundary.
 - Tasks are in memory and disappear on restart; old terminal tasks are evicted when the
-  store fills. There is no list-tasks endpoint: keep task IDs.
-- Limits (all positive integers): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
+  store fills. `GET /v1/tasks?sessionId=...` lists what is still stored.
+- Edit the registry and reload without losing tasks: `POST /v1/admin/reload` (loopback
+  only) or `kill -HUP <pid>`.
+- Limits (positive integers unless noted): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
   `A2A_RELAY_MAX_COMMAND_INPUT_BYTES` (64 KiB, command adapter only),
   `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (1000),
-  `A2A_RELAY_MAX_ACTIVE` (4), `A2A_RELAY_TIMEOUT_MS` (120000).
+  `A2A_RELAY_MAX_ACTIVE` (4), `A2A_RELAY_MAX_WAIT_MS` (600000),
+  `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap).
+  Every variable also accepts an `AGENT_RELAY_*` spelling.
 - Cancellation of a spawned adapter sends process signals; cancellation of an HTTP adapter
   aborts the request and may not stop work already accepted by that service.
 
@@ -214,8 +259,11 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 
 | Symptom | Cause / fix |
 | --- | --- |
-| Relay exits with `Configuration error: ...` | Invalid `config/agents.json`; the message names the agent. |
-| `404 unknown_agent` | `agentId` not in the registry, or registry changed without restart. |
+| Relay exits with `Configuration error: ...` | Invalid registry; the message names the agent. |
+| Relay exits with `port ... is in use` | Another relay is running; set `A2A_RELAY_PORT`. |
+| `404 unknown_agent` | `agentId` not in the registry, or reload after editing. |
+| `400 cwd_not_allowed` | Per-task `cwd` is outside the agent's `allowedRoots`/`cwd`; add the root. |
+| `400 unknown_field` | A request field is misspelled or unsupported; the message names it. |
 | `413 command_input_too_large` | Input exceeds `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`; use a `stdio` adapter for large prompts. |
 | `503 task_capacity_reached` | Store full of non-terminal tasks; raise `A2A_RELAY_MAX_TASKS`/`A2A_RELAY_MAX_ACTIVE` or wait. |
 | `409 idempotency_conflict` | Same `requestId` reused with different fields; use a new ID. |

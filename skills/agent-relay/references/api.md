@@ -7,21 +7,29 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
 ### `GET /healthz`
 
 ```json
-{ "ok": true, "agents": 3, "tasks": 0 }
+{ "ok": true, "agents": 3, "tasks": 0,
+  "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
+              "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
+              "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4 } }
 ```
+
+`maxTimeoutMs` is `null` when no hard cap is configured.
 
 ### `GET /v1/agents`
 
 ```json
 { "agents": [
   { "id": "claude", "name": "Claude Code", "description": "...",
-    "adapter": "command",
+    "adapter": "command", "timeoutMs": 900000,
+    "cwd": "/path/to/project", "allowedRoots": ["/path/to/project"],
     "capabilities": { "newTasks": true, "nativeSessions": false, "streaming": false,
                       "cancellation": "process_signal" } }
 ] }
 ```
 
-`cancellation` is `process_signal` for command/stdio adapters and `request_only` for HTTP.
+`timeoutMs` is the effective timeout for that agent. `cancellation` is `process_signal`
+for command/stdio adapters and `request_only` for HTTP. `cwd` and `allowedRoots` appear
+only when configured.
 
 ### `POST /v1/tasks`
 
@@ -33,13 +41,15 @@ Body:
 | `input` | yes | Non-empty string; bounded by body and (for `command`) command-input limits. |
 | `sessionId` | no | ≤128 chars; correlation tag. Defaults to a new UUID. |
 | `requestId` | no | ≤128 chars; idempotency key scoped per agent. |
-| `timeoutMs` | no | Positive integer; capped by the global timeout. |
+| `timeoutMs` | no | Positive integer. Overrides the agent/global timeout; rejected if above `A2A_RELAY_MAX_TIMEOUT_MS`. |
+| `cwd` | no | Absolute or relative path. Must be inside the agent's `allowedRoots` (or equal to its `cwd`), else `400 cwd_not_allowed`. |
 
-Returns `202` with the task:
+Unknown fields are rejected with `400 unknown_field`. Returns `202` with the task:
 
 ```json
 { "id": "uuid", "sessionId": "uuid", "agentId": "claude", "input": "...",
-  "status": "queued", "createdAt": "ISO-8601", "timeoutMs": 120000, "requestId": "..." }
+  "status": "queued", "createdAt": "ISO-8601", "timeoutMs": 900000,
+  "cwd": "/path/to/project", "requestId": "..." }
 ```
 
 Idempotent replay with the same `requestId` and identical fields returns `200` with the
@@ -50,10 +60,33 @@ original task. Different fields with the same `requestId` return `409`.
 Returns the current task. Terminal tasks additionally include `startedAt`, `finishedAt`,
 and usually `output` / `error` / `outputTruncated`.
 
+Add `?waitMs=<ms>` to long-poll: the server holds the request until the task is terminal or
+the wait elapses (maximum `A2A_RELAY_MAX_WAIT_MS`). An invalid value returns `400 invalid_wait`.
+
+### `GET /v1/tasks`
+
+Lists stored tasks, most recent first. Query parameters:
+
+| Parameter | Notes |
+| --- | --- |
+| `sessionId` | Filter by session. |
+| `status` | One of the status values; anything else is `400 invalid_status`. |
+| `limit` | Positive integer, capped at `A2A_RELAY_MAX_TASKS` (default 100). |
+
+Returns `{ "tasks": [ ... ] }`.
+
 ### `DELETE /v1/tasks/:id`
 
 Cancels a `queued` or `running` task and returns it with status `cancelled`. Terminal
 tasks are returned unchanged.
+
+### `POST /v1/admin/reload`
+
+Reloads the registry from disk without dropping in-memory tasks. Accepted only from
+loopback (`403 forbidden` otherwise). Returns `{ "ok": true, "agents": n, "registry": "..." }`.
+An invalid registry returns `400 configuration_error` and keeps the running registry.
+
+`SIGHUP` performs the same reload.
 
 ## Status values
 
@@ -63,7 +96,8 @@ tasks are returned unchanged.
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
-| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout` | Malformed request. |
+| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_wait`, `invalid_status`, `invalid_limit`, `configuration_error` | Malformed request or registry. |
+| 403 | `forbidden` | Admin route called from a non-loopback address. |
 | 404 | `unknown_agent`, `unknown_task`, `not_found` | Missing agent/task/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
 | 409 | `idempotency_conflict` | `requestId` reused with different fields. |
@@ -76,21 +110,27 @@ tasks are returned unchanged.
 The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
 - `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo }`
-- `tools/list` → the four tools below
+- `tools/list` → the six tools below
 - `ping`
 - `tools/call`
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `list_agents` | `{}` | Same payload as `GET /v1/agents`. |
-| `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs? }` | Submitted task. |
+| `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` | Submitted task; with `waitMs`, the terminal task. |
+| `wait_task` | `{ taskId, maxWaitMs? }` | Terminal task, or the current task if the wait elapses. |
 | `get_task` | `{ taskId }` | Current task. |
+| `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
 | `cancel_task` | `{ taskId }` | Cancelled task. |
 
 Each result is returned as `content: [{ type: "text", text: "<json>" }]` plus
 `structuredContent` holding the same object. Relay errors come back as `isError: true`
 with `structuredContent` such as `{ "error": "unknown_task", "message": "...", "status": 404 }`.
 Invalid tool arguments raise JSON-RPC error `-32602` before any HTTP call.
+
+When the relay is unreachable and `A2A_RELAY_URL` is loopback, the MCP process starts
+`src/server.py` detached (log `~/.local/state/agent-relay/relay.log`) and retries once.
+Set `A2A_RELAY_AUTOSTART=0` to disable.
 
 ## Task object fields
 
@@ -103,8 +143,10 @@ Invalid tool arguments raise JSON-RPC error `-32602` before any HTTP call.
 | `status` | always | See status values. |
 | `createdAt` | always | ISO-8601. |
 | `timeoutMs` | always | Effective timeout. |
+| `cwd` | if set | Effective working directory for the task. |
 | `requestId` | if supplied | Echoed idempotency key. |
 | `startedAt` | running+ | ISO-8601. |
 | `finishedAt` | terminal | ISO-8601. |
 | `output` | success | Captured result text. |
 | `error` | failure/timeout | Failure reason. |
+| `outputTruncated` | on truncation | True when output hit the byte limit. |
