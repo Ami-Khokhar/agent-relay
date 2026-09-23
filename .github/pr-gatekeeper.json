@@ -5,7 +5,7 @@
     "test/test_*.py",
     "tests/**/test_*.py"
   ],
-  "test_command": "python3 -m unittest {files}",
+  "test_command": "python3 -m unittest discover -s test -p 'test_*.py'",
   "protected_paths": [
     ".github/",
     "AGENTS.md"
