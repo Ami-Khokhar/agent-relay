@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Idempotent setup for agent-relay.
 #
-# Locates or clones the source, verifies Node.js 22+, scaffolds the agent registry
+# Locates or clones the source, verifies Python 3.9+, scaffolds the agent registry
 # from the example if missing, and runs the self-test.
 #
 # Env overrides:
@@ -13,22 +13,24 @@ set -euo pipefail
 REPO_URL="${AGENT_RELAY_REPO:-https://github.com/Ami-Khokhar/agent-relay.git}"
 TARGET_DIR="${AGENT_RELAY_DIR:-agent-relay}"
 
-# 1. Node.js 22+
-if ! command -v node >/dev/null 2>&1; then
-  echo "error: Node.js 22 or newer is required but 'node' was not found." >&2
+# 1. Python 3.9+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: Python 3.9 or newer is required but 'python3' was not found." >&2
   exit 1
 fi
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-if [ "$NODE_MAJOR" -lt 22 ]; then
-  echo "error: Node.js 22 or newer is required; found $(node -v)." >&2
+PY_VERSION="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+PY_MAJOR="${PY_VERSION%%.*}"
+PY_MINOR="${PY_VERSION##*.}"
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 9 ]; }; then
+  echo "error: Python 3.9 or newer is required; found $(python3 --version 2>&1)." >&2
   exit 1
 fi
-echo "node $(node -v) ok"
+echo "python $PY_VERSION ok"
 
 # 2. Locate or clone the source
 if [ -n "${AGENT_RELAY_SOURCE:-}" ]; then
   SRC="$AGENT_RELAY_SOURCE"
-elif [ -f package.json ] && grep -q '"name": *"agent-relay"' package.json; then
+elif [ -f pyproject.toml ] && grep -q 'name = "agent-relay"' pyproject.toml; then
   SRC="$PWD"
 elif [ -d "$TARGET_DIR/.git" ]; then
   SRC="$PWD/$TARGET_DIR"
@@ -42,7 +44,7 @@ fi
 SRC="$(cd "$SRC" && pwd)"
 echo "source: $SRC"
 
-if [ ! -f "$SRC/src/server.mjs" ] || [ ! -f "$SRC/src/mcp-server.mjs" ]; then
+if [ ! -f "$SRC/src/server.py" ] || [ ! -f "$SRC/src/mcp_server.py" ]; then
   echo "error: $SRC does not look like an agent-relay checkout." >&2
   exit 1
 fi
@@ -56,10 +58,10 @@ else
 fi
 
 # 4. Self-test (non-fatal)
-if ( cd "$SRC" && node --test "test/**/*.test.mjs" >/dev/null 2>&1 ); then
+if ( cd "$SRC" && python3 -W ignore::ResourceWarning -m unittest discover -s test -p 'test_*.py' >/dev/null 2>&1 ); then
   echo "self-test passed"
 else
-  echo "warning: self-test did not pass; inspect with: cd \"$SRC\" && npm test"
+  echo "warning: self-test did not pass; inspect with: cd \"$SRC\" && python3 -m unittest discover -s test -p 'test_*.py'"
 fi
 
 cat <<EOF
@@ -68,9 +70,9 @@ Next steps:
   cd "$SRC"
   # 1. edit config/agents.json to register your target harnesses
   # 2. start the HTTP service (core):
-  node src/server.mjs
+  python3 src/server.py
   # 3. optionally start the MCP stdio server in another process:
-  node src/mcp-server.mjs
+  python3 src/mcp_server.py
 
 Verify:  curl -sS http://127.0.0.1:43124/v1/agents
 EOF

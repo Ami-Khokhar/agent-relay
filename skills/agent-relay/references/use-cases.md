@@ -59,7 +59,7 @@ Two harnesses checking each other:
 
 If the harness exposes only an API or needs structured output:
 
-1. Copy `examples/stdio-adapter.mjs`.
+1. Copy `examples/stdio_adapter.py`.
 2. Replace `runHarness` with code that calls the harness and returns text.
 3. Register it as `type: "stdio"`.
 4. Test it by piping a request document (see [adapters.md](adapters.md)).
