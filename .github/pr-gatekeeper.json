@@ -1,5 +1,5 @@
 {
-  "verify": "python3 -m unittest discover -s tests -p 'test_*.py'",
+  "verify": "python3 -m unittest discover -s test -p 'test_*.py'",
   "test_file_globs": [
     "tests/test_*.py",
     "test/test_*.py",
