@@ -4,7 +4,7 @@
     { "id": "codex", "name": "Codex", "command": "codex", "args": ["exec"], "cwd": "/path/to/git/project" },
     { "id": "pi", "name": "Pi", "command": "pi", "args": ["--print"], "cwd": "/path/to/project" },
     { "id": "opencode", "name": "OpenCode", "command": "opencode", "args": ["run"], "cwd": "/path/to/project" },
-    { "id": "wrapped", "name": "Any wrapped harness", "type": "stdio", "command": "node", "args": ["/path/to/adapter.mjs"], "cwd": "/path/to/project" },
+    { "id": "wrapped", "name": "Any wrapped harness", "type": "stdio", "command": "python3", "args": ["/path/to/adapter.py"], "cwd": "/path/to/project" },
     { "id": "hosted", "name": "Harness on its own port", "type": "http", "url": "http://127.0.0.1:9000/run" }
   ]
 }

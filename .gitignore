@@ -1,7 +1,8 @@
-node_modules/
-*.log
+__pycache__/
+*.pyc
 
 # Local registry (copy config/agents.example.json here); machine-specific paths.
 config/agents.json
 
+*.log
 .DS_Store

@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""agent-relay MCP stdio interface.
+
+A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the tools list_agents,
+delegate, get_task, and cancel_task. Set A2A_RELAY_URL to point at a non-default relay.
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import sys
+import threading
+
+RELAY_URL = (os.environ.get("A2A_RELAY_URL") or "http://127.0.0.1:43124").rstrip("/")
+_raw_timeout = os.environ.get("A2A_RELAY_HTTP_TIMEOUT_MS")
+if _raw_timeout is not None and _raw_timeout != "":
+    try:
+        REQUEST_TIMEOUT_MS = int(_raw_timeout)
+    except ValueError:
+        sys.exit("A2A_RELAY_HTTP_TIMEOUT_MS must be a positive integer")
+    if REQUEST_TIMEOUT_MS <= 0:
+        sys.exit("A2A_RELAY_HTTP_TIMEOUT_MS must be a positive integer")
+else:
+    REQUEST_TIMEOUT_MS = 10_000
+
+TOOLS = [
+    {
+        "name": "list_agents",
+        "description": "List agents registered with the relay",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "delegate",
+        "description": "Submit an asynchronous task to a registered agent",
+        "inputSchema": {
+            "type": "object", "required": ["agentId", "input"], "additionalProperties": False,
+            "properties": {
+                "agentId": {"type": "string", "minLength": 1, "maxLength": 128},
+                "input": {"type": "string", "minLength": 1},
+                "sessionId": {"type": "string", "minLength": 1, "maxLength": 128},
+                "requestId": {"type": "string", "minLength": 1, "maxLength": 128},
+                "timeoutMs": {"type": "integer", "minimum": 1},
+            },
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+    },
+    {
+        "name": "get_task",
+        "description": "Get the current state and result of a relay task",
+        "inputSchema": {
+            "type": "object", "required": ["taskId"], "additionalProperties": False,
+            "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128}},
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "cancel_task",
+        "description": "Cancel a queued or running relay task",
+        "inputSchema": {
+            "type": "object", "required": ["taskId"], "additionalProperties": False,
+            "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128}},
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+    },
+]
+
+
+class RpcError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class RelayError(Exception):
+    def __init__(self, status, data, message):
+        super().__init__(message)
+        self.status = status
+        self.data = data
+        self.message = message
+
+
+def _invalid(message):
+    raise RpcError(-32602, message)
+
+
+def _is_positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _arguments_for(rpc, allowed):
+    params = rpc.get("params") or {}
+    args = params.get("arguments") or {}
+    if not isinstance(args, dict):
+        _invalid("arguments must be an object")
+    for key in args:
+        if key not in allowed:
+            _invalid(f"Unknown argument: {key}")
+    return args
+
+
+def _non_empty(args, key, max_length=None):
+    value = args.get(key)
+    if not isinstance(value, str) or not value or (max_length and len(value) > max_length):
+        suffix = f" of at most {max_length} characters" if max_length else ""
+        _invalid(f"{key} must be a non-empty string{suffix}")
+
+
+def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
+    from urllib import error as urlerror
+    from urllib import request as urlrequest
+
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["content-type"] = "application/json"
+    request = urlrequest.Request(base_url + path, data=data, method=method, headers=headers)
+    try:
+        with urlrequest.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            code = response.status
+            ok = 200 <= code < 300
+    except urlerror.HTTPError as exc:
+        raw = exc.read()
+        code = exc.code
+        ok = False
+    except (urlerror.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        raise RelayError(None, {"error": "relay_request_failed", "message": str(getattr(exc, "reason", exc))},
+                         str(getattr(exc, "reason", exc)))
+    try:
+        value = json.loads(raw.decode("utf-8") or "null")
+    except ValueError:
+        value = {"error": "invalid_relay_response"}
+    valid_object = isinstance(value, dict)
+    if not ok:
+        data_object = value if valid_object else {"error": "invalid_relay_response"}
+        message = data_object.get("message") or data_object.get("error") or f"Relay returned {code}"
+        raise RelayError(code, data_object, message)
+    if not valid_object:
+        raise RelayError(None, {}, "Relay returned a non-object response")
+    return value
+
+
+def create_http_handler(base_url=None, timeout=None):
+    base_url = base_url if base_url is not None else RELAY_URL
+    timeout = timeout if timeout is not None else REQUEST_TIMEOUT_MS / 1000.0
+
+    def handle(rpc):
+        method = rpc.get("method")
+        if method == "initialize":
+            return {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "a2a-relay-http-mcp", "version": "0.1.0"},
+            }
+        if method == "tools/list":
+            return {"tools": TOOLS}
+        if method == "ping":
+            return {}
+        if method != "tools/call":
+            raise RpcError(-32601, "Method not found")
+        name = (rpc.get("params") or {}).get("name")
+        try:
+            if name == "list_agents":
+                _arguments_for(rpc, [])
+                value = _http_request(base_url, "/v1/agents", timeout=timeout)
+            elif name == "delegate":
+                args = _arguments_for(rpc, ["agentId", "input", "sessionId", "requestId", "timeoutMs"])
+                _non_empty(args, "agentId", 128)
+                _non_empty(args, "input")
+                if "sessionId" in args:
+                    _non_empty(args, "sessionId", 128)
+                if "requestId" in args:
+                    _non_empty(args, "requestId", 128)
+                if "timeoutMs" in args and not _is_positive_int(args["timeoutMs"]):
+                    _invalid("timeoutMs must be a positive integer")
+                payload = {"agentId": args["agentId"], "input": args["input"]}
+                for key in ("sessionId", "requestId", "timeoutMs"):
+                    if key in args:
+                        payload[key] = args[key]
+                value = _http_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
+            elif name == "get_task":
+                from urllib.parse import quote
+                args = _arguments_for(rpc, ["taskId"])
+                _non_empty(args, "taskId", 128)
+                value = _http_request(base_url, "/v1/tasks/" + quote(args["taskId"], safe=""), timeout=timeout)
+            elif name == "cancel_task":
+                from urllib.parse import quote
+                args = _arguments_for(rpc, ["taskId"])
+                _non_empty(args, "taskId", 128)
+                value = _http_request(base_url, "/v1/tasks/" + quote(args["taskId"], safe=""),
+                                      method="DELETE", timeout=timeout)
+            else:
+                raise RpcError(-32602, f"Unknown tool: {name or ''}")
+        except RpcError:
+            raise
+        except RelayError as exc:
+            data = exc.data or {}
+            payload = {"error": data.get("error") or "relay_request_failed", "message": exc.message}
+            if exc.status:
+                payload["status"] = exc.status
+            return {"content": [{"type": "text", "text": json.dumps(payload)}],
+                    "structuredContent": payload, "isError": True}
+        return {"content": [{"type": "text", "text": json.dumps(value)}], "structuredContent": value}
+
+    return handle
+
+
+def _write(output_stream, lock, value):
+    with lock:
+        output_stream.write(json.dumps(value) + "\n")
+        output_stream.flush()
+
+
+def serve(input_stream=None, output_stream=None, handler=None):
+    input_stream = input_stream if input_stream is not None else sys.stdin
+    output_stream = output_stream if output_stream is not None else sys.stdout
+    handler = handler if handler is not None else create_http_handler()
+    write_lock = threading.Lock()
+    threads = []
+    for line in input_stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rpc = json.loads(line)
+        except ValueError:
+            _write(output_stream, write_lock,
+                   {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+            continue
+        if not isinstance(rpc, dict) or rpc.get("jsonrpc") != "2.0" or not isinstance(rpc.get("method"), str):
+            request_id = rpc.get("id") if isinstance(rpc, dict) else None
+            _write(output_stream, write_lock,
+                   {"jsonrpc": "2.0", "id": request_id,
+                    "error": {"code": -32600, "message": "Invalid Request"}})
+            continue
+        if "id" not in rpc:
+            continue
+
+        def run(rpc=rpc):
+            try:
+                result = handler(rpc)
+            except RpcError as exc:
+                response = {"jsonrpc": "2.0", "id": rpc["id"], "error": {"code": exc.code, "message": exc.message}}
+            except Exception as exc:  # noqa: BLE001 - report as an internal JSON-RPC error
+                response = {"jsonrpc": "2.0", "id": rpc["id"], "error": {"code": -32603, "message": str(exc)}}
+            else:
+                response = {"jsonrpc": "2.0", "id": rpc["id"], "result": result}
+            _write(output_stream, write_lock, response)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+
+
+if __name__ == "__main__":
+    try:
+        serve()
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"{exc}\n")
+        sys.exit(1)

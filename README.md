@@ -4,16 +4,16 @@ One agent can submit a task to another agent through a small local HTTP service.
 
 ## Run
 
-Node.js 22 or newer is required. There are no package dependencies.
+Python 3.9 or newer is required. There are no package dependencies.
 
 ```bash
-npm start
+python3 src/server.py
 ```
 
 The HTTP API listens on `http://127.0.0.1:43124` by default. Start the MCP interface in a second process when the orchestrating client supports MCP:
 
 ```bash
-npm run start:mcp
+python3 src/mcp_server.py
 ```
 
 Configure that command as a local stdio MCP server in the client. It provides `list_agents`, `delegate`, `get_task`, and `cancel_task`. `A2A_RELAY_URL` overrides the HTTP address it calls.
@@ -29,7 +29,7 @@ Copy `config/agents.example.json` to `config/agents.json`, edit it, and restart 
     { "id": "codex", "name": "Codex", "command": "codex", "args": ["exec"], "cwd": "/path/to/git/project" },
     { "id": "pi", "name": "Pi", "command": "pi", "args": ["--print"], "cwd": "/path/to/project" },
     { "id": "opencode", "name": "OpenCode", "command": "opencode", "args": ["run"], "cwd": "/path/to/project" },
-    { "id": "wrapped", "name": "Any wrapped harness", "type": "stdio", "command": "node", "args": ["/path/to/adapter.mjs"], "cwd": "/path/to/project" },
+    { "id": "wrapped", "name": "Any wrapped harness", "type": "stdio", "command": "python3", "args": ["/path/to/adapter.py"], "cwd": "/path/to/project" },
     { "id": "hosted", "name": "Harness on its own port", "type": "http", "url": "http://127.0.0.1:9000/run" }
   ]
 }
@@ -49,7 +49,7 @@ The adapter returns exactly one result document:
 {"protocolVersion":"relay.adapter/v1","status":"completed","output":"result text"}
 ```
 
-For a harness failure, return `{"protocolVersion":"relay.adapter/v1","status":"failed","error":"reason"}`. A stdio adapter reads the request from stdin, writes only the result to stdout, and sends diagnostics to stderr. See [examples/stdio-adapter.mjs](examples/stdio-adapter.mjs); replace its `runHarness` function with the harness's supported API. This lets a new harness be added through config plus a small external wrapper, without changing relay or MCP code.
+For a harness failure, return `{"protocolVersion":"relay.adapter/v1","status":"failed","error":"reason"}`. A stdio adapter reads the request from stdin, writes only the result to stdout, and sends diagnostics to stderr. See [examples/stdio_adapter.py](examples/stdio_adapter.py); replace its `run_harness` function with the harness's supported API. This lets a new harness be added through config plus a small external wrapper, without changing relay or MCP code.
 
 An HTTP adapter accepts the same request as a `POST` and returns the same result with `content-type: application/json`. It can run on a separate localhost port for each harness. The relay still gives MCP clients one stable HTTP port and handles the common queue and task lifecycle. Separate harness ports are optional and require running those adapter services. For compatibility, an HTTP adapter response without a JSON content type is still treated as a successful raw-text result when its status is 2xx.
 
@@ -76,4 +76,4 @@ The relay binds to loopback (`A2A_RELAY_HOST`, default `127.0.0.1`) and has no a
 
 Resource limits can be changed with `A2A_RELAY_MAX_BODY_BYTES`, `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`, `A2A_RELAY_MAX_OUTPUT_BYTES`, `A2A_RELAY_MAX_TASKS`, `A2A_RELAY_MAX_ACTIVE`, and `A2A_RELAY_TIMEOUT_MS`. Each must be a positive integer. Command input defaults to 64 KiB because it is passed as one argument and operating systems cap the combined argument and environment size. The output limit applies to the combined stdout and stderr captured from a command and to the body read from an HTTP adapter. The listener also honors `A2A_RELAY_PORT` (default `43124`) and `A2A_RELAY_HOST`; the MCP process honors `A2A_RELAY_URL` and `A2A_RELAY_HTTP_TIMEOUT_MS`.
 
-Run `npm test` to exercise the relay and MCP interface with fake agents.
+Run `python3 -m unittest discover -s test -p 'test_*.py'` to exercise the relay and MCP interface with fake agents.

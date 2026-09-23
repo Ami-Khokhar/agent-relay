@@ -44,37 +44,44 @@ content type is treated as raw success text when its status is 2xx.
 
 ## Minimal stdio adapter template
 
-Copy `examples/stdio-adapter.mjs` and replace `runHarness` with the harness's supported
+Copy `examples/stdio_adapter.py` and replace `run_harness` with the harness's supported
 API or CLI invocation:
 
-```js
-#!/usr/bin/env node
+```python
+#!/usr/bin/env python3
+import json
+import sys
 
-async function runHarness(input) {
-  // Call the harness here and return its text result.
-  // Example: spawn its CLI and capture stdout.
-  return `example harness received: ${input}`
-}
 
-let raw = ''
-for await (const chunk of process.stdin) raw += chunk
+def run_harness(prompt):
+    # Call the harness here and return its text result.
+    # Example: run its CLI and capture stdout.
+    return f"example harness received: {prompt}"
 
-try {
-  const request = JSON.parse(raw)
-  if (request.protocolVersion !== 'relay.adapter/v1' || typeof request.task?.input !== 'string') {
-    throw new Error('invalid relay.adapter/v1 request')
-  }
-  const output = await runHarness(request.task.input)
-  process.stdout.write(JSON.stringify({ protocolVersion: 'relay.adapter/v1', status: 'completed', output }))
-} catch (error) {
-  process.stdout.write(JSON.stringify({ protocolVersion: 'relay.adapter/v1', status: 'failed', error: error.message }))
-}
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        request = json.loads(raw)
+        task = request.get("task") if isinstance(request, dict) else None
+        if request.get("protocolVersion") != "relay.adapter/v1" \
+                or not isinstance(task, dict) or not isinstance(task.get("input"), str):
+            raise ValueError("invalid relay.adapter/v1 request")
+        output = run_harness(task["input"])
+        result = {"protocolVersion": "relay.adapter/v1", "status": "completed", "output": output}
+    except Exception as exc:
+        result = {"protocolVersion": "relay.adapter/v1", "status": "failed", "error": str(exc)}
+    sys.stdout.write(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 Register it:
 
 ```json
-{ "id": "my-harness", "type": "stdio", "command": "node", "args": ["/abs/adapter.mjs"], "cwd": "/path/to/project" }
+{ "id": "my-harness", "type": "stdio", "command": "python3", "args": ["/abs/adapter.py"], "cwd": "/path/to/project" }
 ```
 
 ## Environment available to adapters
@@ -126,7 +133,7 @@ Feed it a request by hand:
 
 ```bash
 printf '%s\n' '{"protocolVersion":"relay.adapter/v1","task":{"id":"t","sessionId":"s","input":"hi","timeoutMs":1000}}' \
-  | node /abs/adapter.mjs
+  | python3 /abs/adapter.py
 ```
 
 It must print a single valid result document and nothing else on stdout. Then register it
