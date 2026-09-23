@@ -1,0 +1,7 @@
+node_modules/
+*.log
+
+# Local registry (copy config/agents.example.json here); machine-specific paths.
+config/agents.json
+
+.DS_Store

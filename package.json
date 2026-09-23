@@ -1,0 +1,16 @@
+{
+  "name": "local-agent-relay",
+  "version": "0.1.0",
+  "description": "Local HTTP and MCP relay for delegating new tasks between coding agents",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "start:mcp": "node src/mcp-server.mjs",
+    "test": "node --test \"test/**/*.test.mjs\""
+  }
+}
