@@ -45,7 +45,8 @@ class McpHandlerTests(unittest.TestCase):
         instructions = result["instructions"]
         self.assertTrue(instructions.strip())
         self.assertLess(len(instructions), 1024)
-        for keyword in ("delegate", "wait_task", "list_agents", "pi", "codex", "sessionId"):
+        for keyword in ("delegate", "wait_task", "list_agents", "pi", "codex", "sessionId",
+                        "orchestrat", "fan out", "shell"):
             self.assertIn(keyword, instructions)
 
     def test_tool_descriptions_name_the_harnesses_and_their_arguments(self):

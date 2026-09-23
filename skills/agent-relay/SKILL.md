@@ -1,6 +1,13 @@
 ---
 name: agent-relay
-description: Delegate or orchestrate work across coding agents — pi, Codex, OpenCode, Claude Code — through agent-relay. Use when the user asks to delegate, hand off, orchestrate, fan out, run agents in parallel, get a second opinion, or use a specific model through another agent (for example "have pi do X", "ask codex", "use deepseek via pi"). Prefer this over running pi, codex, opencode, or claude in a shell: the relay tracks task IDs, status, timeouts, cancellation, and sessions. Also covers starting and registering agents when the relay is not running.
+description: >-
+  Delegate or orchestrate work across coding agents — pi, Codex, OpenCode, Claude Code —
+  through agent-relay. Use when the user asks to delegate, hand off, orchestrate, fan out,
+  run agents in parallel, get a second opinion, or use a specific model through another
+  agent (for example "have pi do X", "ask codex", "use deepseek via pi"). Prefer this over
+  running pi, codex, opencode, or claude in a shell: the relay tracks task IDs, status,
+  timeouts, cancellation, and sessions. Also covers starting and registering agents when
+  the relay is not running.
 ---
 
 # Agent Relay

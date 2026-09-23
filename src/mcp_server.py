@@ -51,7 +51,7 @@ TOOLS = [
     },
     {
         "name": "delegate",
-        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code) and return a taskId. Use for delegation, orchestration, fan-out, and second opinions. Then call wait_task.",
+        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. Returns the new task object; pass its `id` field to wait_task, get_task, or cancel_task.",
         "inputSchema": {
             "type": "object", "required": ["agentId", "input"], "additionalProperties": False,
             "properties": {
@@ -66,7 +66,7 @@ TOOLS = [
                 "timeoutMs": {"type": "integer", "minimum": 1,
                               "description": "Maximum run time for the task, in milliseconds. When it expires the relay stops the task. Omit to use the agent's default timeout."},
                 "cwd": {"type": "string", "minLength": 1,
-                        "description": "Working directory for the target agent (absolute path recommended). Must be inside the agent's allowedRoots or equal to its default cwd, else the relay rejects it with cwd_not_allowed. Omit to use the agent's default cwd."},
+                        "description": "Working directory for the target agent (absolute path recommended). Must be inside the agent's allowedRoots or equal to its default cwd, else the relay rejects it with cwd_not_allowed; it must also be an existing directory, otherwise the relay rejects it with invalid_cwd. Omit to use the agent's default cwd."},
                 "waitMs": {"type": "integer", "minimum": 1,
                            "description": "Maximum time, in milliseconds, that this call waits for the task to finish. If the task is still running, the call returns its current status; then call wait_task again with the same taskId."},
             },
@@ -298,7 +298,7 @@ def create_http_handler(base_url=None, timeout=None):
                     "delegate once per task, then wait for each taskId. Reuse the sessionId "
                     "from an earlier task to group related work for list_tasks; it does not "
                     "resume the harness session. Omit it to start a new session. If no listed "
-                    "agent or model fits, tell the user and ask before you run a CLI directly."
+                    "agent fits, tell the user and ask before you run a CLI directly."
                 ),
             }
         if method == "tools/list":
