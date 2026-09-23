@@ -45,7 +45,7 @@ else:
 TOOLS = [
     {
         "name": "list_agents",
-        "description": "List the registered agents and the models each can run. Call this first to get valid agentId values.",
+        "description": "List the agents registered with the relay, with their adapter, capabilities, and timeout. Call this first to get valid agentId values.",
         "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
@@ -60,13 +60,13 @@ TOOLS = [
                 "input": {"type": "string", "minLength": 1,
                           "description": "Full task text for the target agent. The agent cannot see this conversation. Include the goal, relevant file paths, constraints, and the expected output format."},
                 "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
-                              "description": "ID of an existing session. Pass it to continue earlier work with the same agent. Get it from an earlier task result. Omit it to start a new session; the result contains the new sessionId."},
+                              "description": "Correlation tag for grouping related tasks; not a native harness session, and each task is a fresh invocation. Reuse the value from an earlier task to group work and to filter list_tasks. Omit it and the relay assigns a new UUID (returned in the task result)."},
                 "requestId": {"type": "string", "minLength": 1, "maxLength": 128,
                               "description": "Idempotency key. When you retry a delegate call after an error or timeout, send the same requestId so the relay returns the existing task instead of starting a second one. Use a new value for each new task."},
                 "timeoutMs": {"type": "integer", "minimum": 1,
                               "description": "Maximum run time for the task, in milliseconds. When it expires the relay stops the task. Omit to use the agent's default timeout."},
                 "cwd": {"type": "string", "minLength": 1,
-                        "description": "Absolute path of the working directory for the target agent. Must be inside the agent's allowed roots. Omit to use the agent's default cwd."},
+                        "description": "Working directory for the target agent (absolute path recommended). Must be inside the agent's allowedRoots or equal to its default cwd, else the relay rejects it with cwd_not_allowed. Omit to use the agent's default cwd."},
                 "waitMs": {"type": "integer", "minimum": 1,
                            "description": "Maximum time, in milliseconds, that this call waits for the task to finish. If the task is still running, the call returns its current status; then call wait_task again with the same taskId."},
             },
@@ -295,10 +295,10 @@ def create_http_handler(base_url=None, timeout=None):
                     "then delegate, then wait_task. Do not run agent CLIs (pi, codex, "
                     "opencode, claude) in a shell to do this work. The relay owns task IDs, "
                     "status, timeouts, cancellation, and idempotency. For parallel work, call "
-                    "delegate once per task, then wait for each taskId. Pass the sessionId "
-                    "from an earlier task to continue work with the same agent; omit it to "
-                    "start a new session. If no listed agent or model fits, tell the user and "
-                    "ask before you run a CLI directly."
+                    "delegate once per task, then wait for each taskId. Reuse the sessionId "
+                    "from an earlier task to group related work for list_tasks; it does not "
+                    "resume the harness session. Omit it to start a new session. If no listed "
+                    "agent or model fits, tell the user and ask before you run a CLI directly."
                 ),
             }
         if method == "tools/list":

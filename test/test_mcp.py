@@ -58,6 +58,9 @@ class McpHandlerTests(unittest.TestCase):
         for key in ("agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd", "waitMs"):
             self.assertTrue(properties[key].get("description"), f"{key} has no description")
         self.assertIn("list_agents", properties["agentId"]["description"])
+        session_description = properties["sessionId"]["description"].lower()
+        self.assertIn("correlation", session_description)
+        self.assertNotIn("continue", session_description)
 
     def test_maps_mcp_tools_onto_the_http_task_lifecycle(self):
         def responder(method, path, body):
