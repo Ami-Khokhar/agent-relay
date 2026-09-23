@@ -51,7 +51,7 @@ TOOLS = [
     },
     {
         "name": "delegate",
-        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. Returns the new task object; pass its `id` field to wait_task, get_task, or cancel_task.",
+        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. Returns the task object (the existing task when requestId matches an earlier submission); pass its `id` field to wait_task, get_task, or cancel_task.",
         "inputSchema": {
             "type": "object", "required": ["agentId", "input"], "additionalProperties": False,
             "properties": {
@@ -64,11 +64,11 @@ TOOLS = [
                 "requestId": {"type": "string", "minLength": 1, "maxLength": 128,
                               "description": "Idempotency key. When you retry a delegate call after an error or timeout, send the same requestId so the relay returns the existing task instead of starting a second one. Use a new value for each new task."},
                 "timeoutMs": {"type": "integer", "minimum": 1,
-                              "description": "Maximum run time for the task, in milliseconds. When it expires the relay stops the task. Omit to use the agent's default timeout."},
+                              "description": "Maximum run time for the task, in milliseconds. When it expires the relay stops waiting, marks the task timed_out, and terminates a command/stdio adapter; an http adapter's work may continue. Omit to use the agent's default timeout."},
                 "cwd": {"type": "string", "minLength": 1,
                         "description": "Working directory for the target agent (absolute path recommended). Must be inside the agent's allowedRoots or equal to its default cwd, else the relay rejects it with cwd_not_allowed; it must also be an existing directory, otherwise the relay rejects it with invalid_cwd. Omit to use the agent's default cwd."},
                 "waitMs": {"type": "integer", "minimum": 1,
-                           "description": "Maximum time, in milliseconds, that this call waits for the task to finish. If the task is still running, the call returns its current status; then call wait_task again with the same taskId."},
+                           "description": "Maximum time, in milliseconds, that this call waits for the task to finish; the relay rejects values above A2A_RELAY_MAX_WAIT_MS (default 600000) with invalid_wait (the task is still created). If the task is still running, the call returns its current status; then call wait_task again with the same taskId."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
@@ -82,7 +82,7 @@ TOOLS = [
                 "taskId": {"type": "string", "minLength": 1, "maxLength": 128,
                            "description": "Task ID returned by delegate."},
                 "maxWaitMs": {"type": "integer", "minimum": 1,
-                              "description": "Maximum time to wait, in milliseconds, before returning the current status."},
+                              "description": "Maximum time to wait, in milliseconds, before returning the current status; the relay rejects values above A2A_RELAY_MAX_WAIT_MS (default 600000) with invalid_wait."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},

@@ -25,6 +25,26 @@ class SkillFrontmatterTests(unittest.TestCase):
             value in (">-", ">", "|", "|-") or value.startswith('"') or value.startswith("'"),
             "description must be a block scalar or quoted, so a ': ' cannot break YAML",
         )
+        if value in (">-", ">", "|", "|-"):
+            for continuation in lines[index + 1:]:
+                if not continuation.strip():
+                    continue
+                self.assertTrue(
+                    continuation.startswith((" ", "\t")),
+                    "block scalar continuation must be indented: %r" % continuation,
+                )
+
+    def test_description_parses_when_yaml_is_available(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        with open(SKILL, encoding="utf-8") as handle:
+            text = handle.read()
+        frontmatter = text.split("---\n", 2)[1]
+        data = yaml.safe_load(frontmatter)
+        self.assertIsInstance(data.get("description"), str)
+        self.assertTrue(data["description"].strip())
 
     def test_description_names_the_harnesses_and_triggers(self):
         text = "\n".join(_frontmatter_lines()).lower()
