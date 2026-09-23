@@ -1,6 +1,6 @@
 ---
 name: agent-relay
-description: Set up and operate agent-relay, a local HTTP + MCP service that lets one coding agent delegate a new task to another registered coding agent (Claude Code, Codex, Pi, OpenCode, DeepSeek Harness, or any CLI/stdio/HTTP harness) and then poll, retrieve, or cancel it. Use when the user wants one agent to orchestrate another, run work on a different harness, fan a job out across multiple agents, chain agents together, or expose delegation to an MCP client. Covers obtaining the relay, writing the agent registry, starting the HTTP and MCP processes, submitting and polling tasks, writing custom adapters, and choosing timeouts, concurrency, and limits.
+description: Delegate a task from one coding agent to another. Use when the user wants cross-harness delegation, fan-out across agents, or agent chaining. Covers relay setup, registering agents, starting HTTP/MCP, and submitting, polling, and cancelling tasks.
 ---
 
 # Agent Relay
