@@ -44,8 +44,24 @@ class McpHandlerTests(unittest.TestCase):
         self.assertEqual(result["protocolVersion"], "2025-06-18")
         instructions = result["instructions"]
         self.assertTrue(instructions.strip())
-        self.assertIn("delegate", instructions)
-        self.assertIn("wait_task", instructions)
+        self.assertLess(len(instructions), 1024)
+        for keyword in ("delegate", "wait_task", "list_agents", "pi", "codex", "sessionId",
+                        "orchestrat", "fan out", "shell"):
+            self.assertIn(keyword, instructions)
+
+    def test_tool_descriptions_name_the_harnesses_and_their_arguments(self):
+        handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+        tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+        delegate = tools["delegate"]["description"].lower()
+        for keyword in ("orchestrat", "delegat", "pi", "codex", "opencode", "claude"):
+            self.assertIn(keyword, delegate)
+        properties = tools["delegate"]["inputSchema"]["properties"]
+        for key in ("agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd", "waitMs"):
+            self.assertTrue(properties[key].get("description"), f"{key} has no description")
+        self.assertIn("list_agents", properties["agentId"]["description"])
+        session_description = properties["sessionId"]["description"].lower()
+        self.assertIn("correlation", session_description)
+        self.assertNotIn("continue", session_description)
 
     def test_maps_mcp_tools_onto_the_http_task_lifecycle(self):
         def responder(method, path, body):

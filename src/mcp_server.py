@@ -45,23 +45,30 @@ else:
 TOOLS = [
     {
         "name": "list_agents",
-        "description": "List agents registered with the relay",
+        "description": "List the agents registered with the relay, with their adapter, capabilities, and timeout. Call this first to get valid agentId values.",
         "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
         "name": "delegate",
-        "description": "Submit an asynchronous task to a registered agent",
+        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. Returns the task object (the existing task when requestId matches an earlier submission); pass its `id` field to wait_task, get_task, or cancel_task.",
         "inputSchema": {
             "type": "object", "required": ["agentId", "input"], "additionalProperties": False,
             "properties": {
-                "agentId": {"type": "string", "minLength": 1, "maxLength": 128},
-                "input": {"type": "string", "minLength": 1},
-                "sessionId": {"type": "string", "minLength": 1, "maxLength": 128},
-                "requestId": {"type": "string", "minLength": 1, "maxLength": 128},
-                "timeoutMs": {"type": "integer", "minimum": 1},
-                "cwd": {"type": "string", "minLength": 1},
-                "waitMs": {"type": "integer", "minimum": 1},
+                "agentId": {"type": "string", "minLength": 1, "maxLength": 128,
+                            "description": "ID of the target agent. Get valid IDs from list_agents. Do not invent an ID."},
+                "input": {"type": "string", "minLength": 1,
+                          "description": "Full task text for the target agent. The agent cannot see this conversation. Include the goal, relevant file paths, constraints, and the expected output format."},
+                "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
+                              "description": "Correlation tag for grouping related tasks; not a native harness session, and each task is a fresh invocation. Reuse the value from an earlier task to group work and to filter list_tasks. Omit it and the relay assigns a new UUID (returned in the task result)."},
+                "requestId": {"type": "string", "minLength": 1, "maxLength": 128,
+                              "description": "Idempotency key. When you retry a delegate call after an error or timeout, send the same requestId so the relay returns the existing task instead of starting a second one. Use a new value for each new task."},
+                "timeoutMs": {"type": "integer", "minimum": 1,
+                              "description": "Maximum run time for the task, in milliseconds. When it expires the relay stops waiting, marks the task timed_out, and terminates a command/stdio adapter; an http adapter's work may continue. Omit to use the agent's default timeout."},
+                "cwd": {"type": "string", "minLength": 1,
+                        "description": "Working directory for the target agent (absolute path recommended). Must be inside the agent's allowedRoots or equal to its default cwd, else the relay rejects it with cwd_not_allowed; it must also be an existing directory, otherwise the relay rejects it with invalid_cwd. Omit to use the agent's default cwd."},
+                "waitMs": {"type": "integer", "minimum": 1,
+                           "description": "Maximum time, in milliseconds, that this call waits for the task to finish; the relay rejects values above A2A_RELAY_MAX_WAIT_MS (default 600000) with invalid_wait (the task is still created). If the task is still running, the call returns its current status; then call wait_task again with the same taskId."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
@@ -72,8 +79,10 @@ TOOLS = [
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
             "properties": {
-                "taskId": {"type": "string", "minLength": 1, "maxLength": 128},
-                "maxWaitMs": {"type": "integer", "minimum": 1},
+                "taskId": {"type": "string", "minLength": 1, "maxLength": 128,
+                           "description": "Task ID returned by delegate."},
+                "maxWaitMs": {"type": "integer", "minimum": 1,
+                              "description": "Maximum time to wait, in milliseconds, before returning the current status; the relay rejects values above A2A_RELAY_MAX_WAIT_MS (default 600000) with invalid_wait."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -83,7 +92,8 @@ TOOLS = [
         "description": "Get the current state and result of a relay task",
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
-            "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128,
+                                      "description": "Task ID returned by delegate."}},
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
@@ -93,9 +103,12 @@ TOOLS = [
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {
-                "sessionId": {"type": "string", "minLength": 1, "maxLength": 128},
-                "status": {"type": "string", "enum": list(STATUSES)},
-                "limit": {"type": "integer", "minimum": 1},
+                "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
+                              "description": "Filter to one session. Get the ID from a delegate result."},
+                "status": {"type": "string", "enum": list(STATUSES),
+                           "description": "Filter by task status."},
+                "limit": {"type": "integer", "minimum": 1,
+                          "description": "Maximum number of tasks to return."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -105,7 +118,8 @@ TOOLS = [
         "description": "Cancel a queued or running relay task",
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
-            "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128,
+                                      "description": "Task ID returned by delegate."}},
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     },
@@ -275,11 +289,16 @@ def create_http_handler(base_url=None, timeout=None):
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "agent-relay", "version": "0.2.0"},
                 "instructions": (
-                    "Use delegate and wait_task to hand work to another coding agent "
-                    "and wait for its result. Do not invoke agent CLIs (pi, Codex, "
-                    "OpenCode, Claude Code) through a shell to delegate work; the "
-                    "relay owns task IDs, status, timeouts, cancellation, and "
-                    "idempotency."
+                    "agent-relay sends tasks to other coding agents (pi, Codex, OpenCode, "
+                    "Claude Code) and returns their results. When the user asks to delegate, "
+                    "orchestrate, fan out, or use another agent or model: call list_agents, "
+                    "then delegate, then wait_task. Do not run agent CLIs (pi, codex, "
+                    "opencode, claude) in a shell to do this work. The relay owns task IDs, "
+                    "status, timeouts, cancellation, and idempotency. For parallel work, call "
+                    "delegate once per task, then wait for each taskId. Reuse the sessionId "
+                    "from an earlier task to group related work for list_tasks; it does not "
+                    "resume the harness session. Omit it to start a new session. If no listed "
+                    "agent fits, tell the user and ask before you run a CLI directly."
                 ),
             }
         if method == "tools/list":
