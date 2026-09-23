@@ -274,6 +274,13 @@ def create_http_handler(base_url=None, timeout=None):
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "agent-relay", "version": "0.2.0"},
+                "instructions": (
+                    "Use delegate and wait_task to hand work to another coding agent "
+                    "and wait for its result. Do not invoke agent CLIs (pi, Codex, "
+                    "OpenCode, Claude Code) through a shell to delegate work; the "
+                    "relay owns task IDs, status, timeouts, cancellation, and "
+                    "idempotency."
+                ),
             }
         if method == "tools/list":
             return {"tools": TOOLS}

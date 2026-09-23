@@ -38,6 +38,15 @@ class FakeUpstream:
 
 
 class McpHandlerTests(unittest.TestCase):
+    def test_initialize_advertises_relay_instructions(self):
+        handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+        result = handle({"method": "initialize"})
+        self.assertEqual(result["protocolVersion"], "2025-06-18")
+        instructions = result["instructions"]
+        self.assertTrue(instructions.strip())
+        self.assertIn("delegate", instructions)
+        self.assertIn("wait_task", instructions)
+
     def test_maps_mcp_tools_onto_the_http_task_lifecycle(self):
         def responder(method, path, body):
             if path.endswith("/v1/agents"):

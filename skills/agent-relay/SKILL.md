@@ -1,6 +1,6 @@
 ---
 name: agent-relay
-description: Set up agent-relay and communicate with other coding agents through it. Use when the user wants cross-harness delegation, fan-out across agents, or agent chaining. Covers installing the relay, registering agents, starting HTTP/MCP, and submitting, waiting on, polling, listing, and cancelling tasks.
+description: Orchestrate, delegate to, or run other coding agents — pi, Codex, OpenCode, Claude Code — through a local task relay. Use whenever the user asks to delegate work, orchestrate or chain agents, or run an agent CLI, even when that CLI is already on PATH; prefer this over invoking the CLI directly. Also covers first-time setup, registering agents, starting HTTP/MCP, and submitting, waiting on, polling, listing, and cancelling tasks.
 ---
 
 # Agent Relay
@@ -29,9 +29,15 @@ Use it when the user wants to:
 - have one coding agent delegate a task to a different coding agent or harness;
 - run the same job on several agents and compare results;
 - chain agents (A writes → B reviews → C fixes);
+- delegate implementation work to pi, Codex, OpenCode, or Claude Code instead of
+  shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
 - give an MCP client the tools `list_agents`, `delegate`, `wait_task`, `get_task`,
   `list_tasks`, `cancel_task`.
+
+Prefer this skill over calling an agent CLI directly, even when the CLI is on
+`PATH` and can run the task: the relay adds task IDs, status, timeouts,
+cancellation, and idempotency that a bare CLI call does not have.
 
 ## Prerequisites
 
