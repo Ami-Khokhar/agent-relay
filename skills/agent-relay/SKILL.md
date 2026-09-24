@@ -239,8 +239,9 @@ submission response may have been lost. Without a `requestId`, do not auto-retry
    [references/use-cases.md](references/use-cases.md).
 
 Because agents can themselves be MCP clients, you can chain them: A delegates to B, B
-delegates to C. The relay does not model a cross-agent conversation, so thread continuity
-yourself with a shared `sessionId` value used as a correlation tag.
+delegates to C. The relay does not model a cross-agent conversation: each agent keeps its
+own `sessionId` (one is created automatically per task), and reusing a `sessionId` with a
+different agent is rejected — see the Sessions section above.
 
 ## Adapter contract (for custom harnesses)
 
@@ -273,8 +274,8 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   only) or `kill -HUP <pid>`.
 - Limits (positive integers unless noted): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
   `A2A_RELAY_MAX_COMMAND_INPUT_BYTES` (64 KiB, command adapter only),
-  `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (1000),
-  `A2A_RELAY_MAX_ACTIVE` (4), `A2A_RELAY_MAX_WAIT_MS` (600000),
+  `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB),  `A2A_RELAY_MAX_TASKS` (1000), `A2A_RELAY_MAX_SESSIONS` (500), `A2A_RELAY_MAX_ACTIVE` (4),
+  `A2A_RELAY_MAX_WAIT_MS` (600000),
   `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap).
   Every variable also accepts an `AGENT_RELAY_*` spelling.
 - Cancellation of a spawned adapter sends process signals; cancellation of an HTTP adapter

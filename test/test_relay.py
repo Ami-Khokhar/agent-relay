@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -363,6 +364,100 @@ class RelayTests(unittest.TestCase):
             status, payload = relay.request("GET", "/v1/sessions/missing")
             self.assertEqual(status, 404)
             self.assertEqual(payload["error"], "unknown_session")
+        finally:
+            relay.close()
+
+    def test_session_tracks_a_cancelled_task(self):
+        relay = Relay({"id": "slow", "command": PYTHON,
+                       "args": ["-c", "import time; time.sleep(30)"]})
+        try:
+            _, submitted = relay.submit(agentId="slow", input="long work", sessionId="sess")
+            _, task = relay.request("DELETE", f"/v1/tasks/{submitted['id']}")
+            self.assertEqual(task["status"], "cancelled")
+
+            status, session = relay.request("GET", "/v1/sessions/sess")
+            self.assertEqual(status, 200)
+            self.assertEqual(session["lastStatus"], "cancelled")
+            self.assertEqual(session["lastTaskAt"], task["finishedAt"])
+            self.assertEqual(session["taskCount"], 1)
+        finally:
+            relay.close()
+
+    def test_session_activity_updates_on_each_submission(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            relay.run_task(agentId="echo", input="first", sessionId="sess")
+            _, done = relay.request("GET", "/v1/sessions/sess")
+            finished_at = done["lastTaskAt"]
+            self.assertEqual(done["lastStatus"], "completed")
+
+            relay.run_task(agentId="echo", input="second", sessionId="sess")
+            _, session = relay.request("GET", "/v1/sessions/sess")
+            self.assertEqual(session["lastStatus"], "completed")
+            self.assertGreaterEqual(session["lastTaskAt"], finished_at)
+            self.assertEqual(session["taskCount"], 2)
+        finally:
+            relay.close()
+
+    def test_lists_filters_and_validates_session_queries(self):
+        workdir = tempfile.mkdtemp(prefix="a2a-sessions-")
+        relay = Relay({"id": "echo", "command": PYTHON, "allowedRoots": [workdir],
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            _, first = relay.submit(agentId="echo", input="one", sessionId="s-1",
+                                    sessionName="named")
+            relay.submit(agentId="echo", input="two", sessionId="s-2", cwd=workdir)
+
+            status, row = relay.request("GET", "/v1/sessions/s-1")
+            self.assertEqual(status, 200)
+            self.assertEqual(row["name"], "named")
+
+            _, by_agent = relay.request("GET", "/v1/sessions?agentId=echo")
+            self.assertEqual({session["id"] for session in by_agent["sessions"]}, {"s-1", "s-2"})
+            _, by_cwd = relay.request("GET", f"/v1/sessions?cwd={workdir}")
+            self.assertEqual([session["id"] for session in by_cwd["sessions"]], ["s-2"])
+
+            status, payload = relay.request("GET", "/v1/sessions?limit=0")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_limit")
+            status, payload = relay.request("GET", "/v1/sessions?limit=nope")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_limit")
+            status, capped = relay.request("GET", "/v1/sessions?limit=5000")
+            self.assertEqual(status, 200)
+
+            status, payload = relay.request("PATCH", "/v1/sessions/s-1", {"name": 7})
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_name")
+            status, payload = relay.request("PATCH", "/v1/sessions/s-1", {"name": "x" * 129})
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_name")
+            status, payload = relay.request("PATCH", "/v1/sessions/s-1", None)
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_name")
+
+            status, renamed = relay.request("PATCH", "/v1/sessions/s-1", {"name": ""})
+            self.assertEqual(status, 200)
+            self.assertIsNone(renamed["name"])
+        finally:
+            relay.close()
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_evicts_unnamed_sessions_first_when_the_store_is_full(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]},
+                      env={"A2A_RELAY_MAX_SESSIONS": "2"})
+        try:
+            relay.submit(agentId="echo", input="keep me", sessionId="named",
+                         sessionName="keep")
+            relay.submit(agentId="echo", input="scratch one", sessionId="scratch-1")
+            relay.submit(agentId="echo", input="scratch two", sessionId="scratch-2")
+            _, listing = relay.request("GET", "/v1/sessions")
+            # The oldest unnamed session was evicted; the named one survived.
+            self.assertEqual([session["id"] for session in listing["sessions"]],
+                             ["scratch-2", "named"])
+            self.assertEqual(listing["sessions"][1]["name"], "keep")
         finally:
             relay.close()
 

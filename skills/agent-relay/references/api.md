@@ -51,7 +51,7 @@ Unknown fields are rejected with `400 unknown_field`. Returns `202` with the tas
 ```json
 { "id": "uuid", "sessionId": "uuid", "agentId": "claude", "input": "...",
   "status": "queued", "createdAt": "ISO-8601", "timeoutMs": 900000,
-  "cwd": "/path/to/project", "requestId": "..." }
+  "cwd": "/path/to/project", "requestId": "...", "sessionName": "auth refactor" }
 ```
 
 Idempotent replay with the same `requestId` and identical fields returns `200` with the

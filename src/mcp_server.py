@@ -2,7 +2,7 @@
 """agent-relay MCP stdio interface.
 
 A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the tools list_agents,
-delegate, wait_task, get_task, list_tasks, and cancel_task. Set A2A_RELAY_URL to point at a
+delegate, wait_task, get_task, list_tasks, list_sessions, and cancel_task. Set A2A_RELAY_URL to point at a
 non-default relay. When the relay is not reachable and the URL is loopback, the interface
 starts the HTTP service detached on first use.
 """

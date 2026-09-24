@@ -476,6 +476,16 @@ def _worker(agent, task):
         _finish(task, "failed", error=str(exc))
 
 
+def _touch_session(task, status):
+    """Record the task's terminal state on its session, if any. Caller holds LOCK."""
+    session = SESSIONS.get(task.get("sessionId"))
+    if session is not None:
+        session["lastStatus"] = status
+        session["lastTaskAt"] = task["finishedAt"]
+        session["updatedAt"] = task["finishedAt"]
+    return session
+
+
 def _finish(task, status, **fields):
     global ACTIVE
     with LOCK:
@@ -487,11 +497,7 @@ def _finish(task, status, **fields):
         task.pop("_proc", None)
         if task.pop("_counted", False):
             ACTIVE -= 1
-        session = SESSIONS.get(task.get("sessionId"))
-        if session is not None:
-            session["lastStatus"] = status
-            session["lastTaskAt"] = task["finishedAt"]
-            session["updatedAt"] = task["finishedAt"]
+        _touch_session(task, status)
         TASK_CONDITION.notify_all()
     _drain()
 
@@ -642,10 +648,14 @@ def _session_listing(agent_id=None, cwd=None, limit=20):
 
 
 def _make_room_for_session():
+    """Evict the least recently active session, preferring unnamed ones so a
+    human-chosen name survives ordinary auto-created traffic when possible."""
     if len(SESSIONS) < MAX_SESSIONS:
         return
-    oldest = min(SESSIONS.values(), key=lambda session: session.get("lastTaskAt") or "")
-    SESSIONS.pop(oldest["id"], None)
+    candidates = [session for session in SESSIONS.values() if session.get("name") is None]
+    victim = min(candidates or SESSIONS.values(),
+                 key=lambda session: session.get("lastTaskAt") or "")
+    SESSIONS.pop(victim["id"], None)
 
 
 def _wait_for_terminal(task_id, wait_ms):
@@ -846,6 +856,12 @@ class Handler(BaseHTTPRequestHandler):
                     "lastStatus": "queued",
                     "summary": input_text[:80],
                 }
+            else:
+                # Keep "most recently active" ordering and eviction honest:
+                # activity is the last task submission or completion.
+                session["lastTaskAt"] = task["createdAt"]
+                session["updatedAt"] = task["createdAt"]
+                session["lastStatus"] = "queued"
         self._json(202, visible(task))
         _drain()
 
@@ -970,6 +986,7 @@ class Handler(BaseHTTPRequestHandler):
                 task["status"] = "cancelled"
                 task["finishedAt"] = now_iso()
                 task.pop("_proc", None)
+                _touch_session(task, "cancelled")
                 TASK_CONDITION.notify_all()
         self._json(200, visible(task))
         _drain()
