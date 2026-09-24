@@ -655,8 +655,12 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             if path == "/healthz":
                 if method == "GET":
+                    with LOCK:
+                        active, queued = ACTIVE, sum(
+                            1 for task in QUEUE if task["status"] == "queued")
                     return self._json(200, {"ok": True, "agents": len(AGENTS),
-                                            "tasks": len(TASKS), "limits": _limits()})
+                                            "tasks": len(TASKS), "active": active,
+                                            "queued": queued, "limits": _limits()})
                 return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/agents":
                 if method == "GET":

@@ -141,6 +141,15 @@ detached (log: `~/.local/state/agent-relay/relay.log`). To keep it up across reb
 `bash scripts/install-service.sh`. `SIGTERM` or `SIGINT` cancels running tasks and waits
 briefly for adapters to stop.
 
+To pick up new features merged on the project's `main`, run `bash
+~/.local/share/agent-relay/scripts/update.sh` (or `scripts/update.sh` from the checkout):
+it fast-forwards the checkout and restarts the service only when the code changed. The
+first restart is deferred while tasks are in flight (or while the relay cannot report
+counts), and the next run escalates — restarting unless tasks are visibly busy — so an
+update lands at most one cycle late. `install-service.sh --with-update-timer` schedules
+that update every 6 hours. MCP clients need no reconfiguration — the tool list refreshes
+on each client's next session start.
+
 Register the MCP server in the orchestrating client (point `args` at the absolute path).
 The setup script prints these for your checkout:
 
@@ -290,3 +299,5 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 - [references/adapters.md](references/adapters.md) — adapter contract, template, env vars.
 - [references/use-cases.md](references/use-cases.md) — single delegation, fan-out, pipelines.
 - [scripts/setup.sh](scripts/setup.sh) — idempotent setup.
+- `scripts/update.sh` in the checkout (`~/.local/share/agent-relay` by default) —
+  fast-forward the checkout and restart the service when the code changed.
