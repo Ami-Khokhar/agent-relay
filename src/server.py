@@ -88,6 +88,7 @@ MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
 EXPLICIT_CONFIG = _env("AGENT_RELAY_AGENTS_FILE", "A2A_AGENTS_FILE")
 
 LOCK = threading.RLock()
+REGISTRY_PATH = ""
 TASK_CONDITION = threading.Condition(LOCK)
 AGENTS = {}
 TASKS = {}
@@ -182,11 +183,12 @@ def load_registry(path):
 
 def reload_registry():
     """Reload the registry from disk. Raises on an invalid file; callers keep the old one."""
-    global AGENTS
+    global AGENTS, REGISTRY_PATH
     path = config_path()
     agents = load_registry(str(path))
     with LOCK:
         AGENTS = agents
+        REGISTRY_PATH = str(path)
     return path
 
 
@@ -659,6 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                         active, queued = ACTIVE, sum(
                             1 for task in QUEUE if task["status"] == "queued")
                     return self._json(200, {"ok": True, "agents": len(AGENTS),
+                                            "registry": REGISTRY_PATH,
                                             "tasks": len(TASKS), "active": active,
                                             "queued": queued, "limits": _limits()})
                 return self._json(405, {"error": "method_not_allowed"})
@@ -865,10 +868,11 @@ def _reload_signal(_signum, _frame):
 
 
 def main():
-    global AGENTS
+    global AGENTS, REGISTRY_PATH
     path = config_path()
     try:
         AGENTS = load_registry(str(path))
+        REGISTRY_PATH = str(path)
     except (OSError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
