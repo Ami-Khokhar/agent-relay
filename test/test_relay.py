@@ -596,6 +596,7 @@ class RelayTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(health["limits"]["timeoutMs"], 900000)
             self.assertEqual(health["limits"]["maxActive"], 2)
+            self.assertIs(health["limits"]["strictSessionAgent"], False)
             _, listing = relay.request("GET", "/v1/agents")
             self.assertEqual(listing["agents"][0]["timeoutMs"], 60000)
         finally:

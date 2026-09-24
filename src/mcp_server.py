@@ -60,7 +60,7 @@ TOOLS = [
                 "input": {"type": "string", "minLength": 1,
                           "description": "Full task text for the target agent. The agent cannot see this conversation. Include the goal, relevant file paths, constraints, and the expected output format."},
                 "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
-                              "description": "Correlation tag for grouping related tasks; not a native harness session, and each task is a fresh invocation. Reuse the value from an earlier task, or a sessionId from list_sessions, to group work and to filter list_tasks. Omit it and the relay assigns a new UUID (returned in the task result)."},
+                              "description": "Correlation tag for grouping related tasks; not a native harness session, and each task is a fresh invocation. Reuse the value from an earlier task, or a sessionId from list_sessions, to group work and to filter list_tasks. Omit it and the relay assigns a new UUID (returned in the task result). Letters, digits, and _ . ~ - only."},
                 "sessionName": {"type": "string", "minLength": 1, "maxLength": 128,
                                 "description": "Human-readable name for the session. Used only when this call creates a new session; rename an existing session with PATCH /v1/sessions/:id."},
                 "requestId": {"type": "string", "minLength": 1, "maxLength": 128,

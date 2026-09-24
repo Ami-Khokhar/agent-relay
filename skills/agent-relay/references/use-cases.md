@@ -44,7 +44,7 @@ Run the same prompt on several agents, then compare.
   present a table of agent → status → output.
 
 ```
-sessionId = "compare-<date>"
+sessionId = "compare-2026-09-23"
 for agent in claude codex pi:
     task = delegate(agentId=agent, input=PROMPT, sessionId=sessionId,
                     requestId=f"{agent}-compare", waitMs=600000)
