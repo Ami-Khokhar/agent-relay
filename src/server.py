@@ -93,6 +93,7 @@ TASK_CONDITION = threading.Condition(LOCK)
 AGENTS = {}
 TASKS = {}
 SESSIONS = {}
+EVICTED_SESSIONS = {}
 REQUEST_IDS = {}
 QUEUE = []
 ACTIVE = 0
@@ -649,13 +650,17 @@ def _session_listing(agent_id=None, cwd=None, limit=20):
 
 def _make_room_for_session():
     """Evict the least recently active session, preferring unnamed ones so a
-    human-chosen name survives ordinary auto-created traffic when possible."""
+    human-chosen name survives ordinary auto-created traffic when possible.
+    The evicted id keeps its agent binding so a different agent cannot reuse it."""
     if len(SESSIONS) < MAX_SESSIONS:
         return
     candidates = [session for session in SESSIONS.values() if session.get("name") is None]
     victim = min(candidates or SESSIONS.values(),
                  key=lambda session: session.get("lastTaskAt") or "")
     SESSIONS.pop(victim["id"], None)
+    EVICTED_SESSIONS[victim["id"]] = victim["agentId"]
+    while len(EVICTED_SESSIONS) > MAX_SESSIONS:
+        EVICTED_SESSIONS.pop(next(iter(EVICTED_SESSIONS)))
 
 
 def _wait_for_terminal(task_id, wait_ms):
@@ -705,7 +710,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
-            query = parse_qs(parsed.query)
+            query = parse_qs(parsed.query, keep_blank_values=True)
             if path == "/healthz":
                 if method == "GET":
                     return self._json(200, {"ok": True, "agents": len(AGENTS),
@@ -820,6 +825,16 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "session_agent_mismatch",
                     "message": (f"sessionId {effective_session_id} belongs to agent "
                                 f"{session['agentId']}; call list_sessions or omit sessionId"),
+                })
+            if session is None and EVICTED_SESSIONS.get(effective_session_id) not in (
+                    None, agent["id"]):
+                # An evicted session keeps its agent binding so the id cannot be
+                # quietly re-created by another agent while old tasks survive.
+                return self._json(409, {
+                    "error": "session_agent_mismatch",
+                    "message": (f"sessionId {effective_session_id} belonged to agent "
+                                f"{EVICTED_SESSIONS[effective_session_id]}; call "
+                                "list_sessions or omit sessionId"),
                 })
             if not _make_room():
                 return self._json(503, {"error": "task_capacity_reached"})

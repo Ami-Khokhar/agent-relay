@@ -85,8 +85,9 @@ tasks are returned unchanged.
 ### `GET /v1/sessions`
 
 Lists sessions, most recently active first. A session is created automatically by the
-first task that uses its `sessionId`; it is bound to that task's agent and working
-directory. Query parameters:
+first task that uses its `sessionId`; it records that task's agent and working directory
+(only the agent binding is enforced, and `cwd` may be null when neither the task nor the
+agent sets one). Query parameters:
 
 | Parameter | Notes |
 | --- | --- |
@@ -95,10 +96,12 @@ directory. Query parameters:
 | `limit` | Positive integer, capped at 100 (default 20). |
 
 Returns `{ "sessions": [ ... ] }`. Each session has `id`, `name` (may be `null`),
-`agentId`, `cwd`, `summary` (the first task's input, ≤80 chars), `createdAt`,
+`agentId`, `cwd` (may be `null`), `summary` (the first task's input, ≤80 chars), `createdAt`,
 `updatedAt`, `lastTaskAt`, `lastStatus`, and `taskCount`. Sessions are in memory and
 disappear on restart; the store is capped at `A2A_RELAY_MAX_SESSIONS` (default 500),
-evicting the least recently active.
+evicting the least recently active unnamed session first, then the least recently active
+session. An evicted session id keeps its agent binding: a different agent reusing it gets
+`409 session_agent_mismatch`.
 
 ### `GET /v1/sessions/:id`
 

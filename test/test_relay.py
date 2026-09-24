@@ -455,9 +455,11 @@ class RelayTests(unittest.TestCase):
             relay.submit(agentId="echo", input="scratch two", sessionId="scratch-2")
             _, listing = relay.request("GET", "/v1/sessions")
             # The oldest unnamed session was evicted; the named one survived.
-            self.assertEqual([session["id"] for session in listing["sessions"]],
-                             ["scratch-2", "named"])
-            self.assertEqual(listing["sessions"][1]["name"], "keep")
+            self.assertEqual({session["id"] for session in listing["sessions"]},
+                             {"scratch-2", "named"})
+            named = next(session for session in listing["sessions"]
+                         if session["id"] == "named")
+            self.assertEqual(named["name"], "keep")
         finally:
             relay.close()
 

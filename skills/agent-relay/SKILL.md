@@ -40,7 +40,7 @@ Use it when the user wants to:
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
 - give an MCP client the tools `list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`.
+  `list_tasks`, `list_sessions`, `cancel_task`.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
 `PATH` and can run the task: the relay adds task IDs, status, timeouts,
@@ -212,10 +212,12 @@ native harness session, and each task is a fresh invocation.
 
 ### Sessions
 
-A session is created automatically by the first task that uses its `sessionId`, and is
-bound to that task's agent and working directory. Name it on that first `delegate` call
-with `sessionName`, or rename it later with `PATCH /v1/sessions/:id` (HTTP only — rename
-is a human action). `list_sessions` finds earlier sessions to reference or report on; pass
+A session is created automatically by the first task that uses its `sessionId`, and
+records that task's agent and working directory; only the agent binding is enforced —
+reusing the id with a different agent is rejected. Name the session on that first
+`delegate` call with `sessionName`, or rename it later with `PATCH /v1/sessions/:id`
+(HTTP only — rename is a human action). `list_sessions` finds earlier sessions to
+reference or report on; pass
 the `sessionId` it returns to a new `delegate` call to group the new task with that work.
 It does not resume the harness session. Reusing a `sessionId` with a different agent is
 rejected with `409 session_agent_mismatch`. Sessions live in memory and disappear on
@@ -274,7 +276,8 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   only) or `kill -HUP <pid>`.
 - Limits (positive integers unless noted): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
   `A2A_RELAY_MAX_COMMAND_INPUT_BYTES` (64 KiB, command adapter only),
-  `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB),  `A2A_RELAY_MAX_TASKS` (1000), `A2A_RELAY_MAX_SESSIONS` (500), `A2A_RELAY_MAX_ACTIVE` (4),
+  `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (1000),
+  `A2A_RELAY_MAX_SESSIONS` (500), `A2A_RELAY_MAX_ACTIVE` (4),
   `A2A_RELAY_MAX_WAIT_MS` (600000),
   `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap).
   Every variable also accepts an `AGENT_RELAY_*` spelling.
