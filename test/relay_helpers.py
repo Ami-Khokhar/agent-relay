@@ -34,8 +34,9 @@ class Relay:
     def __init__(self, agent, env=None):
         self.dir = tempfile.mkdtemp(prefix="a2a-relay-")
         self.config = os.path.join(self.dir, "agents.json")
+        agents = agent if isinstance(agent, list) else [agent]
         with open(self.config, "w", encoding="utf-8") as handle:
-            json.dump({"agents": [agent]}, handle)
+            json.dump({"agents": agents}, handle)
         self.port = free_port()
         child_env = {**os.environ, "A2A_RELAY_PORT": str(self.port), "A2A_AGENTS_FILE": self.config}
         child_env.update(env or {})

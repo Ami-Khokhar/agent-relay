@@ -56,7 +56,8 @@ class McpHandlerTests(unittest.TestCase):
         for keyword in ("orchestrat", "delegat", "pi", "codex", "opencode", "claude"):
             self.assertIn(keyword, delegate)
         properties = tools["delegate"]["inputSchema"]["properties"]
-        for key in ("agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd", "waitMs"):
+        for key in ("agentId", "input", "sessionId", "sessionName", "requestId",
+                    "timeoutMs", "cwd", "waitMs"):
             self.assertTrue(properties[key].get("description"), f"{key} has no description")
         self.assertIn("list_agents", properties["agentId"]["description"])
         session_description = properties["sessionId"]["description"].lower()
@@ -79,7 +80,7 @@ class McpHandlerTests(unittest.TestCase):
             listed = handle({"method": "tools/list"})
             self.assertEqual([tool["name"] for tool in listed["tools"]],
                              ["list_agents", "delegate", "wait_task", "get_task", "list_tasks",
-                              "cancel_task"])
+                              "list_sessions", "cancel_task"])
             agents = handle({"method": "tools/call", "params": {"name": "list_agents", "arguments": {}}})
             self.assertEqual(agents["structuredContent"]["agents"][0]["id"], "fake")
             submitted = handle({"method": "tools/call", "params": {
@@ -140,6 +141,32 @@ class McpHandlerTests(unittest.TestCase):
             self.assertIn("sessionId=s-1", upstream.calls[1][1])
             self.assertIn("status=completed", upstream.calls[1][1])
             self.assertIn("limit=5", upstream.calls[1][1])
+        finally:
+            upstream.close()
+
+    def test_lists_sessions_and_passes_session_name(self):
+        def responder(method, path, body):
+            if path.startswith("/v1/sessions"):
+                return 200, {"sessions": [{"id": "s-1", "name": "refactor", "agentId": "fake"}]}
+            if method == "POST":
+                return 202, {"id": "task-9", "sessionId": "s-1", "status": "queued"}
+            return 200, {"id": "task-9", "status": "completed", "output": "ok"}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            listed = handle({"method": "tools/call", "params": {
+                "name": "list_sessions", "arguments": {"agentId": "fake", "limit": 5}}})
+            self.assertEqual(listed["structuredContent"]["sessions"][0]["name"], "refactor")
+            self.assertIn("agentId=fake", upstream.calls[0][1])
+            self.assertIn("limit=5", upstream.calls[0][1])
+
+            submitted = handle({"method": "tools/call", "params": {
+                "name": "delegate",
+                "arguments": {"agentId": "fake", "input": "work", "sessionName": "refactor"}}})
+            self.assertEqual(submitted["structuredContent"]["id"], "task-9")
+            self.assertEqual(upstream.calls[1][2],
+                             {"agentId": "fake", "input": "work", "sessionName": "refactor"})
         finally:
             upstream.close()
 

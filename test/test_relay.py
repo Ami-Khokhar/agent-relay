@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -331,6 +332,262 @@ class RelayTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_creates_lists_and_renames_named_sessions(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            status, task = relay.submit(agentId="echo", input="first task input",
+                                        sessionName="refactor auth")
+            self.assertEqual(status, 202)
+            session_id = task["sessionId"]
+            self.assertEqual(task["sessionName"], "refactor auth")
+
+            status, listing = relay.request("GET", "/v1/sessions")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(listing["sessions"]), 1)
+            session = listing["sessions"][0]
+            self.assertEqual(session["id"], session_id)
+            self.assertEqual(session["name"], "refactor auth")
+            self.assertEqual(session["agentId"], "echo")
+            self.assertEqual(session["summary"], "first task input")
+            self.assertEqual(session["taskCount"], 1)
+
+            status, renamed = relay.request("PATCH", f"/v1/sessions/{session_id}",
+                                            {"name": "auth cleanup"})
+            self.assertEqual(status, 200)
+            self.assertEqual(renamed["name"], "auth cleanup")
+
+            status, payload = relay.request("PATCH", f"/v1/sessions/{session_id}", {"bogus": 1})
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "unknown_field")
+
+            status, payload = relay.request("GET", "/v1/sessions/missing")
+            self.assertEqual(status, 404)
+            self.assertEqual(payload["error"], "unknown_session")
+        finally:
+            relay.close()
+
+    def test_session_tracks_a_cancelled_task(self):
+        relay = Relay({"id": "slow", "command": PYTHON,
+                       "args": ["-c", "import time; time.sleep(30)"]})
+        try:
+            _, submitted = relay.submit(agentId="slow", input="long work", sessionId="sess")
+            _, task = relay.request("DELETE", f"/v1/tasks/{submitted['id']}")
+            self.assertEqual(task["status"], "cancelled")
+
+            status, session = relay.request("GET", "/v1/sessions/sess")
+            self.assertEqual(status, 200)
+            self.assertEqual(session["lastStatus"], "cancelled")
+            self.assertEqual(session["lastTaskAt"], task["finishedAt"])
+            self.assertEqual(session["taskCount"], 1)
+        finally:
+            relay.close()
+
+    def test_session_activity_updates_on_each_submission(self):
+        relay = Relay({"id": "slow", "command": PYTHON,
+                       "args": ["-c", "import time,sys; time.sleep(0.5); print(sys.argv[1])"]})
+        try:
+            _, first = relay.submit(agentId="slow", input="first", sessionId="sess")
+            relay.wait_task(first["id"])
+            _, done = relay.request("GET", "/v1/sessions/sess")
+            finished_at = done["lastTaskAt"]
+            self.assertEqual(done["lastStatus"], "completed")
+
+            # Submit the second task without waiting: the submission itself must
+            # refresh the session activity (the previous task cannot have).
+            _, second = relay.submit(agentId="slow", input="second", sessionId="sess")
+            _, session = relay.request("GET", "/v1/sessions/sess")
+            self.assertEqual(session["lastStatus"], "queued")
+            self.assertGreaterEqual(session["lastTaskAt"], second["createdAt"])
+            self.assertGreater(session["lastTaskAt"], finished_at)
+
+            relay.wait_task(second["id"])
+            _, session = relay.request("GET", "/v1/sessions/sess")
+            self.assertEqual(session["lastStatus"], "completed")
+            self.assertEqual(session["taskCount"], 2)
+        finally:
+            relay.close()
+
+    def test_lists_filters_and_validates_session_queries(self):
+        workdir = tempfile.mkdtemp(prefix="a2a-sessions-")
+        relay = Relay({"id": "echo", "command": PYTHON, "allowedRoots": [workdir],
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            _, first = relay.submit(agentId="echo", input="one", sessionId="s-1",
+                                    sessionName="named")
+            relay.submit(agentId="echo", input="two", sessionId="s-2", cwd=workdir)
+
+            status, row = relay.request("GET", "/v1/sessions/s-1")
+            self.assertEqual(status, 200)
+            self.assertEqual(row["name"], "named")
+
+            _, by_agent = relay.request("GET", "/v1/sessions?agentId=echo")
+            self.assertEqual({session["id"] for session in by_agent["sessions"]}, {"s-1", "s-2"})
+            _, by_cwd = relay.request("GET", f"/v1/sessions?cwd={workdir}")
+            self.assertEqual([session["id"] for session in by_cwd["sessions"]], ["s-2"])
+
+            status, payload = relay.request("GET", "/v1/sessions?limit=0")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_limit")
+            status, payload = relay.request("GET", "/v1/sessions?limit=nope")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_limit")
+            status, capped = relay.request("GET", "/v1/sessions?limit=5000")
+            self.assertEqual(status, 200)
+
+            status, payload = relay.request("PATCH", "/v1/sessions/s-1", {"name": 7})
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_name")
+            status, payload = relay.request("PATCH", "/v1/sessions/s-1", {"name": "x" * 129})
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_name")
+            status, payload = relay.request("PATCH", "/v1/sessions/s-1", None)
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_name")
+
+            status, renamed = relay.request("PATCH", "/v1/sessions/s-1", {"name": ""})
+            self.assertEqual(status, 200)
+            self.assertIsNone(renamed["name"])
+        finally:
+            relay.close()
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_evicts_unnamed_sessions_first_when_the_store_is_full(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]},
+                      env={"A2A_RELAY_MAX_SESSIONS": "2"})
+        try:
+            relay.submit(agentId="echo", input="keep me", sessionId="named",
+                         sessionName="keep")
+            relay.submit(agentId="echo", input="scratch one", sessionId="scratch-1")
+            relay.submit(agentId="echo", input="scratch two", sessionId="scratch-2")
+            _, listing = relay.request("GET", "/v1/sessions")
+            # The oldest unnamed session was evicted; the named one survived.
+            self.assertEqual({session["id"] for session in listing["sessions"]},
+                             {"scratch-2", "named"})
+            named = next(session for session in listing["sessions"]
+                         if session["id"] == "named")
+            self.assertEqual(named["name"], "keep")
+        finally:
+            relay.close()
+
+    def test_allows_a_session_reused_across_agents_by_default(self):
+        agents = [
+            {"id": "echo", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]},
+            {"id": "other", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]},
+        ]
+        relay = Relay(agents)
+        try:
+            relay.submit(agentId="echo", input="one", sessionId="shared")
+            status, task = relay.submit(agentId="other", input="two", sessionId="shared")
+            self.assertEqual(status, 202)
+            self.assertEqual(task["sessionId"], "shared")
+            status, session = relay.request("GET", "/v1/sessions/shared")
+            self.assertEqual(status, 200)
+            self.assertEqual(session["agentId"], "echo")  # metadata: first agent
+        finally:
+            relay.close()
+
+    def test_strict_mode_rejects_a_session_reused_across_agents(self):
+        agents = [
+            {"id": "echo", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]},
+            {"id": "other", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]},
+        ]
+        relay = Relay(agents, env={"A2A_RELAY_STRICT_SESSION_AGENT": "1"})
+        try:
+            relay.submit(agentId="echo", input="one", sessionId="shared")
+            status, payload = relay.submit(agentId="other", input="two", sessionId="shared")
+            self.assertEqual(status, 409)
+            self.assertEqual(payload["error"], "session_agent_mismatch")
+            # The bound agent can still use its own session.
+            status, _ = relay.submit(agentId="echo", input="three", sessionId="shared")
+            self.assertEqual(status, 202)
+        finally:
+            relay.close()
+
+    def test_strict_mode_keeps_the_binding_of_an_evicted_session(self):
+        agents = [
+            {"id": "echo", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]},
+            {"id": "other", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]},
+        ]
+        relay = Relay(agents, env={"A2A_RELAY_STRICT_SESSION_AGENT": "1",
+                                  "A2A_RELAY_MAX_SESSIONS": "1"})
+        try:
+            relay.submit(agentId="echo", input="one", sessionId="s")
+            relay.submit(agentId="echo", input="two", sessionId="evictor")
+            status, listing = relay.request("GET", "/v1/sessions")
+            self.assertEqual([session["id"] for session in listing["sessions"]], ["evictor"])
+
+            status, payload = relay.submit(agentId="other", input="three", sessionId="s")
+            self.assertEqual(status, 409)
+            self.assertEqual(payload["error"], "session_agent_mismatch")
+            status, _ = relay.submit(agentId="echo", input="four", sessionId="s")
+            self.assertEqual(status, 202)
+        finally:
+            relay.close()
+
+    def test_rejects_session_ids_that_are_not_url_safe(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            status, payload = relay.submit(agentId="echo", input="x", sessionId="review/pr-12")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_id")
+            status, payload = relay.submit(agentId="echo", input="x", sessionId="tag#1")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_id")
+            for bad in (".", ".."):
+                status, payload = relay.submit(agentId="echo", input="x", sessionId=bad)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"], "invalid_session_id")
+            status, task = relay.submit(agentId="echo", input="x", sessionId="ok_id.~1")
+            self.assertEqual(status, 202)
+            self.assertEqual(task["sessionId"], "ok_id.~1")
+        finally:
+            relay.close()
+
+    def test_blank_query_values_are_validated(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            relay.submit(agentId="echo", input="one", sessionId="s-1")
+            status, payload = relay.request("GET", "/v1/tasks?sessionId=")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_session_id")
+            status, payload = relay.request("GET", "/v1/tasks?status=")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_status")
+            status, payload = relay.request("GET", "/v1/tasks?limit=")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_limit")
+            task_id = relay.run_task(agentId="echo", input="x", sessionId="s-1")["id"]
+            status, payload = relay.request("GET", f"/v1/tasks/{task_id}?waitMs=")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_wait")
+            status, payload = relay.request("GET", "/v1/sessions?agentId=")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_agent_id")
+        finally:
+            relay.close()
+
+    def test_session_name_is_part_of_idempotency(self):
+        relay = Relay({"id": "echo", "command": PYTHON,
+                       "args": ["-c", "import sys; print(sys.argv[1])"]})
+        try:
+            status, first = relay.submit(agentId="echo", requestId="caller-1", input="one",
+                                         sessionId="s-1", sessionName="before")
+            self.assertEqual(status, 202)
+            status, replay = relay.submit(agentId="echo", requestId="caller-1", input="one",
+                                          sessionId="s-1", sessionName="before")
+            self.assertEqual(status, 200)
+            self.assertEqual(replay["id"], first["id"])
+            status, conflict = relay.submit(agentId="echo", requestId="caller-1", input="one",
+                                            sessionId="s-1", sessionName="after")
+            self.assertEqual(status, 409)
+            self.assertEqual(conflict["error"], "idempotency_conflict")
+        finally:
+            relay.close()
+
     def test_reports_effective_limits_and_agent_timeouts(self):
         relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "print(1)"],
                        "timeoutMs": 60000}, env={"A2A_RELAY_MAX_ACTIVE": "2"})
@@ -339,6 +596,7 @@ class RelayTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(health["limits"]["timeoutMs"], 900000)
             self.assertEqual(health["limits"]["maxActive"], 2)
+            self.assertIs(health["limits"]["strictSessionAgent"], False)
             _, listing = relay.request("GET", "/v1/agents")
             self.assertEqual(listing["agents"][0]["timeoutMs"], 60000)
         finally:

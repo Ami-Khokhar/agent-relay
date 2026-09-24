@@ -11,6 +11,12 @@ long poll — `GET /v1/tasks/:id?waitMs=<ms>` (or MCP `wait_task`) — over a `g
 one call instead of many, and it does not stop too early. Use `GET /v1/tasks?sessionId=...`
 (or `list_tasks`) to recover task IDs after an orchestrator context reset.
 
+Sessions: a session is created by the first task that uses its `sessionId`, which records
+that task's agent as metadata. By default any agent may reuse the id for cross-agent
+correlation; `A2A_RELAY_STRICT_SESSION_AGENT=1` rejects reuse by a different agent with
+`409 session_agent_mismatch`. Name a session with `sessionName` on the creating call, and
+find earlier ones with `list_sessions`.
+
 ## 1. Single delegation
 
 The user wants agent A to do a job on agent B.
@@ -29,14 +35,16 @@ you want a hard ceiling.
 
 Run the same prompt on several agents, then compare.
 
-- Register each harness, submit one task per `agentId` with the **same** `sessionId` value
-  (a correlation tag) and distinct `requestId`s.
+- Register each harness and submit one task per `agentId` with distinct `requestId`s.
+  Give all the tasks one shared `sessionId` (a correlation tag) or omit `sessionId` —
+  either works; strict session-agent mode is the only case that requires one session per
+  agent.
 - Keep within `A2A_RELAY_MAX_ACTIVE`; the rest queue automatically.
-- `wait_task` on each task ID (or `list_tasks` for the session), then present a table of
-  agent → status → output.
+- `wait_task` on each task ID (or `list_sessions` afterwards to see what ran where), then
+  present a table of agent → status → output.
 
 ```
-sessionId = "compare-<date>"
+sessionId = "compare-2026-09-23"
 for agent in claude codex pi:
     task = delegate(agentId=agent, input=PROMPT, sessionId=sessionId,
                     requestId=f"{agent}-compare", waitMs=600000)
@@ -50,8 +58,9 @@ A produces, B reviews, C fixes. Pass each output into the next `input`.
 2. `outB = delegate(B, "Review this and list concrete problems:\n" + outA.output)` → `wait_task`
 3. `outC = delegate(C, "Apply these fixes:\n" + outB.output)` → `wait_task`
 
-Give the whole chain one `sessionId` for traceability. If an agent is itself wired to the
-relay as an MCP client, it can delegate further on its own — the relay does not need to know.
+Give the whole chain one `sessionId` for traceability; it is correlation data, not a
+native session. If an agent is itself wired to the relay as an MCP client, it can
+delegate further on its own — the relay does not need to know.
 
 ## 4. Review loop
 
@@ -75,8 +84,8 @@ If the harness exposes only an API or needs structured output:
 
 Add the MCP server to the client's config and start the HTTP service alongside it (or let
 the MCP process start it on demand). The client then sees `list_agents`, `delegate`,
-`wait_task`, `get_task`, `list_tasks`, `cancel_task`. Because submission is asynchronous,
-use `delegate` with `waitMs` or `wait_task` to block until the result is ready.
+`wait_task`, `get_task`, `list_tasks`, `list_sessions`, `cancel_task`. Because submission is
+asynchronous, use `delegate` with `waitMs` or `wait_task` to block until the result is ready.
 
 ## Choosing limits
 

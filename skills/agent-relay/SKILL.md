@@ -40,7 +40,7 @@ Use it when the user wants to:
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
 - give an MCP client the tools `list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`.
+  `list_tasks`, `list_sessions`, `cancel_task`.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
 `PATH` and can run the task: the relay adds task IDs, status, timeouts,
@@ -191,11 +191,12 @@ curl -sS -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # cancel
 **Via MCP** tools:
 
 - `list_agents {}` → registered agents.
-- `delegate { agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` → task.
+- `delegate { agentId, input, sessionId?, sessionName?, requestId?, timeoutMs?, cwd?, waitMs? }` → task.
   With `waitMs`, `delegate` long-polls and returns the terminal task.
 - `wait_task { taskId, maxWaitMs? }` → holds the call until terminal or the wait elapses.
 - `get_task { taskId }` → current task state and result.
 - `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
+- `list_sessions { agentId?, cwd?, limit? }` → recent sessions, newest activity first.
 - `cancel_task { taskId }` → cancel a queued or running task.
 
 **Prefer `wait_task` over a `get_task` polling loop** — one call instead of many, and it
@@ -208,6 +209,19 @@ Statuses: `queued` → `running` → one of `completed`, `failed`, `timed_out`, 
 Result fields on a terminal task: `output` (success text), `error` (failure reason),
 `outputTruncated` (bool). `sessionId` is **correlation data only** — it does not resume a
 native harness session, and each task is a fresh invocation.
+
+### Sessions
+
+A session is created automatically by the first task that uses its `sessionId`, and
+records that task's agent and working directory as metadata. By default another agent may
+reuse the `sessionId` for cross-agent correlation; set `A2A_RELAY_STRICT_SESSION_AGENT=1`
+to reject such reuse with `409 session_agent_mismatch`. Name the session on that first
+`delegate` call with `sessionName`, or rename it later with `PATCH /v1/sessions/:id`
+(HTTP only — rename is a human action). `list_sessions` finds earlier sessions to
+reference or report on; pass
+the `sessionId` it returns to a new `delegate` call to group the new task with that work.
+It does not resume the harness session. Sessions live in memory and disappear on
+restart, like tasks.
 
 Idempotency: send a unique `requestId`; reusing it with the same fields returns the
 original task (`200`), while reusing it with different fields returns `409`. Use it when a
@@ -228,7 +242,8 @@ submission response may have been lost. Without a `requestId`, do not auto-retry
 
 Because agents can themselves be MCP clients, you can chain them: A delegates to B, B
 delegates to C. The relay does not model a cross-agent conversation, so thread continuity
-yourself with a shared `sessionId` value used as a correlation tag.
+yourself: share one `sessionId` across the chain (it records the agent that created it), or give each
+agent its own — see the Sessions section above.
 
 ## Adapter contract (for custom harnesses)
 
@@ -262,9 +277,11 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 - Limits (positive integers unless noted): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
   `A2A_RELAY_MAX_COMMAND_INPUT_BYTES` (64 KiB, command adapter only),
   `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (1000),
-  `A2A_RELAY_MAX_ACTIVE` (4), `A2A_RELAY_MAX_WAIT_MS` (600000),
+  `A2A_RELAY_MAX_SESSIONS` (500), `A2A_RELAY_MAX_ACTIVE` (4),
+  `A2A_RELAY_MAX_WAIT_MS` (600000),
   `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap).
-  Every variable also accepts an `AGENT_RELAY_*` spelling.
+  `A2A_RELAY_STRICT_SESSION_AGENT` (0) rejects a session id reused by another agent when
+  set to a positive integer. Every variable also accepts an `AGENT_RELAY_*` spelling.
 - Cancellation of a spawned adapter sends process signals; cancellation of an HTTP adapter
   aborts the request and may not stop work already accepted by that service.
 
