@@ -40,8 +40,8 @@ Body:
 | --- | --- | --- |
 | `agentId` | yes | Must match a registry id. |
 | `input` | yes | Non-empty string; bounded by body and (for `command`) command-input limits. |
-| `sessionId` | no | ≤128 chars; correlation tag. Defaults to a new UUID. A session is bound to the first agent that used it; reusing it with another agent returns `409 session_agent_mismatch`. |
-| `sessionName` | no | ≤128 chars. Applied only when this call creates the session; rename later with `PATCH /v1/sessions/:id`. |
+| `sessionId` | no | ≤128 chars of letters, digits, `_ . ~ -`; correlation tag. Defaults to a new UUID. The session records the first task's agent as metadata; by default another agent may reuse the id, and `A2A_RELAY_STRICT_SESSION_AGENT=1` rejects that with `409 session_agent_mismatch`. |
+| `sessionName` | no | ≤128 chars. Applied only when this call creates the session; rename later with `PATCH /v1/sessions/:id`. Part of the idempotency comparison when `requestId` is used. |
 | `requestId` | no | ≤128 chars; idempotency key scoped per agent. |
 | `timeoutMs` | no | Positive integer. Overrides the agent/global timeout; rejected if above `A2A_RELAY_MAX_TIMEOUT_MS`. |
 | `cwd` | no | Absolute or relative path. Must be inside the agent's `allowedRoots` (or equal to its `cwd`), else `400 cwd_not_allowed`. |
@@ -86,8 +86,8 @@ tasks are returned unchanged.
 
 Lists sessions, most recently active first. A session is created automatically by the
 first task that uses its `sessionId`; it records that task's agent and working directory
-(only the agent binding is enforced, and `cwd` may be null when neither the task nor the
-agent sets one). Query parameters:
+as metadata (`cwd` may be null when neither the task nor the agent sets one). Query
+parameters:
 
 | Parameter | Notes |
 | --- | --- |
@@ -100,8 +100,8 @@ Returns `{ "sessions": [ ... ] }`. Each session has `id`, `name` (may be `null`)
 `updatedAt`, `lastTaskAt`, `lastStatus`, and `taskCount`. Sessions are in memory and
 disappear on restart; the store is capped at `A2A_RELAY_MAX_SESSIONS` (default 500),
 evicting the least recently active unnamed session first, then the least recently active
-session. An evicted session id keeps its agent binding: a different agent reusing it gets
-`409 session_agent_mismatch`.
+session. In strict session-agent mode an evicted id keeps its agent binding: a different
+agent reusing it gets `409 session_agent_mismatch`.
 
 ### `GET /v1/sessions/:id`
 
@@ -132,7 +132,7 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 | 403 | `forbidden` | Admin route called from a non-loopback address. |
 | 404 | `unknown_agent`, `unknown_task`, `unknown_session`, `not_found` | Missing agent/task/session/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
-| 409 | `idempotency_conflict`, `session_agent_mismatch` | `requestId` reused with different fields, or a `sessionId` reused with a different agent. |
+| 409 | `idempotency_conflict`, `session_agent_mismatch` | `requestId` reused with different fields; in strict session-agent mode, a `sessionId` reused with a different agent. |
 | 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
 | 503 | `task_capacity_reached` | Store full of non-terminal tasks. |
