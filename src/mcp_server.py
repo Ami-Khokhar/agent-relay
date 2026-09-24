@@ -106,7 +106,7 @@ TOOLS = [
             "type": "object", "additionalProperties": False,
             "properties": {
                 "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
-                              "description": "Filter to one session. Get the ID from a delegate result."},
+                              "description": "Filter to one session. Get the ID from a delegate result. Letters, digits, and _ . ~ - only."},
                 "status": {"type": "string", "enum": list(STATUSES),
                            "description": "Filter by task status."},
                 "limit": {"type": "integer", "minimum": 1,
@@ -122,7 +122,7 @@ TOOLS = [
             "type": "object", "additionalProperties": False,
             "properties": {
                 "agentId": {"type": "string", "minLength": 1, "maxLength": 128,
-                            "description": "Filter to sessions that used this agent."},
+                            "description": "Filter to sessions created by this agent."},
                 "cwd": {"type": "string", "minLength": 1,
                         "description": "Filter to sessions whose working directory is this path."},
                 "limit": {"type": "integer", "minimum": 1,

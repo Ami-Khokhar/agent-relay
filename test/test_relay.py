@@ -536,6 +536,10 @@ class RelayTests(unittest.TestCase):
             status, payload = relay.submit(agentId="echo", input="x", sessionId="tag#1")
             self.assertEqual(status, 400)
             self.assertEqual(payload["error"], "invalid_session_id")
+            for bad in (".", ".."):
+                status, payload = relay.submit(agentId="echo", input="x", sessionId=bad)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"], "invalid_session_id")
             status, task = relay.submit(agentId="echo", input="x", sessionId="ok_id.~1")
             self.assertEqual(status, 202)
             self.assertEqual(task["sessionId"], "ok_id.~1")

@@ -84,8 +84,8 @@ MAX_WAIT_MS = _positive_int(600_000, "AGENT_RELAY_MAX_WAIT_MS", "A2A_RELAY_MAX_W
 MAX_OUTPUT = _positive_int(262_144, "AGENT_RELAY_MAX_OUTPUT_BYTES", "A2A_RELAY_MAX_OUTPUT_BYTES")
 MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
 MAX_SESSIONS = _positive_int(500, "AGENT_RELAY_MAX_SESSIONS", "A2A_RELAY_MAX_SESSIONS")
-STRICT_SESSION_AGENT = _positive_int(0, "AGENT_RELAY_STRICT_SESSION_AGENT",
-                                     "A2A_RELAY_STRICT_SESSION_AGENT") > 0
+STRICT_SESSION_AGENT = _non_negative_int(0, "AGENT_RELAY_STRICT_SESSION_AGENT",
+                                        "A2A_RELAY_STRICT_SESSION_AGENT") > 0
 MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
 MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
                                   "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
@@ -553,8 +553,10 @@ def _valid(value, limit=128):
 
 
 def _valid_session_id(value):
-    """Session ids are addressed as a URL path segment, so constrain the charset."""
-    return _valid(value) and SESSION_ID_RE.fullmatch(value) is not None
+    """Session ids are addressed as a URL path segment, so constrain the charset
+    and reject dot-only ids that normalising clients would rewrite ('.' -> './',
+    '..' -> parent)."""
+    return _valid(value) and value not in (".", "..") and SESSION_ID_RE.fullmatch(value) is not None
 
 
 def _is_positive_int(value):
@@ -659,7 +661,8 @@ def _session_listing(agent_id=None, cwd=None, limit=20):
 def _make_room_for_session():
     """Evict the least recently active session, preferring unnamed ones so a
     human-chosen name survives ordinary auto-created traffic when possible.
-    The evicted id keeps its agent binding so a different agent cannot reuse it."""
+    The evicted id keeps its agent binding for STRICT_SESSION_AGENT mode; by
+    default the id may be re-created by any agent."""
     if len(SESSIONS) < MAX_SESSIONS:
         return
     candidates = [session for session in SESSIONS.values() if session.get("name") is None]
@@ -908,7 +911,7 @@ class Handler(BaseHTTPRequestHandler):
     def _list(self, query):
         session_id = query.get("sessionId", [None])[0]
         status = query.get("status", [None])[0]
-        if session_id is not None and not _valid(session_id):
+        if session_id is not None and not _valid_session_id(session_id):
             return self._json(400, {"error": "invalid_session_id"})
         if status is not None and status not in STATUSES:
             return self._json(400, {"error": "invalid_status"})

@@ -91,7 +91,7 @@ parameters:
 
 | Parameter | Notes |
 | --- | --- |
-| `agentId` | Filter to sessions that used this agent. |
+| `agentId` | Filter to sessions created by this agent (a session records only its creating agent, even when another agent reuses the id). |
 | `cwd` | Filter to sessions whose working directory is this path. |
 | `limit` | Positive integer, capped at 100 (default 20). |
 
