@@ -143,11 +143,12 @@ briefly for adapters to stop.
 
 To pick up new features merged on the project's `main`, run `bash
 ~/.local/share/agent-relay/scripts/update.sh` (or `scripts/update.sh` from the checkout):
-it fast-forwards the checkout and restarts the service only when the code changed
-(deferred while tasks are in flight; a relay that does not report active/queued counts is
-always treated as busy). `install-service.sh --with-update-timer` schedules that update
-every 6 hours. MCP clients need no reconfiguration — the tool list refreshes on each
-client's next session start.
+it fast-forwards the checkout and restarts the service only when the code changed. The
+first restart is deferred while tasks are in flight (or while the relay cannot report
+counts), and the next run escalates — restarting unless tasks are visibly busy — so an
+update lands at most one cycle late. `install-service.sh --with-update-timer` schedules
+that update every 6 hours. MCP clients need no reconfiguration — the tool list refreshes
+on each client's next session start.
 
 Register the MCP server in the orchestrating client (point `args` at the absolute path).
 The setup script prints these for your checkout:

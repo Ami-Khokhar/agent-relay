@@ -15,8 +15,9 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
 
 `maxTimeoutMs` is `null` when no hard cap is configured. `active` counts running tasks
 and `queued` counts waiting tasks (the same distinction as the task statuses;
-`scripts/update.sh` defers service restarts while either is non-zero, and treats a relay
-that does not report them as busy).
+`scripts/update.sh` defers the first restart while either is non-zero, and treats a relay
+that does not report them as busy on the first pass — a relay still unreadable on the
+next run is restarted, since an old relay cannot report counts).
 
 ### `GET /v1/agents`
 
