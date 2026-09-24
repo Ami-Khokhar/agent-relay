@@ -11,10 +11,11 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
               "maxOutputBytes": 262144, "maxTasks": 1000, "maxSessions": 500,
-              "maxActive": 4 } }
+              "maxActive": 4, "strictSessionAgent": false } }
 ```
 
-`maxTimeoutMs` is `null` when no hard cap is configured.
+`maxTimeoutMs` is `null` when no hard cap is configured. `strictSessionAgent` is a
+boolean, unlike the integer limits.
 
 ### `GET /v1/agents`
 
@@ -40,7 +41,7 @@ Body:
 | --- | --- | --- |
 | `agentId` | yes | Must match a registry id. |
 | `input` | yes | Non-empty string; bounded by body and (for `command`) command-input limits. |
-| `sessionId` | no | ≤128 chars of letters, digits, `_ . ~ -`; correlation tag. Defaults to a new UUID. The session records the first task's agent as metadata; by default another agent may reuse the id, and `A2A_RELAY_STRICT_SESSION_AGENT=1` rejects that with `409 session_agent_mismatch`. |
+| `sessionId` | no | ≤128 chars of letters, digits, `_ . ~ -`; `.` and `..` are rejected. Correlation tag; defaults to a new UUID. The session records the first task's agent as metadata; by default another agent may reuse the id, and `A2A_RELAY_STRICT_SESSION_AGENT=1` rejects that with `409 session_agent_mismatch`. Violations return `400 invalid_session_id`. |
 | `sessionName` | no | ≤128 chars. Applied only when this call creates the session; rename later with `PATCH /v1/sessions/:id`. Part of the idempotency comparison when `requestId` is used. |
 | `requestId` | no | ≤128 chars; idempotency key scoped per agent. |
 | `timeoutMs` | no | Positive integer. Overrides the agent/global timeout; rejected if above `A2A_RELAY_MAX_TIMEOUT_MS`. |
@@ -71,7 +72,7 @@ Lists stored tasks, most recent first. Query parameters:
 
 | Parameter | Notes |
 | --- | --- |
-| `sessionId` | Filter by session. |
+| `sessionId` | Filter by session; must satisfy the `sessionId` charset (see `POST /v1/tasks`), else `400 invalid_session_id`. |
 | `status` | One of the status values; anything else is `400 invalid_status`. |
 | `limit` | Positive integer, capped at `A2A_RELAY_MAX_TASKS` (default 100). |
 

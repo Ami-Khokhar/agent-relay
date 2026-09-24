@@ -242,7 +242,7 @@ submission response may have been lost. Without a `requestId`, do not auto-retry
 
 Because agents can themselves be MCP clients, you can chain them: A delegates to B, B
 delegates to C. The relay does not model a cross-agent conversation, so thread continuity
-yourself: share one `sessionId` across the chain (it records who used it), or give each
+yourself: share one `sessionId` across the chain (it records the agent that created it), or give each
 agent its own — see the Sessions section above.
 
 ## Adapter contract (for custom harnesses)
