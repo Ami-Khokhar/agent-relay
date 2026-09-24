@@ -109,7 +109,10 @@ def default_config_path():
     """Prefer a per-user registry, then the one inside the checkout."""
     user = Path.home() / ".config" / "agent-relay" / "agents.json"
     repo = Path(__file__).resolve().parent.parent / "config" / "agents.json"
-    return user if user.exists() else repo
+    if user.exists():
+        return user
+    print(f"warning: user registry not found at {user}; falling back to {repo}", file=sys.stderr)
+    return repo
 
 
 def config_path():
