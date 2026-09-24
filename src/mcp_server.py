@@ -60,7 +60,7 @@ TOOLS = [
                 "input": {"type": "string", "minLength": 1,
                           "description": "Full task text for the target agent. The agent cannot see this conversation. Include the goal, relevant file paths, constraints, and the expected output format."},
                 "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
-                              "description": "Correlation tag for grouping related tasks; not a native harness session, and each task is a fresh invocation. Reuse the value from an earlier task, or a sessionId from list_sessions, to group work and to filter list_tasks. Omit it and the relay assigns a new UUID (returned in the task result)."},
+                              "description": "Correlation tag for grouping related tasks; not a native harness session, and each task is a fresh invocation. Reuse the value from an earlier task, or a sessionId from list_sessions, to group work and to filter list_tasks. Omit it and the relay assigns a new UUID (returned in the task result). Letters, digits, and _ . ~ - only; '.' and '..' are rejected."},
                 "sessionName": {"type": "string", "minLength": 1, "maxLength": 128,
                                 "description": "Human-readable name for the session. Used only when this call creates a new session; rename an existing session with PATCH /v1/sessions/:id."},
                 "requestId": {"type": "string", "minLength": 1, "maxLength": 128,
@@ -106,7 +106,7 @@ TOOLS = [
             "type": "object", "additionalProperties": False,
             "properties": {
                 "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
-                              "description": "Filter to one session. Get the ID from a delegate result."},
+                              "description": "Filter to one session. Get the ID from a delegate result. Letters, digits, and _ . ~ - only; '.' and '..' are rejected."},
                 "status": {"type": "string", "enum": list(STATUSES),
                            "description": "Filter by task status."},
                 "limit": {"type": "integer", "minimum": 1,
@@ -122,7 +122,7 @@ TOOLS = [
             "type": "object", "additionalProperties": False,
             "properties": {
                 "agentId": {"type": "string", "minLength": 1, "maxLength": 128,
-                            "description": "Filter to sessions that used this agent."},
+                            "description": "Filter to sessions created by this agent."},
                 "cwd": {"type": "string", "minLength": 1,
                         "description": "Filter to sessions whose working directory is this path."},
                 "limit": {"type": "integer", "minimum": 1,

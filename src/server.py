@@ -28,6 +28,7 @@ INHERITED_ENV = (
     "SystemRoot", "ComSpec", "PATHEXT",
 )
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+")
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 TASK_FIELDS = {"agentId", "input", "sessionId", "sessionName", "requestId", "timeoutMs", "cwd"}
 STATUSES = {"queued", "running", "completed", "failed", "timed_out", "cancelled"}
@@ -83,6 +84,8 @@ MAX_WAIT_MS = _positive_int(600_000, "AGENT_RELAY_MAX_WAIT_MS", "A2A_RELAY_MAX_W
 MAX_OUTPUT = _positive_int(262_144, "AGENT_RELAY_MAX_OUTPUT_BYTES", "A2A_RELAY_MAX_OUTPUT_BYTES")
 MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
 MAX_SESSIONS = _positive_int(500, "AGENT_RELAY_MAX_SESSIONS", "A2A_RELAY_MAX_SESSIONS")
+STRICT_SESSION_AGENT = _non_negative_int(0, "AGENT_RELAY_STRICT_SESSION_AGENT",
+                                        "A2A_RELAY_STRICT_SESSION_AGENT") > 0
 MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
 MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
                                   "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
@@ -549,6 +552,13 @@ def _valid(value, limit=128):
     return isinstance(value, str) and 0 < len(value) <= limit
 
 
+def _valid_session_id(value):
+    """Session ids are addressed as a URL path segment, so constrain the charset
+    and reject dot-only ids that normalising clients would rewrite ('.' -> './',
+    '..' -> parent)."""
+    return _valid(value) and value not in (".", "..") and SESSION_ID_RE.fullmatch(value) is not None
+
+
 def _is_positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
@@ -588,6 +598,7 @@ def _limits():
         "maxTasks": MAX_TASKS,
         "maxSessions": MAX_SESSIONS,
         "maxActive": MAX_ACTIVE,
+        "strictSessionAgent": STRICT_SESSION_AGENT,
     }
 
 
@@ -651,7 +662,8 @@ def _session_listing(agent_id=None, cwd=None, limit=20):
 def _make_room_for_session():
     """Evict the least recently active session, preferring unnamed ones so a
     human-chosen name survives ordinary auto-created traffic when possible.
-    The evicted id keeps its agent binding so a different agent cannot reuse it."""
+    The evicted id keeps its agent binding for STRICT_SESSION_AGENT mode; by
+    default the id may be re-created by any agent."""
     if len(SESSIONS) < MAX_SESSIONS:
         return
     candidates = [session for session in SESSIONS.values() if session.get("name") is None]
@@ -779,7 +791,7 @@ class Handler(BaseHTTPRequestHandler):
         if not _valid(input_text, MAX_BODY):
             return self._json(400, {"error": "input_required"})
         requested_session_id = request.get("sessionId")
-        if requested_session_id is not None and not _valid(requested_session_id):
+        if requested_session_id is not None and not _valid_session_id(requested_session_id):
             return self._json(400, {"error": "invalid_session_id"})
         session_name = request.get("sessionName")
         if session_name is not None and not _valid(session_name):
@@ -810,74 +822,82 @@ class Handler(BaseHTTPRequestHandler):
                 "message": f"timeoutMs exceeds A2A_RELAY_MAX_TIMEOUT_MS ({MAX_TIMEOUT_MS})"})
         request_key = None if request_id is None else f"{agent['id']}\0{request_id}"
         with LOCK:
+            response = None
             prior = REQUEST_IDS.get(request_key) if request_key else None
             if prior is not None:
                 if (prior["input"] != input_text
                         or prior.get("_requested_session_id") != requested_session_id
+                        or prior.get("_requested_session_name") != session_name
                         or prior.get("_requested_timeout_ms") != timeout_ms
                         or prior.get("_requested_cwd") != request.get("cwd")):
-                    return self._json(409, {"error": "idempotency_conflict"})
-                return self._json(200, visible(prior))
-            effective_session_id = requested_session_id or str(uuid.uuid4())
-            session = SESSIONS.get(effective_session_id)
-            if session is not None and session["agentId"] != agent["id"]:
-                return self._json(409, {
-                    "error": "session_agent_mismatch",
-                    "message": (f"sessionId {effective_session_id} belongs to agent "
-                                f"{session['agentId']}; call list_sessions or omit sessionId"),
-                })
-            if session is None and EVICTED_SESSIONS.get(effective_session_id) not in (
-                    None, agent["id"]):
-                # An evicted session keeps its agent binding so the id cannot be
-                # quietly re-created by another agent while old tasks survive.
-                return self._json(409, {
-                    "error": "session_agent_mismatch",
-                    "message": (f"sessionId {effective_session_id} belonged to agent "
-                                f"{EVICTED_SESSIONS[effective_session_id]}; call "
-                                "list_sessions or omit sessionId"),
-                })
-            if not _make_room():
-                return self._json(503, {"error": "task_capacity_reached"})
-            task = {
-                "id": str(uuid.uuid4()),
-                "sessionId": effective_session_id,
-                "agentId": agent["id"],
-                "input": input_text,
-                "status": "queued",
-                "createdAt": now_iso(),
-                "timeoutMs": task_timeout,
-            }
-            if task_cwd:
-                task["cwd"] = task_cwd
-            if request_key:
-                task["requestId"] = request_id
-                task["_request_key"] = request_key
-                task["_requested_session_id"] = requested_session_id
-                task["_requested_timeout_ms"] = timeout_ms
-                task["_requested_cwd"] = request.get("cwd")
-                REQUEST_IDS[request_key] = task
-            TASKS[task["id"]] = task
-            QUEUE.append(task)
-            if session is None:
-                _make_room_for_session()
-                SESSIONS[effective_session_id] = {
-                    "id": effective_session_id,
-                    "name": session_name,
-                    "agentId": agent["id"],
-                    "cwd": task_cwd or agent.get("cwd"),
-                    "createdAt": task["createdAt"],
-                    "updatedAt": task["createdAt"],
-                    "lastTaskAt": task["createdAt"],
-                    "lastStatus": "queued",
-                    "summary": input_text[:80],
-                }
+                    response = (409, {"error": "idempotency_conflict"})
+                else:
+                    response = (200, visible(prior))
             else:
-                # Keep "most recently active" ordering and eviction honest:
-                # activity is the last task submission or completion.
-                session["lastTaskAt"] = task["createdAt"]
-                session["updatedAt"] = task["createdAt"]
-                session["lastStatus"] = "queued"
-        self._json(202, visible(task))
+                effective_session_id = requested_session_id or str(uuid.uuid4())
+                session = SESSIONS.get(effective_session_id)
+                if STRICT_SESSION_AGENT:
+                    if session is not None and session["agentId"] != agent["id"]:
+                        response = (409, {
+                            "error": "session_agent_mismatch",
+                            "message": (f"sessionId {effective_session_id} belongs to agent "
+                                        f"{session['agentId']}; call list_sessions or omit sessionId"),
+                        })
+                    elif session is None and EVICTED_SESSIONS.get(effective_session_id) not in (
+                            None, agent["id"]):
+                        # An evicted session keeps its agent binding so the id cannot
+                        # be quietly re-created by another agent while old tasks survive.
+                        response = (409, {
+                            "error": "session_agent_mismatch",
+                            "message": (f"sessionId {effective_session_id} belonged to agent "
+                                        f"{EVICTED_SESSIONS[effective_session_id]}; call "
+                                        "list_sessions or omit sessionId"),
+                        })
+            if response is None and not _make_room():
+                response = (503, {"error": "task_capacity_reached"})
+            if response is None:
+                task = {
+                    "id": str(uuid.uuid4()),
+                    "sessionId": effective_session_id,
+                    "agentId": agent["id"],
+                    "input": input_text,
+                    "status": "queued",
+                    "createdAt": now_iso(),
+                    "timeoutMs": task_timeout,
+                }
+                if task_cwd:
+                    task["cwd"] = task_cwd
+                if request_key:
+                    task["requestId"] = request_id
+                    task["_request_key"] = request_key
+                    task["_requested_session_id"] = requested_session_id
+                    task["_requested_session_name"] = session_name
+                    task["_requested_timeout_ms"] = timeout_ms
+                    task["_requested_cwd"] = request.get("cwd")
+                    REQUEST_IDS[request_key] = task
+                TASKS[task["id"]] = task
+                QUEUE.append(task)
+                if session is None:
+                    _make_room_for_session()
+                    SESSIONS[effective_session_id] = {
+                        "id": effective_session_id,
+                        "name": session_name,
+                        "agentId": agent["id"],
+                        "cwd": task_cwd or agent.get("cwd"),
+                        "createdAt": task["createdAt"],
+                        "updatedAt": task["createdAt"],
+                        "lastTaskAt": task["createdAt"],
+                        "lastStatus": "queued",
+                        "summary": input_text[:80],
+                    }
+                else:
+                    # Keep "most recently active" ordering and eviction honest:
+                    # activity is the last task submission or completion.
+                    session["lastTaskAt"] = task["createdAt"]
+                    session["updatedAt"] = task["createdAt"]
+                    session["lastStatus"] = "queued"
+                response = (202, visible(task))
+        self._json(*response)
         _drain()
 
     def _get_task(self, task_id, query):
@@ -897,7 +917,7 @@ class Handler(BaseHTTPRequestHandler):
     def _list(self, query):
         session_id = query.get("sessionId", [None])[0]
         status = query.get("status", [None])[0]
-        if session_id is not None and not _valid(session_id):
+        if session_id is not None and not _valid_session_id(session_id):
             return self._json(400, {"error": "invalid_session_id"})
         if status is not None and status not in STATUSES:
             return self._json(400, {"error": "invalid_status"})
@@ -961,8 +981,10 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             session = SESSIONS.get(session_id)
             if session is None:
-                return self._json(404, {"error": "unknown_session"})
-            return self._json(200, _session_row(session))
+                response = (404, {"error": "unknown_session"})
+            else:
+                response = (200, _session_row(session))
+        return self._json(*response)
 
     def _rename_session(self, session_id):
         body, error = self._read_json()
@@ -978,10 +1000,12 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             session = SESSIONS.get(session_id)
             if session is None:
-                return self._json(404, {"error": "unknown_session"})
-            session["name"] = name or None
-            session["updatedAt"] = now_iso()
-            return self._json(200, _session_row(session))
+                response = (404, {"error": "unknown_session"})
+            else:
+                session["name"] = name or None
+                session["updatedAt"] = now_iso()
+                response = (200, _session_row(session))
+        return self._json(*response)
 
     def _cancel(self, task):
         global ACTIVE

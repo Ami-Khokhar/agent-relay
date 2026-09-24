@@ -213,14 +213,14 @@ native harness session, and each task is a fresh invocation.
 ### Sessions
 
 A session is created automatically by the first task that uses its `sessionId`, and
-records that task's agent and working directory; only the agent binding is enforced —
-reusing the id with a different agent is rejected. Name the session on that first
+records that task's agent and working directory as metadata. By default another agent may
+reuse the `sessionId` for cross-agent correlation; set `A2A_RELAY_STRICT_SESSION_AGENT=1`
+to reject such reuse with `409 session_agent_mismatch`. Name the session on that first
 `delegate` call with `sessionName`, or rename it later with `PATCH /v1/sessions/:id`
 (HTTP only — rename is a human action). `list_sessions` finds earlier sessions to
 reference or report on; pass
 the `sessionId` it returns to a new `delegate` call to group the new task with that work.
-It does not resume the harness session. Reusing a `sessionId` with a different agent is
-rejected with `409 session_agent_mismatch`. Sessions live in memory and disappear on
+It does not resume the harness session. Sessions live in memory and disappear on
 restart, like tasks.
 
 Idempotency: send a unique `requestId`; reusing it with the same fields returns the
@@ -241,9 +241,9 @@ submission response may have been lost. Without a `requestId`, do not auto-retry
    [references/use-cases.md](references/use-cases.md).
 
 Because agents can themselves be MCP clients, you can chain them: A delegates to B, B
-delegates to C. The relay does not model a cross-agent conversation: each agent keeps its
-own `sessionId` (one is created automatically per task), and reusing a `sessionId` with a
-different agent is rejected — see the Sessions section above.
+delegates to C. The relay does not model a cross-agent conversation, so thread continuity
+yourself: share one `sessionId` across the chain (it records the agent that created it), or give each
+agent its own — see the Sessions section above.
 
 ## Adapter contract (for custom harnesses)
 
@@ -280,7 +280,8 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   `A2A_RELAY_MAX_SESSIONS` (500), `A2A_RELAY_MAX_ACTIVE` (4),
   `A2A_RELAY_MAX_WAIT_MS` (600000),
   `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap).
-  Every variable also accepts an `AGENT_RELAY_*` spelling.
+  `A2A_RELAY_STRICT_SESSION_AGENT` (0) rejects a session id reused by another agent when
+  set to a positive integer. Every variable also accepts an `AGENT_RELAY_*` spelling.
 - Cancellation of a spawned adapter sends process signals; cancellation of an HTTP adapter
   aborts the request and may not stop work already accepted by that service.
 

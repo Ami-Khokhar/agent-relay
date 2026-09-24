@@ -11,10 +11,11 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
               "maxOutputBytes": 262144, "maxTasks": 1000, "maxSessions": 500,
-              "maxActive": 4 } }
+              "maxActive": 4, "strictSessionAgent": false } }
 ```
 
-`maxTimeoutMs` is `null` when no hard cap is configured.
+`maxTimeoutMs` is `null` when no hard cap is configured. `strictSessionAgent` is a
+boolean, unlike the integer limits.
 
 ### `GET /v1/agents`
 
@@ -40,8 +41,8 @@ Body:
 | --- | --- | --- |
 | `agentId` | yes | Must match a registry id. |
 | `input` | yes | Non-empty string; bounded by body and (for `command`) command-input limits. |
-| `sessionId` | no | ≤128 chars; correlation tag. Defaults to a new UUID. A session is bound to the first agent that used it; reusing it with another agent returns `409 session_agent_mismatch`. |
-| `sessionName` | no | ≤128 chars. Applied only when this call creates the session; rename later with `PATCH /v1/sessions/:id`. |
+| `sessionId` | no | ≤128 chars of letters, digits, `_ . ~ -`; `.` and `..` are rejected. Correlation tag; defaults to a new UUID. The session records the first task's agent as metadata; by default another agent may reuse the id, and `A2A_RELAY_STRICT_SESSION_AGENT=1` rejects that with `409 session_agent_mismatch`. Violations return `400 invalid_session_id`. |
+| `sessionName` | no | ≤128 chars. Applied only when this call creates the session; rename later with `PATCH /v1/sessions/:id`. Part of the idempotency comparison when `requestId` is used. |
 | `requestId` | no | ≤128 chars; idempotency key scoped per agent. |
 | `timeoutMs` | no | Positive integer. Overrides the agent/global timeout; rejected if above `A2A_RELAY_MAX_TIMEOUT_MS`. |
 | `cwd` | no | Absolute or relative path. Must be inside the agent's `allowedRoots` (or equal to its `cwd`), else `400 cwd_not_allowed`. |
@@ -71,7 +72,7 @@ Lists stored tasks, most recent first. Query parameters:
 
 | Parameter | Notes |
 | --- | --- |
-| `sessionId` | Filter by session. |
+| `sessionId` | Filter by session; must satisfy the `sessionId` charset (see `POST /v1/tasks`), else `400 invalid_session_id`. |
 | `status` | One of the status values; anything else is `400 invalid_status`. |
 | `limit` | Positive integer, capped at `A2A_RELAY_MAX_TASKS` (default 100). |
 
@@ -86,12 +87,12 @@ tasks are returned unchanged.
 
 Lists sessions, most recently active first. A session is created automatically by the
 first task that uses its `sessionId`; it records that task's agent and working directory
-(only the agent binding is enforced, and `cwd` may be null when neither the task nor the
-agent sets one). Query parameters:
+as metadata (`cwd` may be null when neither the task nor the agent sets one). Query
+parameters:
 
 | Parameter | Notes |
 | --- | --- |
-| `agentId` | Filter to sessions that used this agent. |
+| `agentId` | Filter to sessions created by this agent (a session records only its creating agent, even when another agent reuses the id). |
 | `cwd` | Filter to sessions whose working directory is this path. |
 | `limit` | Positive integer, capped at 100 (default 20). |
 
@@ -100,8 +101,8 @@ Returns `{ "sessions": [ ... ] }`. Each session has `id`, `name` (may be `null`)
 `updatedAt`, `lastTaskAt`, `lastStatus`, and `taskCount`. Sessions are in memory and
 disappear on restart; the store is capped at `A2A_RELAY_MAX_SESSIONS` (default 500),
 evicting the least recently active unnamed session first, then the least recently active
-session. An evicted session id keeps its agent binding: a different agent reusing it gets
-`409 session_agent_mismatch`.
+session. In strict session-agent mode an evicted id keeps its agent binding: a different
+agent reusing it gets `409 session_agent_mismatch`.
 
 ### `GET /v1/sessions/:id`
 
@@ -132,7 +133,7 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 | 403 | `forbidden` | Admin route called from a non-loopback address. |
 | 404 | `unknown_agent`, `unknown_task`, `unknown_session`, `not_found` | Missing agent/task/session/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
-| 409 | `idempotency_conflict`, `session_agent_mismatch` | `requestId` reused with different fields, or a `sessionId` reused with a different agent. |
+| 409 | `idempotency_conflict`, `session_agent_mismatch` | `requestId` reused with different fields; in strict session-agent mode, a `sessionId` reused with a different agent. |
 | 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
 | 503 | `task_capacity_reached` | Store full of non-terminal tasks. |
