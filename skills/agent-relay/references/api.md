@@ -7,13 +7,16 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
 ### `GET /healthz`
 
 ```json
-{ "ok": true, "agents": 3, "tasks": 0,
+{ "ok": true, "agents": 3, "tasks": 0, "active": 0, "queued": 0,
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
               "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4 } }
 ```
 
-`maxTimeoutMs` is `null` when no hard cap is configured.
+`maxTimeoutMs` is `null` when no hard cap is configured. `active` counts running tasks
+and `queued` counts waiting tasks (the same distinction as the task statuses;
+`scripts/update.sh` defers service restarts while either is non-zero, and treats a relay
+that does not report them as busy).
 
 ### `GET /v1/agents`
 

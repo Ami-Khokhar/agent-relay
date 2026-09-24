@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -100,7 +101,7 @@ class UpdateScriptTests(unittest.TestCase):
                 result = self._run(env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("updated:", result.stdout)
-                self.assertIn("restarting service (code changed)", result.stdout)
+                self.assertIn("stubbed restart", result.stdout)
                 self.assertIn("relay healthy on port", result.stdout)
             finally:
                 relay.close()
@@ -130,10 +131,55 @@ class UpdateScriptTests(unittest.TestCase):
                 subprocess.run(["git", "fetch", "origin"], cwd=checkout, check=True,
                                capture_output=True, text=True)
                 result = self._run(env, "--force")
-                self.assertIn("restarting service", result.stdout)
                 self.assertIn("stubbed restart", result.stdout)
             finally:
                 relay.close()
+
+    def test_deferred_restart_completes_on_a_later_idle_run(self):
+        """A restart skipped while busy must not be lost: the next run, still
+        up to date, completes it once the relay is idle again."""
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            relay = Relay({"id": "slow", "command": PYTHON,
+                           "args": ["-c", "import time; time.sleep(2)"]})
+            try:
+                port = relay.base.rsplit(":", 1)[1]
+                env = self._stub_env(checkout, port)
+                advance_repo(seed, "c-new")
+                subprocess.run(["git", "fetch", "origin"], cwd=checkout, check=True,
+                               capture_output=True, text=True)
+
+                _, submitted = relay.submit(agentId="slow", input="work in flight")
+                result = self._run(env)
+                self.assertIn("skipping restart", result.stdout)
+                pending = os.path.join(checkout, ".git", "agent-relay-pending-restart")
+                self.assertTrue(os.path.exists(pending))
+
+                relay.wait_task(submitted["id"])
+                result = self._run(env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("completing a restart deferred earlier", result.stdout)
+                self.assertIn("stubbed restart", result.stdout)
+                self.assertFalse(os.path.exists(pending))
+            finally:
+                relay.close()
+
+    def test_bootstrapping_without_the_setup_script_fails_with_a_clear_error(self):
+        """update.sh resolves the bundled setup script relative to itself; run it
+        from a bare scripts/ dir so the guard (not a network clone) is tested."""
+        with tempfile.TemporaryDirectory() as tmp:
+            scripts = os.path.join(tmp, "scripts")
+            os.makedirs(scripts)
+            shutil.copy(UPDATE, os.path.join(scripts, "update.sh"))
+            target = os.path.join(tmp, "install")
+            os.makedirs(target)
+            env = {**os.environ, "AGENT_RELAY_DIR": target}
+            result = subprocess.run(["bash", os.path.join(scripts, "update.sh")],
+                                    env=env, cwd=ROOT, capture_output=True, text=True,
+                                    timeout=30)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("setup script not found", result.stderr)
 
     @staticmethod
     def _stub_env(checkout, port):

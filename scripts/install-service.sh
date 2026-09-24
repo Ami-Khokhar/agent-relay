@@ -160,6 +160,12 @@ if [ "$WITH_UPDATE_TIMER" = "1" ]; then
     <string>/bin/bash</string>
     <string>$TARGET_DIR/scripts/update.sh</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$SERVICE_PATH</string>
+    <key>A2A_RELAY_PORT</key><string>$PORT</string>
+    <key>AGENT_RELAY_DIR</key><string>$TARGET_DIR</string>
+  </dict>
   <key>StartInterval</key><integer>$UPDATE_INTERVAL</integer>
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>$HOME/Library/Logs/agent-relay/update.log</string>
@@ -181,6 +187,9 @@ Description=agent-relay scheduled update
 
 [Service]
 Type=oneshot
+Environment=PATH=$SERVICE_PATH
+Environment=A2A_RELAY_PORT=$PORT
+Environment=AGENT_RELAY_DIR=$TARGET_DIR
 ExecStart=/bin/bash $TARGET_DIR/scripts/update.sh
 UNIT_EOF
     cat > "$UPDATE_TIMER" <<UNIT_EOF
