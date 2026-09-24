@@ -9,7 +9,8 @@
 #   scripts/install-service.sh --with-update-timer
 #                                   also install a scheduled update that runs
 #                                   scripts/update.sh every 6 hours
-#   scripts/install-service.sh --uninstall [--with-update-timer]
+#   scripts/install-service.sh --uninstall   (removes the service and the
+#                                   update timer if one is installed)
 #
 # Env:
 #   AGENT_RELAY_DIR      source checkout (default ~/.local/share/agent-relay)
