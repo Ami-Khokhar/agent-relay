@@ -74,11 +74,18 @@ class UpdateScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             seed = init_repo(os.path.join(tmp, "seed"))
             checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
-            log = os.path.join(tmp, "restarts.log")
-            result = run_update(checkout)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("already up to date", result.stdout)
-            self.assertFalse(os.path.exists(log), "the service was restarted")
+            relay = Relay({"id": "echo", "command": PYTHON,
+                           "args": ["-c", "print(1)"]})
+            try:
+                port = relay.base.rsplit(":", 1)[1]
+                env = self._stub_env(checkout, port)
+                result = self._run(env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("already up to date", result.stdout)
+                with open(env["AGENT_RELAY_RESTART_LOG"], encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "", "the service was restarted")
+            finally:
+                relay.close()
 
     def test_new_commit_restarts_and_verifies_health(self):
         """A real relay runs on a helper-chosen port; uname/launchctl are stubbed
@@ -170,9 +177,6 @@ class UpdateScriptTests(unittest.TestCase):
             seed = init_repo(os.path.join(tmp, "seed"))
             checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
             # A 'relay' whose /healthz answers ok but without the new counts.
-            old_health = os.path.join(tmp, "old-health")
-            with open(old_health, "w", encoding="utf-8") as handle:
-                handle.write('{"ok": true, "agents": 1, "tasks": 0}\n')
             server, port = start_http_server(lambda request: send_json(
                 request, 200, {"ok": True, "agents": 1, "tasks": 0}))
             try:
@@ -219,6 +223,34 @@ class UpdateScriptTests(unittest.TestCase):
                 self.assertIn("skipping restart", result.stdout)
                 with open(env["AGENT_RELAY_RESTART_LOG"], encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), "")
+            finally:
+                relay.close()
+
+    def test_no_restart_never_restarts_even_when_idle(self):
+        """--no-restart must defer even on a fresh update with an idle relay."""
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            relay = Relay({"id": "echo", "command": PYTHON,
+                           "args": ["-c", "print(1)"]})
+            try:
+                port = relay.base.rsplit(":", 1)[1]
+                env = self._stub_env(checkout, port)
+                advance_repo(seed, "c-new")
+                subprocess.run(["git", "fetch", "origin"], cwd=checkout, check=True,
+                               capture_output=True, text=True)
+
+                result = self._run(env, "--no-restart")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--no-restart: restart deferred", result.stdout)
+                with open(env["AGENT_RELAY_RESTART_LOG"], encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "")
+
+                # A later plain run completes it.
+                result = self._run(env)
+                self.assertIn("completing a restart deferred earlier", result.stdout)
+                with open(env["AGENT_RELAY_RESTART_LOG"], encoding="utf-8") as handle:
+                    self.assertIn("kickstart", handle.read())
             finally:
                 relay.close()
 

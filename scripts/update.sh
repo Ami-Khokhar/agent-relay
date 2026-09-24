@@ -79,13 +79,12 @@ restart_service() {
   fi
 }
 
-# Wait for the restarted relay to answer /healthz (up to ~15s); prints the
-# last health body (empty on failure).
+# Wait for the restarted relay to answer /healthz, bounded by wall-clock time
+# (~15s) rather than by probe attempts.
 await_health() {
-  local attempts=0
-  while [ "$attempts" -lt 30 ]; do
-    if health | grep -q '"ok": *true'; then health; return 0; fi
-    attempts=$((attempts + 1))
+  local deadline=$((SECONDS + 15))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if health | grep -q '"ok": *true'; then return 0; fi
     sleep 0.5
   done
   return 1
@@ -126,7 +125,15 @@ else
   echo "updated: $OLD_HEAD -> $NEW_HEAD"
 fi
 
-# 3. Decide whether to restart now. First sight of an update waits for an idle
+# 3. --no-restart always defers: record the marker and leave the service alone.
+if [ "$NO_RESTART" -eq 1 ]; then
+  STATE="busy: $(busy)"
+  printf '%s' "$NEW_HEAD" > "$PENDING"
+  echo "--no-restart: restart deferred ($STATE); the next run without --no-restart will complete it"
+  exit 0
+fi
+
+# 4. Decide whether to restart now. First sight of an update waits for an idle
 #    relay (fail-closed). Once this exact update has been deferred (marker
 #    matches HEAD), the next run escalates: it restarts unless the relay
 #    visibly reports busy tasks, so an old relay that cannot report counts is
@@ -134,25 +141,24 @@ fi
 STATE="busy: $(busy)"
 if [ "$STATE" = "busy: idle" ] || [ "$FORCE" -eq 1 ] \
     || { [ "$PENDING_RESTART" -eq 1 ] && [ "$STATE" != "busy: busy" ]; }; then
-  if restart_service; then
-    if LAST_HEALTH="$(await_health)"; then
-      rm -f "$PENDING"
-      echo "relay healthy on port $PORT"
-      exit 0
-    fi
-    echo "warning: relay did not answer /healthz within 15s of the restart; check the service logs" >&2
-    echo "warning: the pending marker was kept, so the next run will retry the health check" >&2
+  # Mark first, clear on success: a failed restart command or a failed health
+  # check keeps the marker so the next run retries the restart.
+  printf '%s' "$NEW_HEAD" > "$PENDING"
+  if ! restart_service; then
     exit 1
   fi
+  if await_health; then
+    rm -f "$PENDING"
+    echo "relay healthy on port $PORT"
+    exit 0
+  fi
+  echo "warning: relay did not answer /healthz within 15s of the restart; check the service logs" >&2
+  echo "warning: the pending marker was kept, so the next run will retry the restart" >&2
   exit 1
 fi
 
-# 4. Defer: record the marker so a later run (scheduled or manual) completes
-#    the restart. --no-restart defers without waiting for an idle relay too.
+# 5. Defer: record the marker so a later run (scheduled or manual) completes
+#    the restart.
 printf '%s' "$NEW_HEAD" > "$PENDING"
-if [ "$NO_RESTART" -eq 1 ]; then
-  echo "--no-restart: restart deferred ($STATE); the next run without --no-restart will complete it"
-else
-  echo "skipping restart ($STATE); the next run will complete it, or rerun with --force"
-fi
+echo "skipping restart ($STATE); the next run will complete it, or rerun with --force"
 exit 0
