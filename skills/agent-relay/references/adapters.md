@@ -96,6 +96,8 @@ Command and stdio children receive only:
 
 - `A2A_ADAPTER_PROTOCOL=relay.adapter/v1`
 - `A2A_TASK_ID`, `A2A_SESSION_ID` (command adapters; stdio adapters get them in the request)
+- `AGENT_RELAY_PARENT_TASK_ID` — the child's own task ID (command and stdio adapters); the
+  MCP `delegate` tool forwards it as `parentTaskId` so the relay applies its delegation policy
 
 List a credential's variable name in `inheritEnv` to pass it through:
 

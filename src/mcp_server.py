@@ -66,7 +66,7 @@ TOOLS = [
     },
     {
         "name": "delegate",
-        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. Returns the task object (the existing task when requestId matches an earlier submission); pass its `id` field to wait_task, get_task, or cancel_task.",
+        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. When called from an agent the relay itself started, the relay enforces its delegation policy (allowed targets, no cycles, depth and task budgets) and may refuse the task. Returns the task object (the existing task when requestId matches an earlier submission); pass its `id` field to wait_task, get_task, or cancel_task.",
         "inputSchema": {
             "type": "object", "required": ["agentId", "input"], "additionalProperties": False,
             "properties": {
@@ -361,6 +361,11 @@ def create_http_handler(base_url=None, timeout=None):
                 for key in ("sessionId", "requestId", "timeoutMs", "cwd"):
                     if key in args:
                         payload[key] = args[key]
+                # Set by the relay for agents it spawned: the relay then applies its
+                # delegation policy (allowed targets, cycles, depth, budget) to this task.
+                parent_task = _env("AGENT_RELAY_PARENT_TASK_ID")
+                if parent_task:
+                    payload["parentTaskId"] = parent_task
                 value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
                 wait_ms = args.get("waitMs")
                 if wait_ms and value.get("status") in ("queued", "running"):

@@ -36,7 +36,7 @@ class Relay:
         self.dir = tempfile.mkdtemp(prefix="a2a-relay-")
         self.config = os.path.join(self.dir, "agents.json")
         with open(self.config, "w", encoding="utf-8") as handle:
-            json.dump({"agents": [agent]}, handle)
+            json.dump({"agents": agent if isinstance(agent, list) else [agent]}, handle)
         self.port = free_port()
         child_env = {**os.environ, "A2A_RELAY_PORT": str(self.port), "A2A_AGENTS_FILE": self.config,
                      "AGENT_RELAY_TOKEN": TOKEN}
