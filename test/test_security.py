@@ -79,6 +79,7 @@ class ApiTokenTests(unittest.TestCase):
         finally:
             relay.close()
 
+    @unittest.skipUnless(os.name == "posix", "file modes are POSIX-only")
     def test_creates_a_private_token_file_and_refuses_a_shared_one(self):
         directory = tempfile.mkdtemp(prefix="a2a-token-")
         self.addCleanup(shutil.rmtree, directory, True)
@@ -90,14 +91,13 @@ class ApiTokenTests(unittest.TestCase):
             with open(token_file, encoding="utf-8") as handle:
                 token = handle.read().strip()
             self.assertGreaterEqual(len(token), 32)
-            self.assertEqual(relay.request("GET", "/v1/agents", token=token)[0], 200)
             self.assertEqual(relay.request("GET", "/v1/agents", token=TOKEN)[0], 401)
-            _, agents = relay.request("GET", "/v1/agents", token=token)
+            status, agents = relay.request("GET", "/v1/agents", token=token)
+            self.assertEqual(status, 200)
             self.assertNotIn(token, json.dumps(agents))
         finally:
             relay.close()
 
-        os.makedirs(os.path.dirname(token_file), exist_ok=True)
         with open(token_file, "w", encoding="utf-8") as handle:
             handle.write("shared-token\n")
         os.chmod(token_file, 0o644)
@@ -105,7 +105,6 @@ class ApiTokenTests(unittest.TestCase):
             Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]}, env=env)
         self.assertIn("accessible to other users", str(raised.exception))
         self.assertNotIn("shared-token", str(raised.exception))
-
 
     def test_an_unset_token_never_authorizes(self):
         self.assertEqual(server.TOKEN, "")
@@ -187,19 +186,16 @@ class ApiTokenTests(unittest.TestCase):
 
     def test_mcp_client_keeps_the_token_away_from_redirects_and_cleartext(self):
         hits = []
-
         def elsewhere(request):
             hits.append(request.headers.get("authorization"))
             send_json(request, 200, {"agents": []})
 
         target, target_port = start_http_server(elsewhere)
-
         def redirector(request):
             request.send_response(302)
             request.send_header("location", f"http://127.0.0.1:{target_port}/v1/agents")
             request.send_header("content-length", "0")
             request.end_headers()
-
         origin, origin_port = start_http_server(redirector)
         try:
             with mock.patch.dict(os.environ, {"AGENT_RELAY_TOKEN": "secret-token"}):
@@ -210,6 +206,7 @@ class ApiTokenTests(unittest.TestCase):
                 with self.assertRaises(mcp_server.RelayError) as raised:
                     mcp_server._http_request("http://relay.example:43124", "/v1/agents", timeout=1)
                 self.assertEqual(raised.exception.data["error"], "insecure_relay_url")
+                self.assertTrue(mcp_server._loopback("http://127.0.0.2:43124"))
         finally:
             stop_http_server(origin)
             stop_http_server(target)
@@ -267,7 +264,6 @@ class NetworkBoundaryTests(unittest.TestCase):
                                      "status": "completed", "output": "leaked"})
 
         target, target_port = start_http_server(elsewhere)
-
         def redirector(request):
             request.rfile.read(int(request.headers.get("content-length", 0)))
             request.send_response(307)

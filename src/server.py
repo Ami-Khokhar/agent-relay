@@ -156,7 +156,7 @@ def load_token():
     Raises ValueError when the token file is a symlink, is empty, or (on POSIX) is accessible
     to other users. The mode is checked on the opened descriptor, not on the path.
     """
-    value = _env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN")
+    value = (_env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN") or "").strip()
     if value:
         return value
     path = token_path()

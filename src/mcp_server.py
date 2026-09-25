@@ -8,6 +8,7 @@ starts the HTTP service detached on first use.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import socket
@@ -46,7 +47,7 @@ else:
 
 def _token():
     """The relay API token: AGENT_RELAY_TOKEN, else the token file the relay creates."""
-    value = _env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN")
+    value = (_env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN") or "").strip()
     if value:
         return value
     path = _env("AGENT_RELAY_TOKEN_FILE", "A2A_RELAY_TOKEN_FILE")
@@ -234,8 +235,11 @@ def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
 
 
 def _loopback(base_url):
-    hostname = urlsplit(base_url).hostname
-    return hostname in ("127.0.0.1", "localhost", "::1")
+    hostname = urlsplit(base_url).hostname or ""
+    try:
+        return hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def _autostart_enabled():
