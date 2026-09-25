@@ -804,8 +804,11 @@ class Handler(BaseHTTPRequestHandler):
             origin = self.headers.get("origin")
             if origin is not None and origin not in ALLOWED_ORIGINS:
                 # Browsers send Origin on cross-site requests; CLI and MCP clients do not.
+                # The body is left unread, so drop the connection rather than parse it as a request.
+                self.close_connection = True
                 return self._json(403, {"error": "origin_not_allowed"})
             if path.startswith("/v1/") and not self._authorized():
+                self.close_connection = True
                 return self._json(401, {"error": "unauthorized",
                                         "message": "send Authorization: Bearer <token>"},
                                   headers={"www-authenticate": "Bearer"})
@@ -846,6 +849,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "request_failed", "message": str(exc)})
 
     def _authorized(self):
+        if not TOKEN:
+            return False  # never authorize against an unset token
         header = self.headers.get("authorization") or ""
         scheme, _, supplied = header.partition(" ")
         return scheme.lower() == "bearer" and hmac.compare_digest(

@@ -43,7 +43,6 @@ else:
     REQUEST_TIMEOUT_MS = 10_000
 
 
-
 def _token():
     """The relay API token: AGENT_RELAY_TOKEN, else the token file the relay creates."""
     value = _env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN")

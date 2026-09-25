@@ -4,17 +4,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from urllib import request as urlrequest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-from relay_helpers import (PYTHON, ROOT, SERVER, TOKEN, Relay, free_port, send_json,
+from relay_helpers import (PYTHON, ROOT, SERVER, TOKEN, McpClient, Relay, free_port, send_json,
                            start_http_server, stop_http_server)
 import server
 
@@ -89,6 +91,49 @@ class ApiTokenTests(unittest.TestCase):
             Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]}, env=env)
         self.assertIn("accessible to other users", str(raised.exception))
         self.assertNotIn("shared-token", str(raised.exception))
+
+
+    def test_an_unset_token_never_authorizes(self):
+        self.assertEqual(server.TOKEN, "")
+        for header in ("Bearer ", "Bearer", "bearer  "):
+            fake = types.SimpleNamespace(headers={"authorization": header})
+            self.assertFalse(server.Handler._authorized(fake), header)
+
+    def test_rejected_requests_close_the_connection_instead_of_parsing_the_body(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]})
+        try:
+            smuggled = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n"
+            request = (b"POST /v1/tasks HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n"
+                       b"content-length: %d\r\n\r\n" % len(smuggled)) + smuggled
+            with socket.create_connection(("127.0.0.1", relay.port), timeout=3) as sock:
+                sock.sendall(request)
+                data = b""
+                try:
+                    while True:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                except socket.timeout:
+                    self.fail("connection stayed open after a 401")
+            self.assertIn(b" 401 ", data)
+            self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
+        finally:
+            relay.close()
+
+    def test_mcp_interface_reads_the_token_file_the_relay_created(self):
+        directory = tempfile.mkdtemp(prefix="a2a-mcp-token-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        env = {"AGENT_RELAY_TOKEN": "", "AGENT_RELAY_TOKEN_FILE": os.path.join(directory, "token")}
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]}, env=env)
+        client = McpClient(relay.base, env={**env, "A2A_RELAY_AUTOSTART": "0"})
+        try:
+            result = client.call_tool("list_agents", {})
+            self.assertFalse(result.get("isError"), result)
+            self.assertEqual(result["structuredContent"]["agents"][0]["id"], "echo")
+        finally:
+            client.close()
+            relay.close()
 
 
 class NetworkBoundaryTests(unittest.TestCase):

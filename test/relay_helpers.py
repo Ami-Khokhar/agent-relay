@@ -156,8 +156,8 @@ def send_json(handler_request, status, value):
 class McpClient:
     """Spawns src/mcp_server.py and speaks JSON-RPC 2.0 over its stdio."""
 
-    def __init__(self, relay_url):
-        env = {**os.environ, "A2A_RELAY_URL": relay_url, "AGENT_RELAY_TOKEN": TOKEN}
+    def __init__(self, relay_url, env=None):
+        env = {**os.environ, "A2A_RELAY_URL": relay_url, "AGENT_RELAY_TOKEN": TOKEN, **(env or {})}
         self.proc = subprocess.Popen(
             [PYTHON, MCP_SERVER], cwd=ROOT, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
