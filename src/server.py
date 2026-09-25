@@ -185,9 +185,12 @@ def is_loopback(host):
     if host == "localhost":
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError:
         return False
+    # A dual-stack socket reports IPv4 clients as ::ffff:a.b.c.d.
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address.is_loopback or bool(mapped and mapped.is_loopback)
 
 
 def load_registry(path):

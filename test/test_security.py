@@ -224,6 +224,12 @@ class ApiTokenTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_is_loopback_accepts_ipv4_mapped_loopback_addresses(self):
+        for host in ("localhost", "127.0.0.2", "::1", "::ffff:127.0.0.2"):
+            self.assertTrue(server.is_loopback(host), host)
+        for host in ("::ffff:10.0.0.1", "10.0.0.1", "::", "example.com", ""):
+            self.assertFalse(server.is_loopback(host), host)
+
     def test_smoke_script_uses_the_token_and_rejects_unsafe_ones(self):
         relay = Relay({"id": "pong", "command": PYTHON, "args": ["-c", "print('PONG')"]})
         try:
