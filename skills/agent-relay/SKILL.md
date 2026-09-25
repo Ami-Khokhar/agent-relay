@@ -54,11 +54,12 @@ cancellation, and idempotency that a bare CLI call does not have.
 
 ## 1. Get the source
 
-Run the bundled setup script (idempotent):
+Run the bundled setup script (idempotent). The path is relative to the repository root;
+from inside this skill's directory it is `scripts/setup.sh`:
 
 ```bash
-bash scripts/setup.sh              # clones to ~/.local/share/agent-relay by default
-bash scripts/setup.sh --install-skill   # also link the skill into agent skill dirs
+bash skills/agent-relay/scripts/setup.sh                   # clones to ~/.local/share/agent-relay by default
+bash skills/agent-relay/scripts/setup.sh --install-skill   # also link the skill into agent skill dirs
 ```
 
 It verifies Python 3.9+, locates an existing checkout or clones the repo to a stable
@@ -264,6 +265,10 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 - Binds to loopback (`A2A_RELAY_HOST`, default `127.0.0.1`). Setting a non-loopback host
   exposes an unauthenticated service that can run your coding agents — never do it without
   an authenticated HTTPS boundary.
+- Every stored task keeps its full prompt, output, error, and cwd in memory, readable by any
+  API client, until restart, eviction, or `AGENT_RELAY_TASK_RETENTION_MS` after it finishes.
+  Agents run as the relay's OS user and can read that user's files; environment filtering
+  is not a sandbox.
 - Tasks are in memory and disappear on restart; old terminal tasks are evicted when the
   store fills. `GET /v1/tasks?sessionId=...` lists what is still stored.
 - Edit the registry and reload without losing tasks: `POST /v1/admin/reload` (loopback
