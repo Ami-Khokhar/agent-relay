@@ -717,6 +717,8 @@ def _agent_listing():
             entry["cwd"] = agent["cwd"]
         if agent.get("allowedRoots") is not None:
             entry["allowedRoots"] = agent["allowedRoots"]
+        if agent.get("delegateTo") is not None:
+            entry["delegateTo"] = agent["delegateTo"]
         listing.append(entry)
     return listing
 
@@ -731,7 +733,7 @@ def _delegation_error(parent, agent):
     allowed = parent_agent.get("delegateTo")
     if allowed is not None and agent["id"] not in allowed:
         return 403, "delegation_not_allowed", (
-            f"agent {parent['agentId']} may not delegate to {agent['id']} (see its delegateTo)")
+            f"agent {parent['agentId']} may not delegate to {agent['id']} (see its delegateTo in GET /v1/agents)")
     if agent["id"] in parent["_lineage"]:
         return 409, "delegation_cycle", (
             f"{agent['id']} is already in this delegation chain: {' > '.join(parent['_lineage'])}")

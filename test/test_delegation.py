@@ -91,8 +91,10 @@ class DelegationPolicyTests(unittest.TestCase):
         with open(relay.config, "w", encoding="utf-8") as handle:
             json.dump({"agents": [agent("helper"), agent("other")]}, handle)
         self.assertEqual(relay.request("POST", "/v1/admin/reload")[0], 200)
-        status, payload = self.delegate(relay, root, "other")
+        # "helper" is on the removed agent's allowlist, so only the fail-closed branch refuses it.
+        status, payload = self.delegate(relay, root, "helper")
         self.assertEqual((status, payload["error"]), (403, "delegation_not_allowed"))
+        self.assertIn("no longer registered", payload["message"])
 
     def test_rejects_an_invalid_delegate_to_list_at_startup(self):
         directory = tempfile.mkdtemp(prefix="a2a-delegate-to-")
@@ -113,6 +115,18 @@ class DelegationPolicyTests(unittest.TestCase):
         defaults = self.start(agent("a"))
         limits = defaults.request("GET", "/healthz")[1]["limits"]
         self.assertEqual((limits["maxDelegationDepth"], limits["maxDelegatedTasks"]), (2, 20))
+
+    def test_rejects_an_invalid_parent_task_id(self):
+        relay = self.start(agent("a"))
+        for bad in ("", 5, "x" * 129):
+            status, payload = relay.submit(agentId="a", input="x", parentTaskId=bad)
+            self.assertEqual((status, payload["error"]), (400, "invalid_parent_task_id"), repr(bad))
+
+    def test_lists_delegate_to_for_agents_that_set_it(self):
+        relay = self.start([agent("lead", delegateTo=["helper"]), agent("helper")])
+        listing = {entry["id"]: entry for entry in relay.request("GET", "/v1/agents")[1]["agents"]}
+        self.assertEqual(listing["lead"]["delegateTo"], ["helper"])
+        self.assertNotIn("delegateTo", listing["helper"])
 
     def test_rejects_an_unknown_parent_task(self):
         relay = self.start(agent("a"))

@@ -118,6 +118,8 @@ Per-agent optional fields:
 - `env` / `inheritEnv` — extra child environment, or names of relay env vars to pass
   through (for example a credential).
 - `description` — free text shown by `GET /v1/agents`.
+- `delegateTo` — agent IDs this agent's tasks may delegate to; `[]` forbids delegation. Omit
+  to allow any registered agent.
 - `capabilities` may only declare what is true; the relay rejects `nativeSessions: true`,
   `streaming: true`, and `newTasks: false` in this version.
 
@@ -302,6 +304,10 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 | `413 command_input_too_large` | Input exceeds `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`; use a `stdio` adapter for large prompts. |
 | `503 task_capacity_reached` | Store full of non-terminal tasks; raise `A2A_RELAY_MAX_TASKS`/`A2A_RELAY_MAX_ACTIVE` or wait. |
 | `409 idempotency_conflict` | Same `requestId` reused with different fields; use a new ID. |
+| `403 delegation_not_allowed` | The delegating agent's `delegateTo` (see `GET /v1/agents`) excludes the target, or that agent was removed from the registry. |
+| `409 delegation_cycle` | The target is already in this delegation chain; pick another agent or do the work yourself. |
+| `409 delegation_depth_exceeded` | The chain is at `AGENT_RELAY_MAX_DELEGATION_DEPTH`; do the work in this task or raise the limit. |
+| `429 delegation_budget_exhausted` | This task tree used `AGENT_RELAY_MAX_DELEGATED_TASKS`; finish with the results so far or raise the limit. |
 | Task `failed` with adapter errors | Harness exit non-zero or bad output; check stderr by running the command adapter manually. |
 | Task `timed_out` | Exceeded `timeoutMs`; raise it or shorten the work. |
 | MCP tool returns `isError: true` | Relay unreachable or returned an error; the payload carries `error`/`status`. |

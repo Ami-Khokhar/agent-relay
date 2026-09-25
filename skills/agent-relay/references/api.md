@@ -33,8 +33,8 @@ next run is restarted, since an old relay cannot report counts).
 ```
 
 `timeoutMs` is the effective timeout for that agent. `cancellation` is `process_signal`
-for command/stdio adapters and `request_only` for HTTP. `cwd` and `allowedRoots` appear
-only when configured.
+for command/stdio adapters and `request_only` for HTTP. `cwd`, `allowedRoots`, and
+`delegateTo` (the agents its tasks may delegate to) appear only when configured.
 
 ### `POST /v1/tasks`
 
