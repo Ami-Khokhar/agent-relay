@@ -279,8 +279,8 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   `A2A_RELAY_MAX_ACTIVE` (4), `A2A_RELAY_MAX_WAIT_MS` (600000),
   `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap).
   Every variable also accepts an `AGENT_RELAY_*` spelling.
-- Cancellation of a spawned adapter sends process signals; cancellation of an HTTP adapter
-  aborts the request and may not stop work already accepted by that service.
+- Cancellation of a spawned adapter signals its process group; cancellation of an HTTP
+  adapter is `request_only`: the request is not aborted and the service may keep working.
 
 ## Troubleshooting
 
