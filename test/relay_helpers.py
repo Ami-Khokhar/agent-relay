@@ -20,6 +20,7 @@ PYTHON = sys.executable
 SERVER = os.path.join(ROOT, "src", "server.py")
 MCP_SERVER = os.path.join(ROOT, "src", "mcp_server.py")
 FAKE_ADAPTER = os.path.join(ROOT, "test", "fixtures", "fake_stdio_adapter.py")
+TOKEN = "relay-test-token"
 
 
 def free_port():
@@ -37,7 +38,8 @@ class Relay:
         with open(self.config, "w", encoding="utf-8") as handle:
             json.dump({"agents": [agent]}, handle)
         self.port = free_port()
-        child_env = {**os.environ, "A2A_RELAY_PORT": str(self.port), "A2A_AGENTS_FILE": self.config}
+        child_env = {**os.environ, "A2A_RELAY_PORT": str(self.port), "A2A_AGENTS_FILE": self.config,
+                     "AGENT_RELAY_TOKEN": TOKEN}
         child_env.update(env or {})
         self.proc = subprocess.Popen(
             [PYTHON, SERVER], cwd=ROOT, env=child_env,
@@ -50,8 +52,9 @@ class Relay:
         deadline = time.time() + 5
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                stderr = self.proc.stderr.read().decode("utf-8", "replace")
-                raise RuntimeError(f"relay exited {self.proc.returncode}: {stderr}")
+                _, stderr = self.proc.communicate()
+                raise RuntimeError(f"relay exited {self.proc.returncode}: "
+                                   f"{stderr.decode('utf-8', 'replace')}")
             try:
                 with urlrequest.urlopen(self.base + "/healthz", timeout=0.5) as response:
                     if response.status == 200:
@@ -60,9 +63,15 @@ class Relay:
                 time.sleep(0.02)
         raise RuntimeError("relay did not start")
 
-    def request(self, method, path, body=None):
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = {"content-type": "application/json"} if data else {}
+    def request(self, method, path, body=None, headers=None, token=TOKEN):
+        if isinstance(body, str):
+            data = body.encode("utf-8")  # raw body, sent as-is
+        else:
+            data = json.dumps(body).encode("utf-8") if body is not None else None
+        base_headers = {"content-type": "application/json"} if data else {}
+        if token:
+            base_headers["authorization"] = f"Bearer {token}"
+        headers = {**base_headers, **(headers or {})}
         request = urlrequest.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             with urlrequest.urlopen(request, timeout=10) as response:
@@ -148,7 +157,7 @@ class McpClient:
     """Spawns src/mcp_server.py and speaks JSON-RPC 2.0 over its stdio."""
 
     def __init__(self, relay_url):
-        env = {**os.environ, "A2A_RELAY_URL": relay_url}
+        env = {**os.environ, "A2A_RELAY_URL": relay_url, "AGENT_RELAY_TOKEN": TOKEN}
         self.proc = subprocess.Popen(
             [PYTHON, MCP_SERVER], cwd=ROOT, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

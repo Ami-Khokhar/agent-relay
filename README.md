@@ -10,7 +10,7 @@ Python 3.9 or newer is required. There are no package dependencies.
 python3 src/server.py
 ```
 
-The HTTP API listens on `http://127.0.0.1:43124` by default. Start the MCP interface in a second process when the orchestrating client supports MCP:
+The HTTP API listens on `http://127.0.0.1:43124` by default. Every `/v1/` request needs the API token (see [Local security model](#local-security-model)); the relay creates it on first start at `~/.config/agent-relay/token`, and the MCP interface and `scripts/smoke.sh` read it from there. Start the MCP interface in a second process when the orchestrating client supports MCP:
 
 ```bash
 python3 src/mcp_server.py
@@ -105,31 +105,43 @@ The `sessionId` is relay correlation data and does not claim native harness sess
 Edit the registry, then reload without losing in-memory tasks:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:43124/v1/admin/reload
+AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
+curl -sS -X POST -H "$AUTH" http://127.0.0.1:43124/v1/admin/reload
 kill -HUP <relay-pid>
 ```
 
-The reload endpoint is accepted only from loopback. An invalid registry is rejected and the running registry is kept.
+The reload endpoint needs the token and is accepted only from loopback. An invalid registry is rejected and the running registry is kept.
 
 ## Submit and inspect work
 
 ```bash
-curl -sS http://127.0.0.1:43124/v1/agents
-curl -sS http://127.0.0.1:43124/v1/tasks \
+AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
+curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/agents
+curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/tasks \
   -H 'content-type: application/json' \
   -d '{"agentId":"codex","requestId":"review-2026-09-23-1","input":"Inspect this project and report the main risks","cwd":"/path/to/git/project"}'
-curl -sS 'http://127.0.0.1:43124/v1/tasks?sessionId=review-2026-09-23-1'
-curl -sS 'http://127.0.0.1:43124/v1/tasks/TASK_ID?waitMs=600000'
-curl -sS -X DELETE http://127.0.0.1:43124/v1/tasks/TASK_ID
+curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/tasks?sessionId=review-2026-09-23-1'
+curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/tasks/TASK_ID?waitMs=600000'
+curl -sS -H "$AUTH" -X DELETE http://127.0.0.1:43124/v1/tasks/TASK_ID
 ```
 
 Submission returns `202` with a task ID and session ID. Poll the task URL for `queued`, `running`, `completed`, `failed`, `timed_out`, or `cancelled`. `GET /v1/tasks/TASK_ID?waitMs=<ms>` long-polls until the task is terminal or the wait elapses. `GET /v1/tasks?sessionId=...&status=...&limit=...` lists stored tasks (most recent first). Supply a unique `requestId` and reuse it when retrying a submission; the relay returns the original task instead of starting duplicate work. Reusing it with different task fields returns `409`. Without a request ID, callers must not automatically retry a submission whose response was lost. The session ID currently groups work for the caller; generic command adapters do not continue native agent conversations. No real agent is called by the tests.
+
+## Local security model
+
+The relay is a **single-user local service**. Its trust boundary is one bearer token:
+
+- Every `/v1/` route (agents, task submission, reads, listing, cancellation, reload) requires `Authorization: Bearer <token>`; otherwise it returns `401`. `/healthz` stays open and returns no task data. The token comes from `AGENT_RELAY_TOKEN`, else the file at `AGENT_RELAY_TOKEN_FILE` (default `~/.config/agent-relay/token`). The relay creates that file with mode `0600` on first start and refuses to start if other users can read it. The token is never returned by the API or logged. `curl -H` puts it in the process list, so on a shared machine pass it with `curl -K` instead (as `scripts/smoke.sh` does).
+- Anyone holding the token is the owner: they can run every registered agent and read every stored task's `input`, `output`, `error`, and `cwd`. A `sessionId` is a filter, not an access-control boundary. There is no per-client task ownership; do not share the token with clients that must not see each other's prompts and results.
+- Browser requests are refused. A request with an `Origin` header gets `403 origin_not_allowed` unless that origin is listed in `AGENT_RELAY_ALLOWED_ORIGINS` (comma-separated). `POST /v1/tasks` requires `content-type: application/json` (`415` otherwise), so a cross-site "simple" form or `text/plain` POST cannot submit work.
+- The listener binds to loopback (`A2A_RELAY_HOST`, default `127.0.0.1`), which still lets other local processes connect, so they need the token too. The relay has no TLS. It refuses a non-loopback `A2A_RELAY_HOST` unless `AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK=1` is set, and then prints a warning at startup. Use that only behind an authenticated HTTPS proxy.
+- An `http` adapter receives the complete task prompt. The relay refuses a registry entry that sends it over cleartext `http://` to a non-loopback host unless the entry sets `"allowInsecureHttp": true`; use `https://` for any remote adapter, and register only endpoints you trust. The relay never follows adapter redirects: a `3xx` response fails the task, so the prompt only reaches the configured URL.
 
 ## Scope and operation
 
 HTTP is the core transport because callers can use it locally or across machines and do not need to share a runtime. MCP stdio is a client interface for agents that discover tools. A2A can be added as a protocol adapter if an A2A client is required. The former A2A shaped endpoint is not part of this HTTP task API.
 
-The relay binds to loopback (`A2A_RELAY_HOST`, default `127.0.0.1`) and has no authentication or TLS. Setting `A2A_RELAY_HOST` to a non-loopback address exposes the API to the network; do not do so without an authenticated HTTPS boundary, because any client allowed to submit tasks can cause the configured coding agents to run. Tasks are held in memory and disappear on restart. At most four tasks run at once by default (`A2A_RELAY_MAX_ACTIVE`); the rest queue. Results are bounded, and completed tasks may be evicted when the task store fills. For a durable single-host deployment, add SQLite task storage. Command adapters inherit only basic process variables by default. If an adapter needs a credential already in the relay's environment, list its name in that agent's `inheritEnv` array rather than putting the secret value in the registry file. Cancellation stops the direct command process; child processes it started may require adapter-specific cleanup. On `SIGTERM` or `SIGINT` the relay cancels running tasks and waits briefly for adapter processes to terminate before exiting.
+Tasks are held in memory and disappear on restart. At most four tasks run at once by default (`A2A_RELAY_MAX_ACTIVE`); the rest queue. Results are bounded, and completed tasks may be evicted when the task store fills. For a durable single-host deployment, add SQLite task storage. Command adapters inherit only basic process variables by default. If an adapter needs a credential already in the relay's environment, list its name in that agent's `inheritEnv` array rather than putting the secret value in the registry file. Cancellation stops the direct command process; child processes it started may require adapter-specific cleanup. On `SIGTERM` or `SIGINT` the relay cancels running tasks and waits briefly for adapter processes to terminate before exiting.
 
 Resource limits can be changed with `A2A_RELAY_MAX_BODY_BYTES`, `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`, `A2A_RELAY_MAX_OUTPUT_BYTES`, `A2A_RELAY_MAX_TASKS`, `A2A_RELAY_MAX_ACTIVE`, `A2A_RELAY_MAX_WAIT_MS`, `A2A_RELAY_TIMEOUT_MS` (default timeout, 15 minutes), and `A2A_RELAY_MAX_TIMEOUT_MS` (optional hard cap; unset means no cap). Each must be a positive integer except `A2A_RELAY_MAX_TIMEOUT_MS`, which accepts `0` for no cap. Command input defaults to 64 KiB because it is passed as one argument and operating systems cap the combined argument and environment size. The output limit applies to the combined stdout and stderr captured from a command and to the body read from an HTTP adapter. The listener also honors `A2A_RELAY_PORT` (default `43124`) and `A2A_RELAY_HOST`; the MCP process honors `A2A_RELAY_URL`, `A2A_RELAY_HTTP_TIMEOUT_MS`, and `A2A_RELAY_AUTOSTART`. Every variable also accepts an `AGENT_RELAY_*` spelling (for example `AGENT_RELAY_TIMEOUT_MS`); the `A2A_*` names remain as aliases.
 

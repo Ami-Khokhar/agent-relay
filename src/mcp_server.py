@@ -42,6 +42,21 @@ if _raw_timeout is not None:
 else:
     REQUEST_TIMEOUT_MS = 10_000
 
+
+
+def _token():
+    """The relay API token: AGENT_RELAY_TOKEN, else the token file the relay creates."""
+    value = _env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN")
+    if value:
+        return value
+    path = _env("AGENT_RELAY_TOKEN_FILE", "A2A_RELAY_TOKEN_FILE")
+    path = Path(path) if path else Path.home() / ".config" / "agent-relay" / "token"
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 TOOLS = [
     {
         "name": "list_agents",
@@ -173,6 +188,9 @@ def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
 
     data = None
     headers = {}
+    token = _token()
+    if token:
+        headers["authorization"] = f"Bearer {token}"
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["content-type"] = "application/json"

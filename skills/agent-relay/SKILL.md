@@ -50,7 +50,7 @@ cancellation, and idempotency that a bare CLI call does not have.
 
 - Python 3.9 or newer (`python3 --version`).
 - At least one target agent CLI installed and authenticated (or an HTTP/stdio adapter).
-- Loopback only by default: no auth, no TLS. Do not bind to a public interface.
+- Loopback only by default, with a bearer token and no TLS. Do not bind to a public interface.
 
 ## 1. Get the source
 
@@ -174,7 +174,7 @@ Codex uses `[mcp_servers.agent-relay]` in `~/.codex/config.toml`; OpenCode uses 
 
 ```bash
 curl -sS http://127.0.0.1:43124/healthz
-curl -sS http://127.0.0.1:43124/v1/agents
+curl -sS -H "authorization: Bearer $(cat ~/.config/agent-relay/token)" http://127.0.0.1:43124/v1/agents
 bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints the result
 ```
 
@@ -187,14 +187,15 @@ and exits on a bad registry, so check the server log.
 **Via HTTP** (submit returns `202` immediately; then long-poll):
 
 ```bash
-TASK=$(curl -sS http://127.0.0.1:43124/v1/tasks \
+AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"   # created on first start
+TASK=$(curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/tasks \
   -H 'content-type: application/json' \
   -d '{"agentId":"claude","requestId":"review-1","input":"Inspect this repo and list the top 3 risks","cwd":"/path/to/project"}')
 echo "$TASK"
 ID=$(printf '%s' "$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-curl -sS "http://127.0.0.1:43124/v1/tasks/$ID?waitMs=600000"   # blocks until terminal
-curl -sS "http://127.0.0.1:43124/v1/tasks?sessionId=review-1"   # list by session
-curl -sS -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # cancel
+curl -sS -H "$AUTH" "http://127.0.0.1:43124/v1/tasks/$ID?waitMs=600000"   # blocks until terminal
+curl -sS -H "$AUTH" "http://127.0.0.1:43124/v1/tasks?sessionId=review-1"   # list by session
+curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # cancel
 ```
 
 **Via MCP** tools:
@@ -261,13 +262,19 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 
 ## Operating limits and security
 
-- Binds to loopback (`A2A_RELAY_HOST`, default `127.0.0.1`). Setting a non-loopback host
-  exposes an unauthenticated service that can run your coding agents — never do it without
-  an authenticated HTTPS boundary.
+- Single-user local service. Every `/v1/` route needs the bearer token from
+  `~/.config/agent-relay/token` (created `0600` on first start; the MCP tools send it). Anyone
+  with the token can run every agent and read every stored task; `sessionId` is not access
+  control. Browser `Origin`s and non-JSON task submissions are rejected.
+- Binds to loopback (`A2A_RELAY_HOST`, default `127.0.0.1`) with no TLS. A non-loopback host
+  is refused unless `AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK=1`; use that only behind an
+  authenticated HTTPS proxy.
+- `http` adapters receive the full prompt. Cleartext `http://` to a non-loopback host needs
+  `"allowInsecureHttp": true`; adapter redirects are never followed.
 - Tasks are in memory and disappear on restart; old terminal tasks are evicted when the
   store fills. `GET /v1/tasks?sessionId=...` lists what is still stored.
-- Edit the registry and reload without losing tasks: `POST /v1/admin/reload` (loopback
-  only) or `kill -HUP <pid>`.
+- Edit the registry and reload without losing tasks: `POST /v1/admin/reload` (token,
+  loopback only) or `kill -HUP <pid>`.
 - Limits (positive integers unless noted): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
   `A2A_RELAY_MAX_COMMAND_INPUT_BYTES` (64 KiB, command adapter only),
   `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (1000),
