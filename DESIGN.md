@@ -49,7 +49,7 @@ These are adapter entry points, not a claim that each agent has been invoked end
 
 1. Add SQLite task storage before depending on task IDs across relay restarts.
 2. Add native adapters only where needed for session continuation, event streams, and agent-specific cancellation. Keep capability flags truthful.
-3. Add authentication and HTTPS before binding outside loopback.
+3. Add TLS (or document a supported HTTPS proxy setup) for non-loopback use. A bearer token now protects the API, and binding outside loopback requires `AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK=1`.
 4. Add an A2A adapter when a concrete A2A client needs it; validate that adapter against the selected A2A protocol version.
 
 The original project folder has no Git metadata or configured remote. The three comparison implementations were developed in isolated temporary Git worktrees.

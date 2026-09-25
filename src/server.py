@@ -146,7 +146,8 @@ def token_path():
 def load_token():
     """Return the API credential: AGENT_RELAY_TOKEN, else the token file (created 0600 if absent).
 
-    Raises ValueError when the token file is readable by other users or is empty.
+    Raises ValueError when the token file is a symlink, is accessible to other users, or is
+    empty. The checks run on the opened descriptor, so the file cannot be swapped in between.
     """
     value = _env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN")
     if value:
@@ -160,11 +161,19 @@ def load_token():
     else:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(secrets.token_urlsafe(32) + "\n")
-    if os.name == "posix" and path.stat().st_mode & 0o077:
-        raise ValueError(f"token file {path} is accessible to other users; run: chmod 600 {path}")
-    value = path.read_text(encoding="utf-8").strip()
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        if path.is_symlink():
+            raise ValueError(f"token file {path} is a symlink; replace it with a regular file") from exc
+        raise
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        if os.name == "posix" and os.fstat(handle.fileno()).st_mode & 0o077:
+            raise ValueError(f"token file {path} is accessible to other users; run: chmod 600 {path}")
+        value = handle.read().strip()
     if not value:
-        raise ValueError(f"token file {path} is empty")
+        raise ValueError(f"token file {path} is empty; delete it to generate a new token, "
+                         "or set AGENT_RELAY_TOKEN")
     return value
 
 
@@ -804,6 +813,10 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(value).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        if status >= 400:
+            # An error may leave the request body unread; never parse it as a next request.
+            self.close_connection = True
+            self.send_header("connection", "close")
         for name, header in (headers or {}).items():
             self.send_header(name, header)
         self.send_header("content-length", str(len(body)))

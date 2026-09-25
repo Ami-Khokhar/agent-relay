@@ -6,7 +6,8 @@ Every `/v1/` route requires `Authorization: Bearer <token>`. The token is
 `AGENT_RELAY_TOKEN`, else the file `~/.config/agent-relay/token` (override with
 `AGENT_RELAY_TOKEN_FILE`), which the relay creates with mode `0600` on first start. Requests
 carrying an `Origin` header are refused unless that origin is listed in
-`AGENT_RELAY_ALLOWED_ORIGINS`. `GET /healthz` needs no token.
+`AGENT_RELAY_ALLOWED_ORIGINS` (meant for non-browser clients; the relay sends no CORS
+headers). Error responses close the connection. `GET /healthz` needs no token.
 
 ## HTTP endpoints
 

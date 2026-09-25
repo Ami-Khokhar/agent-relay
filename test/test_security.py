@@ -12,12 +12,14 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 from urllib import request as urlrequest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from relay_helpers import (PYTHON, ROOT, SERVER, TOKEN, McpClient, Relay, free_port, send_json,
                            start_http_server, stop_http_server)
+import mcp_server
 import server
 
 
@@ -134,6 +136,91 @@ class ApiTokenTests(unittest.TestCase):
         finally:
             client.close()
             relay.close()
+
+
+    def test_listed_origins_are_accepted_and_others_refused(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]},
+                      env={"AGENT_RELAY_ALLOWED_ORIGINS": "https://tool.example, https://other.example"})
+        try:
+            for origin in ("https://tool.example", "https://other.example"):
+                self.assertEqual(relay.request("GET", "/v1/agents", headers={"origin": origin})[0], 200)
+            status, payload = relay.request("GET", "/v1/agents", headers={"origin": "https://evil.example"})
+            self.assertEqual((status, payload["error"]), (403, "origin_not_allowed"))
+        finally:
+            relay.close()
+
+    def test_method_errors_close_the_connection_too(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]})
+        try:
+            smuggled = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n"
+            request = (b"PUT /v1/tasks HTTP/1.1\r\nHost: x\r\nauthorization: Bearer %s\r\n"
+                       b"content-length: %d\r\n\r\n" % (TOKEN.encode(), len(smuggled))) + smuggled
+            with socket.create_connection(("127.0.0.1", relay.port), timeout=3) as sock:
+                sock.sendall(request)
+                data = b""
+                try:
+                    while True:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                except socket.timeout:
+                    self.fail("connection stayed open after a 405")
+            self.assertIn(b" 405 ", data)
+            self.assertIn(b"connection: close", data.lower())
+            self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
+        finally:
+            relay.close()
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "needs O_NOFOLLOW")
+    def test_refuses_a_symlinked_or_empty_token_file(self):
+        directory = tempfile.mkdtemp(prefix="a2a-token-link-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        real, link = os.path.join(directory, "real"), os.path.join(directory, "token")
+        with open(real, "w", encoding="utf-8") as handle:
+            handle.write("linked-token\n")
+        os.chmod(real, 0o600)
+        os.symlink(real, link)
+        env = {"AGENT_RELAY_TOKEN_FILE": link, "AGENT_RELAY_TOKEN": ""}
+        with self.assertRaises(RuntimeError) as raised:
+            Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]}, env=env)
+        self.assertIn("is a symlink", str(raised.exception))
+
+        os.remove(link)
+        open(link, "w").close()
+        os.chmod(link, 0o600)
+        with self.assertRaises(RuntimeError) as raised:
+            Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]}, env=env)
+        self.assertIn("delete it to generate a new token", str(raised.exception))
+
+    def test_mcp_client_keeps_the_token_away_from_redirects_and_cleartext(self):
+        hits = []
+
+        def elsewhere(request):
+            hits.append(request.headers.get("authorization"))
+            send_json(request, 200, {"agents": []})
+
+        target, target_port = start_http_server(elsewhere)
+
+        def redirector(request):
+            request.send_response(302)
+            request.send_header("location", f"http://127.0.0.1:{target_port}/v1/agents")
+            request.send_header("content-length", "0")
+            request.end_headers()
+
+        origin, origin_port = start_http_server(redirector)
+        try:
+            with mock.patch.dict(os.environ, {"AGENT_RELAY_TOKEN": "secret-token"}):
+                with self.assertRaises(mcp_server.RelayError) as raised:
+                    mcp_server._http_request(f"http://127.0.0.1:{origin_port}", "/v1/agents")
+                self.assertEqual(raised.exception.status, 302)
+                self.assertEqual(hits, [])
+                with self.assertRaises(mcp_server.RelayError) as raised:
+                    mcp_server._http_request("http://relay.example:43124", "/v1/agents", timeout=1)
+                self.assertEqual(raised.exception.data["error"], "insecure_relay_url")
+        finally:
+            stop_http_server(origin)
+            stop_http_server(target)
 
 
 class NetworkBoundaryTests(unittest.TestCase):
