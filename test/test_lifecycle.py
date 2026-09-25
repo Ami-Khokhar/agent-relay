@@ -316,6 +316,9 @@ class LifecycleTests(unittest.TestCase):
 
         task, _ = self._http_error_task(handler, 5000)
         self.assertEqual(task["status"], "failed")
+        # The truncated body is reported as the adapter's text, never as a complete result.
+        self.assertEqual(task["error"], "HTTP agent returned 500")
+        self.assertEqual(task.get("output"), "short")
 
 if __name__ == "__main__":
     unittest.main()

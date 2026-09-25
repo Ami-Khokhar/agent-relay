@@ -108,6 +108,8 @@ Never inline secret values in the registry file.
 
 - `command` / `stdio`: the relay sends `SIGTERM`, then `SIGKILL` after ~1s, to the
   adapter's process group, so processes it started stop too (Windows: direct process only).
+  After the adapter itself has exited and been reaped, the group is signalled again only where
+  the leader's identity can be checked (Linux); elsewhere leftover descendants are not.
 - `http`: `request_only`. The relay marks the task cancelled and discards the result; it does
   not abort the in-flight request or notify the service, so the work may continue.
 
