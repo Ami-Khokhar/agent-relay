@@ -247,11 +247,12 @@ class LifecycleTests(unittest.TestCase):
         server._signal(leader, force=True)
 
         def gone():
+            # A killed orphan may linger as a zombie where nothing reaps it; that still counts.
             try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+                with open(f"/proc/{pid}/stat", "rb") as handle:
+                    return handle.read().rsplit(b")", 1)[1].split()[0] == b"Z"
+            except (OSError, IndexError):
                 return True
-            return False
 
         self.assertTrue(_wait_for(gone), "a descendant of the reaped leader survived")
 

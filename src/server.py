@@ -563,6 +563,8 @@ def _run_http(agent, task):
         except (OSError, socket.timeout) as read_error:
             _finish(task, "timed_out" if _remaining(task) <= 0 else "failed", error=str(read_error))
             return
+        finally:
+            exc.close()  # read1 never closes a fully read response; release the connection
         code = exc.code
         ok = False
     except (urlerror.URLError, socket.timeout, TimeoutError) as exc:
@@ -609,7 +611,8 @@ def _run_http(agent, task):
 
 
 def _worker(agent, task):
-    # One deadline covers process startup, request delivery, execution, and result collection.
+    # One deadline covers process startup, request delivery, execution, and reading an HTTP
+    # adapter's response; a spawned adapter's output is collected under a short post-exit grace.
     task["_deadline"] = time.monotonic() + task["timeoutMs"] / 1000.0
     try:
         kind = agent["type"]
