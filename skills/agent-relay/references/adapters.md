@@ -104,9 +104,10 @@ Never inline secret values in the registry file.
 
 ## Cancellation
 
-- `command` / `stdio`: the relay sends `SIGTERM`, then `SIGKILL` after ~1s.
-- `http`: the relay aborts the request; work already accepted by the remote service may
-  continue. Adapters should treat client disconnect as a cancel signal where possible.
+- `command` / `stdio`: the relay sends `SIGTERM`, then `SIGKILL` after ~1s, to the
+  adapter's process group, so processes it started stop too (Windows: direct process only).
+- `http`: `request_only`. The relay marks the task cancelled and discards the result; it does
+  not abort the in-flight request or notify the service, so the work may continue.
 
 On relay `SIGTERM`/`SIGINT`, running adapters are cancelled the same way before exit.
 
