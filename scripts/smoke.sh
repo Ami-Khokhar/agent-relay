@@ -33,7 +33,7 @@ if [ -z "$TOKEN" ]; then
   echo "error: no API token; start the relay once or set AGENT_RELAY_TOKEN" >&2
   exit 1
 fi
-case "$TOKEN" in *'"'*|*'\'*) echo "error: the API token must not contain quotes or backslashes" >&2; exit 1;; esac
+case "$TOKEN" in *[!A-Za-z0-9_-]*) echo "error: the API token may only contain letters, digits, '-' and '_'" >&2; exit 1;; esac
 # Pass the token through a curl config on a file descriptor so it never appears in `ps`.
 relay_curl() { curl -sS -K <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") "$@"; }
 

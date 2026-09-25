@@ -313,6 +313,8 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 | `413 command_input_too_large` | Input exceeds `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`; use a `stdio` adapter for large prompts. |
 | `503 task_capacity_reached` | Store full of non-terminal tasks; raise `A2A_RELAY_MAX_TASKS`/`A2A_RELAY_MAX_ACTIVE` or wait. |
 | `409 idempotency_conflict` | Same `requestId` reused with different fields; use a new ID. |
+| `401 unauthorized` | Send `Authorization: Bearer` with `~/.config/agent-relay/token`, or the same `AGENT_RELAY_TOKEN` the relay uses. |
+| `403 origin_not_allowed` | The request sent an `Origin` not in `AGENT_RELAY_ALLOWED_ORIGINS`; CLI and MCP clients should not send one. |
 | `403 delegation_not_allowed` | The delegating agent's `delegateTo` (see `GET /v1/agents`) excludes the target, or that agent was removed from the registry. |
 | `409 delegation_cycle` | The target is already in this delegation chain; pick another agent or do the work yourself. |
 | `409 delegation_depth_exceeded` | The chain is at `AGENT_RELAY_MAX_DELEGATION_DEPTH`; do the work in this task or raise the limit. |

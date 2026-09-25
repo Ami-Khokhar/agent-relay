@@ -153,8 +153,8 @@ def token_path():
 def load_token():
     """Return the API credential: AGENT_RELAY_TOKEN, else the token file (created 0600 if absent).
 
-    Raises ValueError when the token file is a symlink, is accessible to other users, or is
-    empty. The checks run on the opened descriptor, so the file cannot be swapped in between.
+    Raises ValueError when the token file is a symlink, is empty, or (on POSIX) is accessible
+    to other users. The mode is checked on the opened descriptor, not on the path.
     """
     value = _env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN")
     if value:
@@ -168,12 +168,9 @@ def load_token():
     else:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(secrets.token_urlsafe(32) + "\n")
-    try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as exc:
-        if path.is_symlink():
-            raise ValueError(f"token file {path} is a symlink; replace it with a regular file") from exc
-        raise
+    if path.is_symlink():  # checked everywhere; O_NOFOLLOW also closes the race on POSIX
+        raise ValueError(f"token file {path} is a symlink; replace it with a regular file")
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(fd, "r", encoding="utf-8") as handle:
         if os.name == "posix" and os.fstat(handle.fileno()).st_mode & 0o077:
             raise ValueError(f"token file {path} is accessible to other users; run: chmod 600 {path}")
