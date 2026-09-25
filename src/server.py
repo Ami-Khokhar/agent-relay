@@ -31,6 +31,10 @@ AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd", "parentTaskId"}
 STATUSES = {"queued", "running", "completed", "failed", "timed_out", "cancelled"}
+# On POSIX each adapter runs in its own process group so cancellation reaches descendants.
+PROCESS_GROUPS = os.name == "posix"
+# Seconds to wait for adapter pipes to drain after the adapter process has exited.
+COLLECT_GRACE_S = 2.0
 
 
 def _env(*names, default=None):
@@ -257,10 +261,13 @@ class _Capture:
 
 
 def _pump(stream, sink, capture):
+    # read1 returns what is available; read(n) would wait for n bytes or EOF.
+    read = getattr(stream, "read1", stream.read)
+
     def run():
         try:
             while True:
-                chunk = stream.read(65536)
+                chunk = read(65536)
                 if not chunk:
                     break
                 kept = capture.feed(chunk)
@@ -279,34 +286,99 @@ def _pump(stream, sink, capture):
     return thread
 
 
-def _terminate(proc):
-    if proc.poll() is not None:
-        return
+def _signal(proc, force):
     try:
-        proc.terminate()
+        if PROCESS_GROUPS:
+            os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+        elif proc.poll() is None:
+            proc.kill() if force else proc.terminate()
     except OSError:
         pass
 
-    def _kill():
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
 
-    killer = threading.Timer(1.0, _kill)
+def _terminate(proc):
+    """SIGTERM the adapter's process group (or the process itself), then SIGKILL after 1 s.
+
+    The group is signalled even when the direct child has already exited, so descendants it
+    left behind are stopped too.
+    """
+    if not PROCESS_GROUPS and proc.poll() is not None:
+        return
+    _signal(proc, force=False)
+    killer = threading.Timer(1.0, _signal, (proc, True))
     killer.daemon = True
     killer.start()
 
 
+def _remaining(task):
+    return max(0.0, task["_deadline"] - time.monotonic())
+
+
 def _wait(proc, task):
     try:
-        proc.wait(timeout=task["timeoutMs"] / 1000.0)
+        proc.wait(timeout=_remaining(task))
         return False
     except subprocess.TimeoutExpired:
         _terminate(proc)
         proc.wait()
         return True
+
+
+def _join_all(threads, seconds):
+    deadline = time.monotonic() + seconds
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return not any(thread.is_alive() for thread in threads)
+
+
+def _collect(proc, threads):
+    """Wait a bounded time for the adapter's I/O threads once the adapter has exited.
+
+    A descendant that still holds a pipe (for example one that called setsid(), or any child on
+    Windows) could block a write or delay EOF forever. After a short grace the group is signalled
+    once more and then the relay stops waiting: the daemon I/O threads are abandoned, whatever
+    output was captured is used, and the task's slot is released.
+    """
+    if not _join_all(threads, COLLECT_GRACE_S):
+        _terminate(proc)
+        _join_all(threads, 1.5)
+
+
+def _spawn(agent, task, argv, env, stdin):
+    """Start an adapter process and register it with the task in one step.
+
+    Returns None when the task was cancelled before or while the process started; a process
+    that raced with cancellation is terminated before it can run unobserved.
+    """
+    with LOCK:
+        if task["status"] != "running":
+            return None
+    proc = subprocess.Popen(
+        argv, cwd=_task_cwd(agent, task), env=env, stdin=stdin,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=PROCESS_GROUPS,
+    )
+    with LOCK:
+        task["_proc"] = proc
+        cancelled = task["status"] != "running"
+    if cancelled:
+        _terminate(proc)
+    return proc
+
+
+def _feed(proc, data):
+    """Write the request to stdin on a thread so a non-reading adapter cannot block the deadline."""
+    result = {}
+
+    def run():
+        try:
+            proc.stdin.write(data)
+            proc.stdin.close()
+        except (OSError, ValueError) as exc:
+            result["error"] = getattr(exc, "strerror", None) or str(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, result
 
 
 def _timed_out(exc, started, task):
@@ -326,22 +398,18 @@ def _run_command(agent, task):
     env["A2A_TASK_ID"] = task["id"]
     env["A2A_SESSION_ID"] = task["sessionId"]
     try:
-        proc = subprocess.Popen(
-            [agent["command"], *agent["args"], task["input"]],
-            cwd=_task_cwd(agent, task), env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        proc = _spawn(agent, task, [agent["command"], *agent["args"], task["input"]], env,
+                      subprocess.DEVNULL)
     except OSError as exc:
         _finish(task, "failed", error=exc.strerror or str(exc))
         return
-    with LOCK:
-        task["_proc"] = proc
+    if proc is None:
+        return
     capture = _Capture(MAX_OUTPUT)
     out, err = [], []
     readers = (_pump(proc.stdout, out, capture), _pump(proc.stderr, err, capture))
     timed_out = _wait(proc, task)
-    for reader in readers:
-        reader.join()
+    _collect(proc, readers)
     output = b"".join(out).decode("utf-8", "replace").strip()
     error = b"".join(err).decode("utf-8", "replace").strip()
     if timed_out:
@@ -357,28 +425,19 @@ def _run_command(agent, task):
 def _run_stdio(agent, task):
     env = task_environment(agent, task)
     try:
-        proc = subprocess.Popen(
-            [agent["command"], *agent["args"]],
-            cwd=_task_cwd(agent, task), env=env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        proc = _spawn(agent, task, [agent["command"], *agent["args"]], env, subprocess.PIPE)
     except OSError as exc:
         _finish(task, "failed", error=exc.strerror or str(exc))
         return
-    with LOCK:
-        task["_proc"] = proc
+    if proc is None:
+        return
     capture = _Capture(MAX_OUTPUT)
     out, err = [], []
     readers = (_pump(proc.stdout, out, capture), _pump(proc.stderr, err, capture))
-    stdin_error = None
-    try:
-        proc.stdin.write((json.dumps(adapter_request(task)) + "\n").encode("utf-8"))
-        proc.stdin.close()
-    except (BrokenPipeError, OSError) as exc:
-        stdin_error = exc.strerror or str(exc)
+    writer, fed = _feed(proc, (json.dumps(adapter_request(task)) + "\n").encode("utf-8"))
     timed_out = _wait(proc, task)
-    for reader in readers:
-        reader.join()
+    _collect(proc, (writer, *readers))
+    stdin_error = fed.get("error")
     stdout = b"".join(out).decode("utf-8", "replace")
     stderr = b"".join(err).decode("utf-8", "replace")
     if timed_out:
@@ -422,7 +481,7 @@ def _run_http(agent, task):
                                  headers={"content-type": "application/json"})
     started = time.monotonic()
     try:
-        with urlrequest.urlopen(request, timeout=task["timeoutMs"] / 1000.0) as response:
+        with urlrequest.urlopen(request, timeout=max(_remaining(task), 0.001)) as response:
             content_type = (response.headers.get("content-type") or "").lower()
             raw = response.read(MAX_OUTPUT + 1)
             code = response.status
@@ -476,6 +535,8 @@ def _run_http(agent, task):
 
 
 def _worker(agent, task):
+    # One deadline covers process startup, request delivery, execution, and result collection.
+    task["_deadline"] = time.monotonic() + task["timeoutMs"] / 1000.0
     try:
         kind = agent["type"]
         if kind == "command":
@@ -486,20 +547,31 @@ def _worker(agent, task):
             _run_http(agent, task)
     except Exception as exc:  # noqa: BLE001 - surface any adapter failure on the task
         _finish(task, "failed", error=str(exc))
+    finally:
+        _release(task)
 
 
 def _finish(task, status, **fields):
-    global ACTIVE
     with LOCK:
         if task["status"] not in ("queued", "running"):
             return
         task["status"] = status
         task["finishedAt"] = now_iso()
         task.update({key: value for key, value in fields.items() if value is not None})
+        TASK_CONDITION.notify_all()
+
+
+def _release(task):
+    """Free the task's active slot once its worker, and so its adapter process, is done.
+
+    A cancelled task keeps its slot until the process exits (or the HTTP request returns), so
+    the relay never runs more than MAX_ACTIVE adapters at once.
+    """
+    global ACTIVE
+    with LOCK:
         task.pop("_proc", None)
         if task.pop("_counted", False):
             ACTIVE -= 1
-        TASK_CONDITION.notify_all()
     _drain()
 
 
@@ -519,6 +591,7 @@ def _drain():
                 continue
             ACTIVE += 1
             task["_counted"] = True
+            task["_adapter"] = agent["type"]
             task["status"] = "running"
             task["startedAt"] = now_iso()
             threading.Thread(target=_worker, args=(agent, task), daemon=True).start()
@@ -543,6 +616,10 @@ def _terminate_task(task):
     proc = task.get("_proc")
     if proc is not None:
         _terminate(proc)
+
+
+def _cancellation_mode(agent_type):
+    return "request_only" if agent_type == "http" else "process_signal"
 
 
 def _valid(value, limit=128):
@@ -602,7 +679,7 @@ def _agent_listing():
             "timeoutMs": agent.get("timeoutMs") or TIMEOUT_MS,
             "capabilities": {
                 **agent["capabilities"],
-                "cancellation": "request_only" if agent["type"] == "http" else "process_signal",
+                "cancellation": _cancellation_mode(agent["type"]),
             },
         }
         if agent.get("description") is not None:
@@ -877,15 +954,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "agents": len(AGENTS), "registry": str(path)})
 
     def _cancel(self, task):
-        global ACTIVE
         if task is None:
             return self._json(404, {"error": "unknown_task"})
         with LOCK:
             if task["status"] in ("queued", "running"):
                 if task["status"] == "running":
+                    # The worker keeps the active slot until the adapter has really stopped.
                     _terminate_task(task)
-                    if task.pop("_counted", False):
-                        ACTIVE -= 1
+                    task["cancellation"] = _cancellation_mode(task.get("_adapter"))
                 else:
                     try:
                         QUEUE.remove(task)
@@ -893,7 +969,6 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 task["status"] = "cancelled"
                 task["finishedAt"] = now_iso()
-                task.pop("_proc", None)
                 TASK_CONDITION.notify_all()
         self._json(200, visible(task))
         _drain()

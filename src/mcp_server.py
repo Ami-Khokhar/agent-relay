@@ -115,7 +115,7 @@ TOOLS = [
     },
     {
         "name": "cancel_task",
-        "description": "Cancel a queued or running relay task",
+        "description": "Cancel a queued or running relay task. For command/stdio agents the relay signals the adapter's process group (SIGTERM, then SIGKILL after 1 s). For http agents it only marks the task cancelled (cancellation: request_only); the in-flight request is not aborted and the remote service may keep working.",
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
             "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128,
