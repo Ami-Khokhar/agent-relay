@@ -264,6 +264,11 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 - Binds to loopback (`A2A_RELAY_HOST`, default `127.0.0.1`). Setting a non-loopback host
   exposes an unauthenticated service that can run your coding agents — never do it without
   an authenticated HTTPS boundary.
+- Recursive delegation is supported under a policy: agents the relay spawns get
+  `AGENT_RELAY_PARENT_TASK_ID`, `delegate` forwards it, and the relay enforces per-agent
+  `delegateTo`, rejects cycles, and caps depth (`AGENT_RELAY_MAX_DELEGATION_DEPTH`, 2) and
+  tasks per tree (`AGENT_RELAY_MAX_DELEGATED_TASKS`, 20). It is cooperative: do not give the
+  relay's MCP server or API access to an agent that must not delegate.
 - Tasks are in memory and disappear on restart; old terminal tasks are evicted when the
   store fills. `GET /v1/tasks?sessionId=...` lists what is still stored.
 - Edit the registry and reload without losing tasks: `POST /v1/admin/reload` (loopback
