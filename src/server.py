@@ -89,6 +89,10 @@ MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
 MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
 MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
                                   "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
+# Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
+# 0 keeps them until they are evicted for space or the relay restarts.
+TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
+                                      "A2A_RELAY_TASK_RETENTION_MS")
 # Recursive delegation: how many levels below a root task, and how many tasks one root's tree
 # may create in total. 0 depth rejects every task that names a parentTaskId.
 MAX_DELEGATION_DEPTH = _non_negative_int(2, "AGENT_RELAY_MAX_DELEGATION_DEPTH",
@@ -557,6 +561,7 @@ def _finish(task, status, **fields):
             return
         task["status"] = status
         task["finishedAt"] = now_iso()
+        task["_finished"] = time.monotonic()
         task.update({key: value for key, value in fields.items() if value is not None})
         TASK_CONDITION.notify_all()
 
@@ -586,6 +591,7 @@ def _drain():
             if agent is None:
                 task["status"] = "failed"
                 task["finishedAt"] = now_iso()
+                task["_finished"] = time.monotonic()
                 task["error"] = "unknown_agent"
                 TASK_CONDITION.notify_all()
                 continue
@@ -597,6 +603,32 @@ def _drain():
             threading.Thread(target=_worker, args=(agent, task), daemon=True).start()
 
 
+def _forget(task):
+    del TASKS[task["id"]]
+    request_key = task.get("_request_key")
+    if request_key:
+        REQUEST_IDS.pop(request_key, None)
+    TASK_CONDITION.notify_all()
+
+
+def _purge_expired():
+    """Drop terminal tasks that finished more than TASK_RETENTION_MS ago. Call with LOCK held."""
+    if not TASK_RETENTION_MS:
+        return
+    cutoff = time.monotonic() - TASK_RETENTION_MS / 1000.0
+    for task in [task for task in TASKS.values() if task.get("_finished", cutoff + 1) <= cutoff]:
+        _forget(task)
+
+
+def _purge_periodically():
+    """Enforce retention on an idle relay too, not only when a request arrives."""
+    interval = min(TASK_RETENTION_MS / 1000.0, 60.0)
+    while True:
+        time.sleep(interval)
+        with LOCK:
+            _purge_expired()
+
+
 def _make_room():
     if len(TASKS) < MAX_TASKS:
         return True
@@ -604,11 +636,7 @@ def _make_room():
                      if task["status"] not in ("queued", "running")), None)
     if terminal is None:
         return False
-    del TASKS[terminal["id"]]
-    request_key = terminal.get("_request_key")
-    if request_key:
-        REQUEST_IDS.pop(request_key, None)
-    TASK_CONDITION.notify_all()
+    _forget(terminal)
     return True
 
 
@@ -663,6 +691,7 @@ def _limits():
         "maxCommandInputBytes": MAX_COMMAND_INPUT,
         "maxOutputBytes": MAX_OUTPUT,
         "maxTasks": MAX_TASKS,
+        "taskRetentionMs": TASK_RETENTION_MS or None,
         "maxActive": MAX_ACTIVE,
         "maxDelegationDepth": MAX_DELEGATION_DEPTH,
         "maxDelegatedTasks": MAX_DELEGATED_TASKS,
@@ -774,6 +803,9 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            if path.startswith("/v1/"):
+                with LOCK:
+                    _purge_expired()
             if path == "/healthz":
                 if method == "GET":
                     with LOCK:
@@ -973,6 +1005,7 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 task["status"] = "cancelled"
                 task["finishedAt"] = now_iso()
+                task["_finished"] = time.monotonic()
                 TASK_CONDITION.notify_all()
         self._json(200, visible(task))
         _drain()
@@ -1012,6 +1045,8 @@ def main():
     except (OSError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
+    if TASK_RETENTION_MS:
+        threading.Thread(target=_purge_periodically, daemon=True).start()
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     if hasattr(signal, "SIGHUP"):
