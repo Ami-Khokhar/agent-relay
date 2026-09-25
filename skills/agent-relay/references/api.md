@@ -81,8 +81,10 @@ Returns `{ "tasks": [ ... ] }`.
 
 ### `DELETE /v1/tasks/:id`
 
-Cancels a `queued` or `running` task and returns it with status `cancelled`. Terminal
-tasks are returned unchanged.
+Cancels a `queued` or `running` task and returns it with status `cancelled`. A cancelled
+running task also carries `cancellation`: `process_signal` (the adapter's process group was
+signalled) or `request_only` (HTTP: the request was not aborted). The task keeps its active
+slot until the process exits or the request returns. Terminal tasks are returned unchanged.
 
 ### `POST /v1/admin/reload`
 
