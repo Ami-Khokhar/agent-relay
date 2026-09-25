@@ -8,6 +8,7 @@ starts the HTTP service detached on first use.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import socket
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib import request as urlrequest
 from urllib.parse import quote, urlencode, urlsplit
 
 STATUSES = ("queued", "running", "completed", "failed", "timed_out", "cancelled")
@@ -41,6 +43,20 @@ if _raw_timeout is not None:
         sys.exit("A2A_RELAY_HTTP_TIMEOUT_MS must be a positive integer")
 else:
     REQUEST_TIMEOUT_MS = 10_000
+
+
+def _token():
+    """The relay API token: AGENT_RELAY_TOKEN, else the token file the relay creates."""
+    value = (_env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN") or "").strip()
+    if value:
+        return value
+    path = _env("AGENT_RELAY_TOKEN_FILE", "A2A_RELAY_TOKEN_FILE")
+    path = Path(path) if path else Path.home() / ".config" / "agent-relay" / "token"
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
 
 TOOLS = [
     {
@@ -167,18 +183,33 @@ def _non_empty(args, key, max_length=None):
         _invalid(f"{key} must be a non-empty string{suffix}")
 
 
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
     from urllib import error as urlerror
-    from urllib import request as urlrequest
 
     data = None
     headers = {}
+    token = _token()
+    if token:
+        parsed = urlsplit(base_url)
+        if parsed.scheme != "https" and not _loopback(base_url):
+            raise RelayError(None, {"error": "insecure_relay_url",
+                                    "message": "refusing to send the API token over cleartext http "
+                                               "to a non-loopback relay; use an https URL"},
+                             "refusing to send the API token over cleartext http to a non-loopback relay")
+        headers["authorization"] = f"Bearer {token}"
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["content-type"] = "application/json"
     request = urlrequest.Request(base_url + path, data=data, method=method, headers=headers)
+    # Never follow redirects: urllib would re-send the Authorization header to the new host.
+    opener = urlrequest.build_opener(_NoRedirect)
     try:
-        with urlrequest.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             raw = response.read()
             code = response.status
             ok = 200 <= code < 300
@@ -204,8 +235,11 @@ def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
 
 
 def _loopback(base_url):
-    hostname = urlsplit(base_url).hostname
-    return hostname in ("127.0.0.1", "localhost", "::1")
+    hostname = urlsplit(base_url).hostname or ""
+    try:
+        return hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def _autostart_enabled():

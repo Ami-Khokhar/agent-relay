@@ -7,10 +7,13 @@ registry of adapters. See README.md for the HTTP API and the relay.adapter/v1 co
 from __future__ import annotations
 
 import errno
+import hmac
 import http.client
+import ipaddress
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -21,6 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlsplit
 
 ADAPTER_PROTOCOL = "relay.adapter/v1"
@@ -101,6 +105,13 @@ MAX_DELEGATION_DEPTH = _non_negative_int(2, "AGENT_RELAY_MAX_DELEGATION_DEPTH",
 MAX_DELEGATED_TASKS = _positive_int(20, "AGENT_RELAY_MAX_DELEGATED_TASKS",
                                     "A2A_RELAY_MAX_DELEGATED_TASKS")
 EXPLICIT_CONFIG = _env("AGENT_RELAY_AGENTS_FILE", "A2A_AGENTS_FILE")
+# Listening beyond loopback exposes an unencrypted API; it needs a conspicuous opt-in.
+ALLOW_NON_LOOPBACK = _env("AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK",
+                          "A2A_RELAY_UNSAFE_ALLOW_NON_LOOPBACK") == "1"
+ALLOWED_ORIGINS = {origin.strip() for origin in (
+    _env("AGENT_RELAY_ALLOWED_ORIGINS", "A2A_RELAY_ALLOWED_ORIGINS", default="").split(","))
+    if origin.strip()}
+TOKEN = ""
 
 LOCK = threading.RLock()
 REGISTRY_PATH = ""
@@ -132,6 +143,51 @@ def config_path():
     if EXPLICIT_CONFIG:
         return Path(EXPLICIT_CONFIG)
     return default_config_path()
+
+
+def token_path():
+    explicit = _env("AGENT_RELAY_TOKEN_FILE", "A2A_RELAY_TOKEN_FILE")
+    return Path(explicit) if explicit else Path.home() / ".config" / "agent-relay" / "token"
+
+
+def load_token():
+    """Return the API credential: AGENT_RELAY_TOKEN, else the token file (created 0600 if absent).
+
+    Raises ValueError when the token file is a symlink, is empty, or (on POSIX) is accessible
+    to other users. The mode is checked on the opened descriptor, not on the path.
+    """
+    value = (_env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN") or "").strip()
+    if value:
+        return value
+    path = token_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(secrets.token_urlsafe(32) + "\n")
+    if path.is_symlink():  # checked everywhere; O_NOFOLLOW also closes the race on POSIX
+        raise ValueError(f"token file {path} is a symlink; replace it with a regular file")
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        if os.name == "posix" and os.fstat(handle.fileno()).st_mode & 0o077:
+            raise ValueError(f"token file {path} is accessible to other users; run: chmod 600 {path}")
+        value = handle.read().strip()
+    if not value:
+        raise ValueError(f"token file {path} is empty; delete it to generate a new token, "
+                         "or set AGENT_RELAY_TOKEN")
+    return value
+
+
+def is_loopback(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def load_registry(path):
@@ -179,6 +235,11 @@ def load_registry(path):
             url = raw.get("url")
             if not isinstance(url, str) or urlsplit(url).scheme not in ("http", "https"):
                 raise ValueError(f"Invalid HTTP agent: {agent_id}")
+            if (urlsplit(url).scheme == "http" and not is_loopback(urlsplit(url).hostname or "")
+                    and raw.get("allowInsecureHttp") is not True):
+                raise ValueError(
+                    f"HTTP agent {agent_id} would send prompts in cleartext to a non-loopback host; "
+                    "use https or set \"allowInsecureHttp\": true")
         delegate_to = raw.get("delegateTo")
         if delegate_to is not None and (not isinstance(delegate_to, list) or not all(
                 isinstance(item, str) for item in delegate_to)):
@@ -511,6 +572,13 @@ def _run_stdio(agent, task):
     _finish(task, response["status"], output=response.get("output", ""), error=response.get("error"))
 
 
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    """Never follow adapter redirects: the prompt must only reach the configured URL."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def _read_body(stream, task):
     """Read at most MAX_OUTPUT + 1 bytes, giving up at the task deadline.
 
@@ -544,19 +612,25 @@ def _read_body(stream, task):
 
 def _run_http(agent, task):
     from urllib import error as urlerror
-    from urllib import request as urlrequest
 
+    opener = urlrequest.build_opener(_NoRedirect)
     payload = json.dumps(adapter_request(task)).encode("utf-8")
     request = urlrequest.Request(agent["url"], data=payload, method="POST",
                                  headers={"content-type": "application/json"})
     started = time.monotonic()
     try:
-        with urlrequest.urlopen(request, timeout=max(_remaining(task), 0.001)) as response:
+        with opener.open(request, timeout=max(_remaining(task), 0.001)) as response:
             content_type = (response.headers.get("content-type") or "").lower()
             raw = _read_body(response, task)
             code = response.status
             ok = 200 <= code < 300
     except urlerror.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            location = exc.headers.get("location") if exc.headers else None
+            _finish(task, "failed", error=f"HTTP adapter redirected ({exc.code} to {location}); "
+                                          "redirects are not followed")
+            exc.close()
+            return
         content_type = ((exc.headers.get("content-type") if exc.headers else "") or "").lower()
         try:
             raw = _read_body(exc, task)
@@ -850,10 +924,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # silence per-request logging
         pass
 
-    def _json(self, status, value):
+    def _json(self, status, value, headers=None):
         body = json.dumps(value).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        if status >= 400:
+            # An error may leave the request body unread; never parse it as a next request.
+            self.close_connection = True
+            self.send_header("connection", "close")
+        for name, header in (headers or {}).items():
+            self.send_header(name, header)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -878,6 +958,17 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            origin = self.headers.get("origin")
+            if origin is not None and origin not in ALLOWED_ORIGINS:
+                # Browsers send Origin on cross-site requests; CLI and MCP clients do not.
+                # The body is left unread, so drop the connection rather than parse it as a request.
+                self.close_connection = True
+                return self._json(403, {"error": "origin_not_allowed"})
+            if path.startswith("/v1/") and not self._authorized():
+                self.close_connection = True
+                return self._json(401, {"error": "unauthorized",
+                                        "message": "send Authorization: Bearer <token>"},
+                                  headers={"www-authenticate": "Bearer"})
             if path.startswith("/v1/"):
                 with LOCK:
                     _purge_expired()
@@ -917,8 +1008,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 - never leak a stack trace to the client
             self._json(500, {"error": "request_failed", "message": str(exc)})
 
+    def _authorized(self):
+        if not TOKEN:
+            return False  # never authorize against an unset token
+        header = self.headers.get("authorization") or ""
+        scheme, _, supplied = header.partition(" ")
+        return scheme.lower() == "bearer" and hmac.compare_digest(
+            supplied.strip().encode("utf-8"), TOKEN.encode("utf-8"))
+
     def _submit(self):
-        global ACTIVE
+        content_type = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            self.close_connection = True
+            return self._json(415, {"error": "unsupported_media_type",
+                                    "message": "content-type must be application/json"})
         length_header = self.headers.get("content-length")
         length = int(length_header) if length_header and length_header.isdigit() else 0
         if length > MAX_BODY:
@@ -1112,7 +1215,12 @@ def _reload_signal(_signum, _frame):
 
 
 def main():
-    global AGENTS, REGISTRY_PATH
+    global AGENTS, REGISTRY_PATH, TOKEN
+    if not is_loopback(HOST) and not ALLOW_NON_LOOPBACK:
+        print(f"error: refusing to listen on non-loopback address {HOST}: the relay has no TLS and "
+              "is a single-user local service. Put it behind an authenticated HTTPS proxy and set "
+              "AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK=1 to accept the risk.", file=sys.stderr)
+        return 1
     path = config_path()
     try:
         AGENTS = load_registry(str(path))
@@ -1136,6 +1244,15 @@ def main():
         print(f"error: {exc}", file=sys.stderr)
         return 1
     server.daemon_threads = True
+    try:
+        TOKEN = load_token()
+    except (OSError, ValueError) as exc:
+        server.server_close()
+        print(f"error: cannot load the API token: {exc}", file=sys.stderr)
+        return 1
+    if not is_loopback(HOST):
+        print(f"WARNING: listening on non-loopback address {HOST} without TLS; anyone who can "
+              "reach it and obtain the token can run your coding agents.", file=sys.stderr, flush=True)
     print(f"agent-relay listening at http://{HOST}:{PORT} (registry: {path})", flush=True)
     try:
         server.serve_forever()
