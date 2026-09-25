@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/schemas/workitem.schema.json",
+  "title": "WorkItem",
+  "description": "Durable orchestration record for one deliverable issue. The controller's source of truth for orchestration; GitHub is the source of truth for facts (issue/PR/commit/merge). One WorkItem = one issue = one branch = one PR.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "repo",
+    "issueNumber",
+    "goal",
+    "acceptance",
+    "state",
+    "stateVersion",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "factory.workitem/v1" },
+    "id": { "type": "string", "minLength": 1 },
+    "repo": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+    "issueNumber": { "type": "integer", "minimum": 1 },
+    "parentGoalId": {
+      "type": ["string", "null"],
+      "description": "Set for child issues of an epic. Parent completion depends on all children."
+    },
+    "goal": { "type": "string", "minLength": 1 },
+    "acceptance": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Frozen at intake. A merge is not completion until these are checked."
+    },
+    "branch": { "type": ["string", "null"] },
+    "prNumber": { "type": ["integer", "null"], "minimum": 1 },
+    "baseSha": { "type": ["string", "null"] },
+    "headSha": {
+      "type": ["string", "null"],
+      "description": "The commit the controller last dispatched/observed on the branch."
+    },
+    "reviewedSha": {
+      "type": ["string", "null"],
+      "description": "The commit the latest accepted gate verdict applies to."
+    },
+    "gateRound": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Mirror of pr-gatekeeper's round number. Never incremented by controller retries."
+    },
+    "attempts": { "type": "integer", "minimum": 0 },
+    "blockers": {
+      "type": "array",
+      "description": "Fingerprinted unresolved findings, for same-problem round counting.",
+      "items": { "$ref": "#/$defs/blocker" }
+    },
+    "state": { "$ref": "#/$defs/state" },
+    "stateVersion": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optimistic-concurrency version. Every durable write increments it."
+    },
+    "activeWorkOrderId": { "type": ["string", "null"] },
+    "relayTaskId": { "type": ["string", "null"] },
+    "worker": { "type": ["string", "null"], "description": "agent-relay agentId used." },
+    "owner": {
+      "type": ["string", "null"],
+      "description": "Named human owner, required while state is human_waiting."
+    },
+    "terminalReason": { "type": ["string", "null"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "state": {
+      "enum": [
+        "intent",
+        "issued",
+        "planned",
+        "ready",
+        "dispatching",
+        "implementing",
+        "pr_open",
+        "reviewing",
+        "changes_requested",
+        "merge_pending",
+        "merged",
+        "closed",
+        "human_waiting",
+        "blocked",
+        "failed",
+        "cancelled"
+      ],
+      "description": "merged and closed and cancelled are terminal. human_waiting is NOT terminal: it is an action queue with a path back to ready or closed."
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fingerprint", "firstSeenRound", "resolved"],
+      "properties": {
+        "fingerprint": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable hash of path + normalized problem text. Identity of 'the same problem'."
+        },
+        "firstSeenRound": { "type": "integer", "minimum": 0 },
+        "resolved": { "type": "boolean" }
+      }
+    }
+  }
+}

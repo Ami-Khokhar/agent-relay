@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/schemas/workorder.schema.json",
+  "title": "WorkOrder",
+  "description": "The instruction handed to a worker (via agent-relay) for one unit of execution. Immutable once dispatched. Idempotency is by idempotencyKey, not by relay task id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "workItemId",
+    "round",
+    "kind",
+    "goal",
+    "acceptance",
+    "constraints",
+    "requiredEvidence",
+    "budget",
+    "idempotencyKey",
+    "createdAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "factory.workorder/v1" },
+    "id": { "type": "string", "minLength": 1 },
+    "workItemId": { "type": "string", "minLength": 1 },
+    "round": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Gate round this work order acts on (0 = first implementation)."
+    },
+    "kind": { "enum": ["implement", "fix", "verify"] },
+    "repo": { "type": ["string", "null"] },
+    "baseSha": { "type": ["string", "null"] },
+    "headSha": {
+      "type": ["string", "null"],
+      "description": "The reviewed commit a fix must build on; must be re-checked before the worker starts."
+    },
+    "goal": { "type": "string", "minLength": 1 },
+    "acceptance": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "constraints": { "$ref": "#/$defs/constraints" },
+    "findingsToAddress": {
+      "type": "array",
+      "description": "For kind=fix: the specific findings this work order exists to resolve.",
+      "items": { "$ref": "#/$defs/findingRef" }
+    },
+    "requiredEvidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": ["tests-pass", "lint-pass", "typecheck-pass", "build-pass", "scan-clean", "proof-commands"]
+      }
+    },
+    "budget": { "$ref": "#/$defs/budget" },
+    "workspace": { "$ref": "#/$defs/workspace" },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable key, e.g. pr-13-fix-r2. A replay returns the existing task instead of starting duplicate work."
+    },
+    "createdAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxChangedLines", "maxChangedFiles", "protectedPaths"],
+      "properties": {
+        "maxChangedLines": { "type": "integer", "minimum": 1 },
+        "maxChangedFiles": { "type": "integer", "minimum": 1 },
+        "protectedPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Touching any of these forces HUMAN at the gate."
+        },
+        "allowedPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional least-privilege scope. Empty/absent = the whole repo."
+        }
+      }
+    },
+    "findingRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fingerprint"],
+      "properties": {
+        "fingerprint": { "type": "string", "minLength": 1 },
+        "path": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"] },
+        "problem": { "type": ["string", "null"] }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "wallMs": { "type": "integer", "minimum": 1 },
+        "tokens": { "type": "integer", "minimum": 1 },
+        "usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "enum": ["local", "worktree", "container", "remote"] },
+        "path": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

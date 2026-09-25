@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Software Factory — Architecture</title>
+<style>
+  :root {
+    --bg: #0f1216;
+    --panel: #171b21;
+    --ink: #e8edf2;
+    --muted: #9aa7b4;
+    --line: #2a313a;
+    --built: #2ea043;
+    --built-bg: #0f2a17;
+    --partial: #d29922;
+    --partial-bg: #2c2410;
+    --missing: #f85149;
+    --missing-bg: #2d1517;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 600px at 20% -10%, #1b2330 0%, var(--bg) 60%);
+    color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 32px 20px 64px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  header h1 {
+    font-size: 28px; margin: 0 0 6px; letter-spacing: -0.3px;
+    background: linear-gradient(90deg, #e8edf2, var(--accent));
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  header p { margin: 0 0 22px; color: var(--muted); max-width: 820px; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; margin: 0 0 22px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px; border-radius: 999px; font-size: 13px;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .dot.built { background: var(--built); }
+  .dot.partial { background: var(--partial); }
+  .dot.missing { background: var(--missing); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 20px; margin: 0 0 22px;
+  }
+  .diagram { overflow-x: auto; text-align: center; }
+  .diagram .mermaid { min-height: 200px; }
+  .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .notes .card { margin: 0; }
+  .notes h3 { margin: 0 0 8px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--accent); }
+  .notes ul { margin: 0; padding-left: 18px; }
+  .notes li { margin: 6px 0; color: #cdd6df; }
+  .notes code { background: #0b0e12; border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; font-size: 12.5px; }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  pre.ascii {
+    overflow-x: auto; background: #0b0e12; border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; color: #b9c6d3; font: 12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .hint { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
+  .kv { color: var(--muted); }
+  .kv b { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Software Factory — Architecture</h1>
+    <p>
+      Two fixed cells (<b>agent-relay</b> as the local execution bus, <b>pr-gatekeeper</b> as the
+      review + merge gate) joined by a durable blackboard and a controller that owns the work item.
+    </p>
+  </header>
+
+  <div class="legend">
+    <span class="chip"><span class="dot built"></span> BUILT — working today</span>
+    <span class="chip"><span class="dot partial"></span> PARTIAL — exists but incomplete / coupled</span>
+    <span class="chip"><span class="dot missing"></span> MISSING — no owner yet</span>
+  </div>
+
+  <div class="card diagram">
+    <pre class="mermaid">
+flowchart TB
+    H["HUMAN&lt;br/&gt;states the goal · resolves escalation · owns rollback"]
+
+    subgraph PLAN["1 · Planning cell — PARTIAL"]
+        A1["Orchestrator agent&lt;br/&gt;clarify · acceptance criteria&lt;br/&gt;decompose to ≤600 lines / ≤20 files"]
+    end
+
+    subgraph CONTROL["2 · Control plane — MISSING"]
+        C1["Controller / Foreman&lt;br/&gt;WorkItem state machine · leases&lt;br/&gt;idempotency · reconciliation"]
+        C2["Escalation queue&lt;br/&gt;HUMAN: owner · reason · SLA"]
+        C3["Observability + cost ledger"]
+    end
+
+    subgraph GH["3 · GitHub plane — durable blackboard — BUILT"]
+        I["Issues"]
+        PR["Pull requests&lt;br/&gt;six-heading body"]
+        LB["Labels · comments ·&lt;br/&gt;review-completed events"]
+    end
+
+    subgraph EXEC["4 · Execution plane — agent-relay — BUILT"]
+        R["agent-relay&lt;br/&gt;IDs · queue · timeout · cancel · idempotency"]
+        W["Worker pool&lt;br/&gt;claude · codex · pi · opencode · dsh"]
+        WS["Workspace provider&lt;br/&gt;worktree / container — PARTIAL"]
+    end
+
+    subgraph REV["5 · Review plane — pr-gatekeeper — BUILT"]
+        G1["gates job — NO secrets, RUNS PR code&lt;br/&gt;lint · static · verify · base-compare · revert probe"]
+        G2["review job — secrets, NEVER runs PR code&lt;br/&gt;reviewer → verifier → policy"]
+        MG["Model gateway&lt;br/&gt;role → provider profile + model — PARTIAL"]
+        GP["Publish&lt;br/&gt;review · comment · label · check · dispatch · merge"]
+    end
+
+    subgraph SHIP["6 · Release plane — MISSING"]
+        REL["version · changelog · deploy&lt;br/&gt;rollback owner"]
+    end
+
+    H --> A1
+    A1 --> I
+    I -->|"ready"| C1
+    C1 -->|"WorkOrder (delegate)"| R
+    R --> W
+    W -. uses .-> WS
+    W -->|"branch + commit + evidence"| PR
+    C1 -. "validate artifact, open PR" .-> PR
+    PR -->|"on open / push"| G1
+    G1 --> G2
+    G2 <--> MG
+    G2 --> GP
+    GP -->|"MERGE / CHANGES / HUMAN"| LB
+    LB -->|"repository_dispatch event"| C1
+    GH -. "periodic reconcile (source of truth)" .-> C1
+    C1 -->|"CHANGES → fresh fix WorkOrder"| R
+    C1 -->|"HUMAN"| C2
+    C2 --> H
+    H -->|"resolve → re-gate"| C1
+    GP -->|"squash merge"| REL
+    REL --> H
+    C1 --> C3
+    GP -.-> C3
+    W -.-> C3
+
+    classDef built fill:#0f2a17,stroke:#2ea043,color:#e8edf2;
+    classDef partial fill:#2c2410,stroke:#d29922,color:#e8edf2;
+    classDef missing fill:#2d1517,stroke:#f85149,color:#e8edf2,stroke-dasharray:4 3;
+
+    class I,PR,LB,R,W,G1,G2,GP,H built;
+    class A1,WS,MG,C3 partial;
+    class C1,C2,REL missing;
+    </pre>
+    <p class="hint">Rendered with Mermaid (loaded from CDN — needs internet). A plain-text version is below.</p>
+  </div>
+
+  <div class="notes">
+    <div class="card">
+      <h3>Two planes</h3>
+      <ul>
+        <li><b>GitHub plane (#3)</b> — durable blackboard and source of truth between phases: issues, PRs, labels, events.</li>
+        <li><b>agent-relay plane (#4)</b> — ephemeral, local execution bus: dispatch one task, wait, get the result.</li>
+        <li>Phases talk through GitHub; execution happens through the relay.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>The loop</h3>
+      <ul>
+        <li>issue → controller → relay → worker → PR → gate → decision → back to controller.</li>
+        <li><code>repository_dispatch</code> is a <b>wake-up hint</b>; the periodic <b>reconcile</b> against GitHub is the truth.</li>
+        <li>CHANGES → fresh fix WorkOrder on the same branch. HUMAN → escalation queue.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Trust boundary</h3>
+      <ul>
+        <li><b>gates job</b> runs untrusted PR code with <b>no secrets</b>.</li>
+        <li><b>review job</b> holds secrets and <b>never runs PR code</b>.</li>
+        <li>PR code and credentials never share a runner.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Agnosticism axes</h3>
+      <ul>
+        <li><b>Harness-agnostic</b> — enforced at the worker pool; any CLI behind the adapter contract.</li>
+        <li><b>Model-agnostic</b> — enforced at the Model gateway: logical role → provider profile + model.</li>
+        <li>Both are configuration, not code.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>Plain-text (ASCII) version</summary>
+      <pre class="ascii">
+                                   ┌───────────────────────────────────────────────┐
+                                   │                    HUMAN                      │
+                                   │   states the goal · resolves escalation ·     │
+                                   │   signs off release / owns rollback           │
+                                   └───────┬───────────────────────────────▲───────┘
+                                           │ goal                          │ resolve / sign-off
+                                           ▼                               │
+                              ┌────────────────────────────┐               │
+                              │  1  PLANNING CELL          │  PARTIAL      │
+                              │  issue + acceptance        │               │
+                              │  decompose to ≤600 lines   │               │
+                              └──────────────┬─────────────┘               │
+                                             │ issue                       │
+                                             ▼                             │
+    ┌────────────────────────── 3  GITHUB PLANE  (durable blackboard) ─────┼─────────────┐
+    │   Issues        Pull Requests (six headings)      Labels · events    │  BUILT      │
+    └──────────┬─────────────────────────────────────────────────────▲─────┴─────────────┘
+               │ ready                                               │ event / reconcile
+               ▼                                                     │
+    ┌────────────────────── 2  CONTROL PLANE  (MISSING) ─────────────┴──────────┐
+    │   Controller / Foreman : WorkItem state machine · leases · idempotency    │
+    │   reconciliation loop    |    Escalation queue (HUMAN)   |   Telemetry    │
+    └──────────┬───────────────────────────────────────────────┬──────────────┘
+               │ WorkOrder (delegate)                          │ HUMAN
+               ▼                                               ▼
+    ┌──────────────────── 4  EXECUTION PLANE  (agent-relay) ───────────┐   ┌──────────┐
+    │   relay: IDs · queue · timeout · cancel · idempotency            │   │  HUMAN   │
+    │      └─> worker pool: claude · codex · pi · opencode · dsh       │──>│  QUEUE   │───┐
+    │      └─> workspace: worktree / container                         │   └──────────┘   │
+    └──────────┬───────────────────────────────────────────────────────┘                  │
+               │ branch + commit + evidence                                               │
+               ▼                                                                          │
+    ┌──────────────── 5  REVIEW PLANE  (pr-gatekeeper, BUILT) ────────────────────────┐   │
+    │  gates job   [ NO secrets · RUNS PR code ]                                      │   │
+    │     pr-lint · static/secret scan · verify · base-compare · revert probe          │   │
+    │                              │                                                  │   │
+    │  review job  [ secrets · NEVER runs PR code ]                                   │   │
+    │     reviewer ──> verifier ──> policy        <──>  MODEL GATEWAY (PARTIAL)        │   │
+    │                              │                                                  │   │
+    │  publish: review · comment · label · check · dispatch · squash-merge             │   │
+    └──────────┬────────────────────────────────────┬─────────────────────────────────┘   │
+        MERGE  │                          CHANGES / │                                       │
+               ▼                                    └──── back to Controller (fix WorkOrder)─┘
+    ┌────────────────────── 6  RELEASE PLANE  (MISSING) ─────────────────────────────┐
+    │   version · changelog · deploy · who verifies · who can roll back              │
+    └────────────────────────────────────────────────────────────────────────────────┘
+      </pre>
+    </details>
+  </div>
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({
+    startOnLoad: true,
+    securityLevel: 'loose',
+    theme: 'base',
+    themeVariables: {
+      background: '#171b21',
+      primaryColor: '#1c2430',
+      primaryTextColor: '#e8edf2',
+      primaryBorderColor: '#3a4655',
+      lineColor: '#7d8b9c',
+      secondaryColor: '#171b21',
+      tertiaryColor: '#171b21',
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+      fontSize: '14px',
+      clusterBkg: '#12161b',
+      clusterBorder: '#2a313a',
+      titleColor: '#9aa7b4'
+    },
+    flowchart: { curve: 'basis', useMaxWidth: true }
+  });
+</script>
+</body>
+</html>
