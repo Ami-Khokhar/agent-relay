@@ -7,9 +7,13 @@ registry of adapters. See README.md for the HTTP API and the relay.adapter/v1 co
 from __future__ import annotations
 
 import errno
+import hmac
+import http.client
+import ipaddress
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -20,6 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlsplit
 
 ADAPTER_PROTOCOL = "relay.adapter/v1"
@@ -29,8 +34,12 @@ INHERITED_ENV = (
 )
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd"}
+TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd", "parentTaskId"}
 STATUSES = {"queued", "running", "completed", "failed", "timed_out", "cancelled"}
+# On POSIX each adapter runs in its own process group so cancellation reaches descendants.
+PROCESS_GROUPS = os.name == "posix"
+# Seconds to wait for adapter pipes to drain after the adapter process has exited.
+COLLECT_GRACE_S = 2.0
 
 
 def _env(*names, default=None):
@@ -85,9 +94,27 @@ MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
 MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
 MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
                                   "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
+# Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
+# 0 keeps them until they are evicted for space or the relay restarts.
+TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
+                                      "A2A_RELAY_TASK_RETENTION_MS")
+# Recursive delegation: how many levels below a root task, and how many tasks one root's tree
+# may create in total. 0 depth rejects every task that names a parentTaskId.
+MAX_DELEGATION_DEPTH = _non_negative_int(2, "AGENT_RELAY_MAX_DELEGATION_DEPTH",
+                                         "A2A_RELAY_MAX_DELEGATION_DEPTH")
+MAX_DELEGATED_TASKS = _positive_int(20, "AGENT_RELAY_MAX_DELEGATED_TASKS",
+                                    "A2A_RELAY_MAX_DELEGATED_TASKS")
 EXPLICIT_CONFIG = _env("AGENT_RELAY_AGENTS_FILE", "A2A_AGENTS_FILE")
+# Listening beyond loopback exposes an unencrypted API; it needs a conspicuous opt-in.
+ALLOW_NON_LOOPBACK = _env("AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK",
+                          "A2A_RELAY_UNSAFE_ALLOW_NON_LOOPBACK") == "1"
+ALLOWED_ORIGINS = {origin.strip() for origin in (
+    _env("AGENT_RELAY_ALLOWED_ORIGINS", "A2A_RELAY_ALLOWED_ORIGINS", default="").split(","))
+    if origin.strip()}
+TOKEN = ""
 
 LOCK = threading.RLock()
+REGISTRY_PATH = ""
 TASK_CONDITION = threading.Condition(LOCK)
 AGENTS = {}
 TASKS = {}
@@ -119,6 +146,51 @@ def config_path():
     if EXPLICIT_CONFIG:
         return Path(EXPLICIT_CONFIG)
     return default_config_path()
+
+
+def token_path():
+    explicit = _env("AGENT_RELAY_TOKEN_FILE", "A2A_RELAY_TOKEN_FILE")
+    return Path(explicit) if explicit else Path.home() / ".config" / "agent-relay" / "token"
+
+
+def load_token():
+    """Return the API credential: AGENT_RELAY_TOKEN, else the token file (created 0600 if absent).
+
+    Raises ValueError when the token file is a symlink, is empty, or (on POSIX) is accessible
+    to other users. The mode is checked on the opened descriptor, not on the path.
+    """
+    value = (_env("AGENT_RELAY_TOKEN", "A2A_RELAY_TOKEN") or "").strip()
+    if value:
+        return value
+    path = token_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(secrets.token_urlsafe(32) + "\n")
+    if path.is_symlink():  # checked everywhere; O_NOFOLLOW also closes the race on POSIX
+        raise ValueError(f"token file {path} is a symlink; replace it with a regular file")
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        if os.name == "posix" and os.fstat(handle.fileno()).st_mode & 0o077:
+            raise ValueError(f"token file {path} is accessible to other users; run: chmod 600 {path}")
+        value = handle.read().strip()
+    if not value:
+        raise ValueError(f"token file {path} is empty; delete it to generate a new token, "
+                         "or set AGENT_RELAY_TOKEN")
+    return value
+
+
+def is_loopback(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def load_registry(path):
@@ -166,6 +238,15 @@ def load_registry(path):
             url = raw.get("url")
             if not isinstance(url, str) or urlsplit(url).scheme not in ("http", "https"):
                 raise ValueError(f"Invalid HTTP agent: {agent_id}")
+            if (urlsplit(url).scheme == "http" and not is_loopback(urlsplit(url).hostname or "")
+                    and raw.get("allowInsecureHttp") is not True):
+                raise ValueError(
+                    f"HTTP agent {agent_id} would send prompts in cleartext to a non-loopback host; "
+                    "use https or set \"allowInsecureHttp\": true")
+        delegate_to = raw.get("delegateTo")
+        if delegate_to is not None and (not isinstance(delegate_to, list) or not all(
+                isinstance(item, str) for item in delegate_to)):
+            raise ValueError(f"Invalid delegateTo: {agent_id}")
         caps = raw.get("capabilities")
         if caps is not None and (not isinstance(caps, dict)
                                  or not all(isinstance(item, bool) for item in caps.values())):
@@ -185,11 +266,12 @@ def load_registry(path):
 
 def reload_registry():
     """Reload the registry from disk. Raises on an invalid file; callers keep the old one."""
-    global AGENTS
+    global AGENTS, REGISTRY_PATH
     path = config_path()
     agents = load_registry(str(path))
     with LOCK:
         AGENTS = agents
+        REGISTRY_PATH = str(path)
     return path
 
 
@@ -203,6 +285,13 @@ def environment(agent):
             env[key] = os.environ[key]
     env.update(agent.get("env") or {})
     env["A2A_ADAPTER_PROTOCOL"] = ADAPTER_PROTOCOL
+    return env
+
+
+def task_environment(agent, task):
+    env = environment(agent)
+    # Lets the relay's MCP tools (or any client) attribute delegated work to this task.
+    env["AGENT_RELAY_PARENT_TASK_ID"] = task["id"]
     return env
 
 
@@ -241,10 +330,13 @@ class _Capture:
 
 
 def _pump(stream, sink, capture):
+    # read1 returns what is available; read(n) would wait for n bytes or EOF.
+    read = getattr(stream, "read1", stream.read)
+
     def run():
         try:
             while True:
-                chunk = stream.read(65536)
+                chunk = read(65536)
                 if not chunk:
                     break
                 kept = capture.feed(chunk)
@@ -263,34 +355,133 @@ def _pump(stream, sink, capture):
     return thread
 
 
-def _terminate(proc):
-    if proc.poll() is not None:
-        return
+def _start_time(pid):
+    """The process start time from /proc (Linux), or None when it cannot be read."""
     try:
-        proc.terminate()
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            fields = handle.read().rsplit(b")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    return fields[19] if len(fields) > 19 else None  # field 22 of stat; fields[0] is field 3
+
+
+def _group_is_ours(proc):
+    """Whether the process group named by the adapter's pid still belongs to this task.
+
+    Until the leader is reaped its pid, and so the group id, cannot be reused. Afterwards the
+    id stays reserved only while group members remain; once it is free another process may
+    take it. On Linux the leader's start time, recorded at spawn, tells the two apart: a process
+    now holding that pid with a different start time is foreign. Elsewhere there is no way to
+    check, so a reaped leader's group is never signalled.
+    """
+    if proc.returncode is None:
+        return True
+    recorded = getattr(proc, "relay_start_time", None)
+    if recorded is None:
+        return False
+    current = _start_time(proc.pid)
+    # No process with that pid: the id is either free (the signal fails with ESRCH) or still
+    # held by our surviving group members.
+    return current is None or current == recorded
+
+
+def _signal(proc, force):
+    try:
+        if PROCESS_GROUPS:
+            if not _group_is_ours(proc):
+                return
+            os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+        elif proc.poll() is None:
+            proc.kill() if force else proc.terminate()
     except OSError:
         pass
 
-    def _kill():
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
 
-    killer = threading.Timer(1.0, _kill)
+def _terminate(proc):
+    """SIGTERM the adapter's process group (or the process itself), then SIGKILL after 1 s.
+
+    The group is signalled while the leader is unreaped. After it has been reaped the group is
+    signalled only where the leader's identity can still be checked (see _group_is_ours), so
+    descendants it left behind are stopped on Linux but not on other POSIX systems.
+    """
+    if not PROCESS_GROUPS and proc.poll() is not None:
+        return
+    _signal(proc, force=False)
+    killer = threading.Timer(1.0, _signal, (proc, True))
     killer.daemon = True
     killer.start()
 
 
+def _remaining(task):
+    return max(0.0, task["_deadline"] - time.monotonic())
+
+
 def _wait(proc, task):
     try:
-        proc.wait(timeout=task["timeoutMs"] / 1000.0)
+        proc.wait(timeout=_remaining(task))
         return False
     except subprocess.TimeoutExpired:
         _terminate(proc)
         proc.wait()
         return True
+
+
+def _join_all(threads, seconds):
+    deadline = time.monotonic() + seconds
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return not any(thread.is_alive() for thread in threads)
+
+
+def _collect(proc, threads):
+    """Wait a bounded time for the adapter's I/O threads once the adapter has exited.
+
+    A descendant that still holds a pipe (for example one that called setsid(), or any child on
+    Windows) could block a write or delay EOF forever. After a short grace the group is signalled
+    once more and then the relay stops waiting: the daemon I/O threads are abandoned, whatever
+    output was captured is used, and the task's slot is released.
+    """
+    if not _join_all(threads, COLLECT_GRACE_S):
+        _terminate(proc)
+        _join_all(threads, 1.5)
+
+
+def _spawn(agent, task, argv, env, stdin):
+    """Start an adapter process and register it with the task in one step.
+
+    Returns None when the task was cancelled before or while the process started; a process
+    that raced with cancellation is terminated before it can run unobserved.
+    """
+    with LOCK:
+        if task["status"] != "running":
+            return None
+    proc = subprocess.Popen(
+        argv, cwd=_task_cwd(agent, task), env=env, stdin=stdin,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=PROCESS_GROUPS,
+    )
+    proc.relay_start_time = _start_time(proc.pid)
+    with LOCK:
+        task["_proc"] = proc
+        cancelled = task["status"] != "running"
+    if cancelled:
+        _terminate(proc)
+    return proc
+
+
+def _feed(proc, data):
+    """Write the request to stdin on a thread so a non-reading adapter cannot block the deadline."""
+    result = {}
+
+    def run():
+        try:
+            proc.stdin.write(data)
+            proc.stdin.close()
+        except (OSError, ValueError) as exc:
+            result["error"] = getattr(exc, "strerror", None) or str(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, result
 
 
 def _timed_out(exc, started, task):
@@ -306,26 +497,22 @@ def _task_cwd(agent, task):
 
 
 def _run_command(agent, task):
-    env = environment(agent)
+    env = task_environment(agent, task)
     env["A2A_TASK_ID"] = task["id"]
     env["A2A_SESSION_ID"] = task["sessionId"]
     try:
-        proc = subprocess.Popen(
-            [agent["command"], *agent["args"], task["input"]],
-            cwd=_task_cwd(agent, task), env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        proc = _spawn(agent, task, [agent["command"], *agent["args"], task["input"]], env,
+                      subprocess.DEVNULL)
     except OSError as exc:
         _finish(task, "failed", error=exc.strerror or str(exc))
         return
-    with LOCK:
-        task["_proc"] = proc
+    if proc is None:
+        return
     capture = _Capture(MAX_OUTPUT)
     out, err = [], []
     readers = (_pump(proc.stdout, out, capture), _pump(proc.stderr, err, capture))
     timed_out = _wait(proc, task)
-    for reader in readers:
-        reader.join()
+    _collect(proc, readers)
     output = b"".join(out).decode("utf-8", "replace").strip()
     error = b"".join(err).decode("utf-8", "replace").strip()
     if timed_out:
@@ -339,30 +526,21 @@ def _run_command(agent, task):
 
 
 def _run_stdio(agent, task):
-    env = environment(agent)
+    env = task_environment(agent, task)
     try:
-        proc = subprocess.Popen(
-            [agent["command"], *agent["args"]],
-            cwd=_task_cwd(agent, task), env=env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        proc = _spawn(agent, task, [agent["command"], *agent["args"]], env, subprocess.PIPE)
     except OSError as exc:
         _finish(task, "failed", error=exc.strerror or str(exc))
         return
-    with LOCK:
-        task["_proc"] = proc
+    if proc is None:
+        return
     capture = _Capture(MAX_OUTPUT)
     out, err = [], []
     readers = (_pump(proc.stdout, out, capture), _pump(proc.stderr, err, capture))
-    stdin_error = None
-    try:
-        proc.stdin.write((json.dumps(adapter_request(task)) + "\n").encode("utf-8"))
-        proc.stdin.close()
-    except (BrokenPipeError, OSError) as exc:
-        stdin_error = exc.strerror or str(exc)
+    writer, fed = _feed(proc, (json.dumps(adapter_request(task)) + "\n").encode("utf-8"))
     timed_out = _wait(proc, task)
-    for reader in readers:
-        reader.join()
+    _collect(proc, (writer, *readers))
+    stdin_error = fed.get("error")
     stdout = b"".join(out).decode("utf-8", "replace")
     stderr = b"".join(err).decode("utf-8", "replace")
     if timed_out:
@@ -397,23 +575,73 @@ def _run_stdio(agent, task):
     _finish(task, response["status"], output=response.get("output", ""), error=response.get("error"))
 
 
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    """Never follow adapter redirects: the prompt must only reach the configured URL."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _read_body(stream, task):
+    """Read at most MAX_OUTPUT + 1 bytes, giving up at the task deadline.
+
+    The socket timeout alone bounds each recv, so an adapter that drip-feeds bytes could
+    otherwise hold the task (and its active slot) far past its timeout. The loop ends when
+    read1 returns nothing (Content-Length consumed, chunked terminator, or EOF) or the
+    response reports that it is closed.
+    """
+    # ``stream`` is an HTTPResponse, or an HTTPError wrapping one in ``fp``; the socket
+    # timeout must be set on the response that owns the connection.
+    response = stream if isinstance(stream, http.client.HTTPResponse) else getattr(stream, "fp", None)
+    if not isinstance(response, http.client.HTTPResponse):
+        response = None
+    read = response.read1 if response is not None else stream.read
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    closed = response.isclosed if response is not None else (lambda: False)
+    chunks, size = [], 0
+    while size <= MAX_OUTPUT and not closed():
+        remaining = _remaining(task)
+        if remaining <= 0:
+            raise TimeoutError(f"Agent exceeded {task['timeoutMs']} ms")
+        if sock is not None:
+            sock.settimeout(remaining)
+        chunk = read(min(65536, MAX_OUTPUT + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
+
+
 def _run_http(agent, task):
     from urllib import error as urlerror
-    from urllib import request as urlrequest
 
+    opener = urlrequest.build_opener(_NoRedirect)
     payload = json.dumps(adapter_request(task)).encode("utf-8")
     request = urlrequest.Request(agent["url"], data=payload, method="POST",
                                  headers={"content-type": "application/json"})
     started = time.monotonic()
     try:
-        with urlrequest.urlopen(request, timeout=task["timeoutMs"] / 1000.0) as response:
+        with opener.open(request, timeout=max(_remaining(task), 0.001)) as response:
             content_type = (response.headers.get("content-type") or "").lower()
-            raw = response.read(MAX_OUTPUT + 1)
+            raw = _read_body(response, task)
             code = response.status
             ok = 200 <= code < 300
     except urlerror.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            location = exc.headers.get("location") if exc.headers else None
+            _finish(task, "failed", error=f"HTTP adapter redirected ({exc.code} to {location}); "
+                                          "redirects are not followed")
+            exc.close()
+            return
         content_type = ((exc.headers.get("content-type") if exc.headers else "") or "").lower()
-        raw = exc.read(MAX_OUTPUT + 1)
+        try:
+            raw = _read_body(exc, task)
+        except (OSError, socket.timeout) as read_error:
+            _finish(task, "timed_out" if _remaining(task) <= 0 else "failed", error=str(read_error))
+            return
+        finally:
+            exc.close()  # read1 never closes a fully read response; release the connection
         code = exc.code
         ok = False
     except (urlerror.URLError, socket.timeout, TimeoutError) as exc:
@@ -460,6 +688,9 @@ def _run_http(agent, task):
 
 
 def _worker(agent, task):
+    # One deadline covers process startup, request delivery, execution, and reading an HTTP
+    # adapter's response; a spawned adapter's output is collected under a short post-exit grace.
+    task["_deadline"] = time.monotonic() + task["timeoutMs"] / 1000.0
     try:
         kind = agent["type"]
         if kind == "command":
@@ -470,20 +701,32 @@ def _worker(agent, task):
             _run_http(agent, task)
     except Exception as exc:  # noqa: BLE001 - surface any adapter failure on the task
         _finish(task, "failed", error=str(exc))
+    finally:
+        _release(task)
 
 
 def _finish(task, status, **fields):
-    global ACTIVE
     with LOCK:
         if task["status"] not in ("queued", "running"):
             return
         task["status"] = status
         task["finishedAt"] = now_iso()
+        task["_finished"] = time.monotonic()
         task.update({key: value for key, value in fields.items() if value is not None})
+        TASK_CONDITION.notify_all()
+
+
+def _release(task):
+    """Free the task's active slot once its worker, and so its adapter process, is done.
+
+    A cancelled task keeps its slot until the process exits (or the HTTP request returns), so
+    the relay never runs more than MAX_ACTIVE adapters at once.
+    """
+    global ACTIVE
+    with LOCK:
         task.pop("_proc", None)
         if task.pop("_counted", False):
             ACTIVE -= 1
-        TASK_CONDITION.notify_all()
     _drain()
 
 
@@ -498,14 +741,42 @@ def _drain():
             if agent is None:
                 task["status"] = "failed"
                 task["finishedAt"] = now_iso()
+                task["_finished"] = time.monotonic()
                 task["error"] = "unknown_agent"
                 TASK_CONDITION.notify_all()
                 continue
             ACTIVE += 1
             task["_counted"] = True
+            task["_adapter"] = agent["type"]
             task["status"] = "running"
             task["startedAt"] = now_iso()
             threading.Thread(target=_worker, args=(agent, task), daemon=True).start()
+
+
+def _forget(task):
+    del TASKS[task["id"]]
+    request_key = task.get("_request_key")
+    if request_key:
+        REQUEST_IDS.pop(request_key, None)
+    TASK_CONDITION.notify_all()
+
+
+def _purge_expired():
+    """Drop terminal tasks that finished more than TASK_RETENTION_MS ago. Call with LOCK held."""
+    if not TASK_RETENTION_MS:
+        return
+    cutoff = time.monotonic() - TASK_RETENTION_MS / 1000.0
+    for task in [task for task in TASKS.values() if task.get("_finished", cutoff + 1) <= cutoff]:
+        _forget(task)
+
+
+def _purge_periodically():
+    """Enforce retention on an idle relay too, not only when a request arrives."""
+    interval = min(TASK_RETENTION_MS / 1000.0, 60.0)
+    while True:
+        time.sleep(interval)
+        with LOCK:
+            _purge_expired()
 
 
 def _make_room():
@@ -515,11 +786,7 @@ def _make_room():
                      if task["status"] not in ("queued", "running")), None)
     if terminal is None:
         return False
-    del TASKS[terminal["id"]]
-    request_key = terminal.get("_request_key")
-    if request_key:
-        REQUEST_IDS.pop(request_key, None)
-    TASK_CONDITION.notify_all()
+    _forget(terminal)
     return True
 
 
@@ -527,6 +794,10 @@ def _terminate_task(task):
     proc = task.get("_proc")
     if proc is not None:
         _terminate(proc)
+
+
+def _cancellation_mode(agent_type):
+    return "request_only" if agent_type == "http" else "process_signal"
 
 
 def _valid(value, limit=128):
@@ -570,7 +841,10 @@ def _limits():
         "maxCommandInputBytes": MAX_COMMAND_INPUT,
         "maxOutputBytes": MAX_OUTPUT,
         "maxTasks": MAX_TASKS,
+        "taskRetentionMs": TASK_RETENTION_MS or None,
         "maxActive": MAX_ACTIVE,
+        "maxDelegationDepth": MAX_DELEGATION_DEPTH,
+        "maxDelegatedTasks": MAX_DELEGATED_TASKS,
     }
 
 
@@ -584,7 +858,7 @@ def _agent_listing():
             "timeoutMs": agent.get("timeoutMs") or TIMEOUT_MS,
             "capabilities": {
                 **agent["capabilities"],
-                "cancellation": "request_only" if agent["type"] == "http" else "process_signal",
+                "cancellation": _cancellation_mode(agent["type"]),
             },
         }
         if agent.get("description") is not None:
@@ -593,8 +867,33 @@ def _agent_listing():
             entry["cwd"] = agent["cwd"]
         if agent.get("allowedRoots") is not None:
             entry["allowedRoots"] = agent["allowedRoots"]
+        if agent.get("delegateTo") is not None:
+            entry["delegateTo"] = agent["delegateTo"]
         listing.append(entry)
     return listing
+
+
+def _delegation_error(parent, agent):
+    """Return (status, error, message) when the parent task may not delegate to ``agent``."""
+    parent_agent = AGENTS.get(parent["agentId"])
+    if parent_agent is None:
+        # Fail closed: without the parent's registry entry its delegateTo cannot be checked.
+        return 403, "delegation_not_allowed", (
+            f"agent {parent['agentId']} is no longer registered, so it may not delegate")
+    allowed = parent_agent.get("delegateTo")
+    if allowed is not None and agent["id"] not in allowed:
+        return 403, "delegation_not_allowed", (
+            f"agent {parent['agentId']} may not delegate to {agent['id']} (see its delegateTo in GET /v1/agents)")
+    if agent["id"] in parent["_lineage"]:
+        return 409, "delegation_cycle", (
+            f"{agent['id']} is already in this delegation chain: {' > '.join(parent['_lineage'])}")
+    if len(parent["_lineage"]) > MAX_DELEGATION_DEPTH:
+        return 409, "delegation_depth_exceeded", (
+            f"delegation depth would exceed AGENT_RELAY_MAX_DELEGATION_DEPTH ({MAX_DELEGATION_DEPTH})")
+    if parent["_root"]["_delegated"] >= MAX_DELEGATED_TASKS:
+        return 429, "delegation_budget_exhausted", (
+            f"this task tree already created AGENT_RELAY_MAX_DELEGATED_TASKS ({MAX_DELEGATED_TASKS}) tasks")
+    return None
 
 
 def _list_tasks(session_id=None, status=None, limit=100):
@@ -628,10 +927,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # silence per-request logging
         pass
 
-    def _json(self, status, value):
+    def _json(self, status, value, headers=None):
         body = json.dumps(value).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        if status >= 400:
+            # An error may leave the request body unread; never parse it as a next request.
+            self.close_connection = True
+            self.send_header("connection", "close")
+        for name, header in (headers or {}).items():
+            self.send_header(name, header)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -656,12 +961,27 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            origin = self.headers.get("origin")
+            if origin is not None and origin not in ALLOWED_ORIGINS:
+                # Browsers send Origin on cross-site requests; CLI and MCP clients do not.
+                # The body is left unread, so drop the connection rather than parse it as a request.
+                self.close_connection = True
+                return self._json(403, {"error": "origin_not_allowed"})
+            if path.startswith("/v1/") and not self._authorized():
+                self.close_connection = True
+                return self._json(401, {"error": "unauthorized",
+                                        "message": "send Authorization: Bearer <token>"},
+                                  headers={"www-authenticate": "Bearer"})
+            if path.startswith("/v1/"):
+                with LOCK:
+                    _purge_expired()
             if path == "/healthz":
                 if method == "GET":
                     with LOCK:
                         active, queued = ACTIVE, sum(
                             1 for task in QUEUE if task["status"] == "queued")
                     return self._json(200, {"ok": True, "agents": len(AGENTS),
+                                            "registry": REGISTRY_PATH,
                                             "tasks": len(TASKS), "active": active,
                                             "queued": queued, "limits": _limits()})
                 return self._json(405, {"error": "method_not_allowed"})
@@ -691,8 +1011,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 - never leak a stack trace to the client
             self._json(500, {"error": "request_failed", "message": str(exc)})
 
+    def _authorized(self):
+        if not TOKEN:
+            return False  # never authorize against an unset token
+        header = self.headers.get("authorization") or ""
+        scheme, _, supplied = header.partition(" ")
+        return scheme.lower() == "bearer" and hmac.compare_digest(
+            supplied.strip().encode("utf-8"), TOKEN.encode("utf-8"))
+
     def _submit(self):
-        global ACTIVE
+        content_type = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            self.close_connection = True
+            return self._json(415, {"error": "unsupported_media_type",
+                                    "message": "content-type must be application/json"})
         length_header = self.headers.get("content-length")
         length = int(length_header) if length_header and length_header.isdigit() else 0
         if length > MAX_BODY:
@@ -724,6 +1056,9 @@ class Handler(BaseHTTPRequestHandler):
         timeout_ms = request.get("timeoutMs")
         if timeout_ms is not None and not _is_positive_int(timeout_ms):
             return self._json(400, {"error": "invalid_timeout"})
+        parent_id = request.get("parentTaskId")
+        if parent_id is not None and not _valid(parent_id):
+            return self._json(400, {"error": "invalid_parent_task_id"})
         task_cwd, cwd_error = _resolve_task_cwd(agent, request.get("cwd"))
         if cwd_error:
             message = (f"cwd is not inside an allowed root for agent {agent['id']}"
@@ -749,9 +1084,18 @@ class Handler(BaseHTTPRequestHandler):
                 if (prior["input"] != input_text
                         or prior.get("_requested_session_id") != session_id
                         or prior.get("_requested_timeout_ms") != timeout_ms
-                        or prior.get("_requested_cwd") != request.get("cwd")):
+                        or prior.get("_requested_cwd") != request.get("cwd")
+                        or prior.get("parentTaskId") != parent_id):
                     return self._json(409, {"error": "idempotency_conflict"})
                 return self._json(200, visible(prior))
+            parent = TASKS.get(parent_id) if parent_id is not None else None
+            if parent_id is not None:
+                if parent is None:
+                    return self._json(400, {"error": "unknown_parent_task"})
+                refused = _delegation_error(parent, agent)
+                if refused:
+                    status, error, message = refused
+                    return self._json(status, {"error": error, "message": message})
             if not _make_room():
                 return self._json(503, {"error": "task_capacity_reached"})
             task = {
@@ -763,6 +1107,13 @@ class Handler(BaseHTTPRequestHandler):
                 "createdAt": now_iso(),
                 "timeoutMs": task_timeout,
             }
+            if parent is None:
+                task.update(depth=0, _lineage=[agent["id"]], _delegated=0)
+                task["_root"] = task
+            else:
+                task.update(parentTaskId=parent["id"], depth=parent["depth"] + 1,
+                            _lineage=parent["_lineage"] + [agent["id"]], _root=parent["_root"])
+                parent["_root"]["_delegated"] += 1
             if task_cwd:
                 task["cwd"] = task_cwd
             if request_key:
@@ -820,15 +1171,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "agents": len(AGENTS), "registry": str(path)})
 
     def _cancel(self, task):
-        global ACTIVE
         if task is None:
             return self._json(404, {"error": "unknown_task"})
         with LOCK:
             if task["status"] in ("queued", "running"):
                 if task["status"] == "running":
+                    # The worker keeps the active slot until the adapter has really stopped.
                     _terminate_task(task)
-                    if task.pop("_counted", False):
-                        ACTIVE -= 1
+                    task["cancellation"] = _cancellation_mode(task.get("_adapter"))
                 else:
                     try:
                         QUEUE.remove(task)
@@ -836,7 +1186,7 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 task["status"] = "cancelled"
                 task["finishedAt"] = now_iso()
-                task.pop("_proc", None)
+                task["_finished"] = time.monotonic()
                 TASK_CONDITION.notify_all()
         self._json(200, visible(task))
         _drain()
@@ -868,13 +1218,21 @@ def _reload_signal(_signum, _frame):
 
 
 def main():
-    global AGENTS
+    global AGENTS, REGISTRY_PATH, TOKEN
+    if not is_loopback(HOST) and not ALLOW_NON_LOOPBACK:
+        print(f"error: refusing to listen on non-loopback address {HOST}: the relay has no TLS and "
+              "is a single-user local service. Put it behind an authenticated HTTPS proxy and set "
+              "AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK=1 to accept the risk.", file=sys.stderr)
+        return 1
     path = config_path()
     try:
         AGENTS = load_registry(str(path))
+        REGISTRY_PATH = str(path)
     except (OSError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
+    if TASK_RETENTION_MS:
+        threading.Thread(target=_purge_periodically, daemon=True).start()
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     if hasattr(signal, "SIGHUP"):
@@ -889,6 +1247,15 @@ def main():
         print(f"error: {exc}", file=sys.stderr)
         return 1
     server.daemon_threads = True
+    try:
+        TOKEN = load_token()
+    except (OSError, ValueError) as exc:
+        server.server_close()
+        print(f"error: cannot load the API token: {exc}", file=sys.stderr)
+        return 1
+    if not is_loopback(HOST):
+        print(f"WARNING: listening on non-loopback address {HOST} without TLS; anyone who can "
+              "reach it and obtain the token can run your coding agents.", file=sys.stderr, flush=True)
     print(f"agent-relay listening at http://{HOST}:{PORT} (registry: {path})", flush=True)
     try:
         server.serve_forever()

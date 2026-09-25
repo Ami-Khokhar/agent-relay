@@ -39,8 +39,11 @@ Validation rules enforced by the relay (a violation fails the task):
 
 A `stdio` adapter must write **only** the result to stdout and send diagnostics to stderr.
 An `http` adapter accepts a `POST` and returns the result with
-`content-type: application/json`. For compatibility, an HTTP response without a JSON
-content type is treated as raw success text when its status is 2xx.
+`content-type: application/json`. It receives the complete prompt, so use `https://` for a
+remote adapter (cleartext `http://` to a non-loopback host needs `"allowInsecureHttp": true`
+in its registry entry). The relay does not follow redirects: a `3xx` fails the task.
+For compatibility, an HTTP response without a JSON content type is treated as raw success
+text when its status is 2xx.
 
 ## Minimal stdio adapter template
 
@@ -93,6 +96,8 @@ Command and stdio children receive only:
 
 - `A2A_ADAPTER_PROTOCOL=relay.adapter/v1`
 - `A2A_TASK_ID`, `A2A_SESSION_ID` (command adapters; stdio adapters get them in the request)
+- `AGENT_RELAY_PARENT_TASK_ID` — the child's own task ID (command and stdio adapters); the
+  MCP `delegate` tool forwards it as `parentTaskId` so the relay applies its delegation policy
 
 List a credential's variable name in `inheritEnv` to pass it through:
 
@@ -104,9 +109,12 @@ Never inline secret values in the registry file.
 
 ## Cancellation
 
-- `command` / `stdio`: the relay sends `SIGTERM`, then `SIGKILL` after ~1s.
-- `http`: the relay aborts the request; work already accepted by the remote service may
-  continue. Adapters should treat client disconnect as a cancel signal where possible.
+- `command` / `stdio`: the relay sends `SIGTERM`, then `SIGKILL` after ~1s, to the
+  adapter's process group, so processes it started stop too (Windows: direct process only).
+  After the adapter itself has exited and been reaped, the group is signalled again only where
+  the leader's identity can be checked (Linux); elsewhere leftover descendants are not.
+- `http`: `request_only`. The relay marks the task cancelled and discards the result; it does
+  not abort the in-flight request or notify the service, so the work may continue.
 
 On relay `SIGTERM`/`SIGINT`, running adapters are cancelled the same way before exit.
 

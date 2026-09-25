@@ -50,8 +50,10 @@ A produces, B reviews, C fixes. Pass each output into the next `input`.
 2. `outB = delegate(B, "Review this and list concrete problems:\n" + outA.output)` → `wait_task`
 3. `outC = delegate(C, "Apply these fixes:\n" + outB.output)` → `wait_task`
 
-Give the whole chain one `sessionId` for traceability. If an agent is itself wired to the
-relay as an MCP client, it can delegate further on its own — the relay does not need to know.
+Give the whole chain one `sessionId` for traceability. If an agent the relay started is
+itself wired to the relay as an MCP client, it can delegate further: its `delegate` calls carry
+the relay's lineage (`parentTaskId`), so the relay applies its delegation policy (`delegateTo`,
+no cycles, depth and task budgets).
 
 ## 4. Review loop
 
@@ -88,6 +90,11 @@ use `delegate` with `waitMs` or `wait_task` to block until the result is ready.
 - `A2A_RELAY_MAX_OUTPUT_BYTES`: raise if agents return large reports (default 256 KiB).
 - `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`: raise only for `command` adapters, and stay well
   under OS argument limits; prefer `stdio` for large prompts.
+- `AGENT_RELAY_MAX_DELEGATION_DEPTH` (default 2) and `AGENT_RELAY_MAX_DELEGATED_TASKS`
+  (default 20): cap delegation by agents the relay started. Raise the task budget when a
+  spawned orchestrator fans out to more than 20 tasks. A task whose agent is waiting on a
+  delegated child still holds an `A2A_RELAY_MAX_ACTIVE` slot, so nested or fan-out
+  orchestration from a relay task needs a higher `A2A_RELAY_MAX_ACTIVE` too.
 
 ## Presenting results
 

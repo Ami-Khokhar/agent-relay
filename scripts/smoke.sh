@@ -5,6 +5,8 @@
 #
 # Env:
 #   A2A_RELAY_URL / AGENT_RELAY_URL   relay base URL (default http://127.0.0.1:43124)
+#   AGENT_RELAY_TOKEN                 API token (default: ~/.config/agent-relay/token,
+#                                     or AGENT_RELAY_TOKEN_FILE)
 set -euo pipefail
 
 AGENT_ID="${1:-}"
@@ -22,13 +24,26 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+TOKEN="${AGENT_RELAY_TOKEN:-${A2A_RELAY_TOKEN:-}}"
+if [ -z "$TOKEN" ]; then
+  TOKEN_FILE="${AGENT_RELAY_TOKEN_FILE:-${A2A_RELAY_TOKEN_FILE:-$HOME/.config/agent-relay/token}}"
+  TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+fi
+if [ -z "$TOKEN" ]; then
+  echo "error: no API token; start the relay once or set AGENT_RELAY_TOKEN" >&2
+  exit 1
+fi
+case "$TOKEN" in *[!A-Za-z0-9_-]*) echo "error: the API token may only contain letters, digits, '-' and '_'" >&2; exit 1;; esac
+# Pass the token through a curl config on a file descriptor so it never appears in `ps`.
+relay_curl() { curl -sS -K <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") "$@"; }
+
 REQUEST_ID="smoke-$(date +%s)-$$"
 
 echo "relay:    $RELAY_URL"
 echo "agent:    $AGENT_ID"
 echo "probe:    Reply with exactly PONG"
 
-SUBMITTED="$(curl -sS "$RELAY_URL/v1/tasks" \
+SUBMITTED="$(relay_curl "$RELAY_URL/v1/tasks" \
   -H 'content-type: application/json' \
   -d "{\"agentId\":\"$AGENT_ID\",\"requestId\":\"$REQUEST_ID\",\"input\":\"Reply with exactly PONG\",\"timeoutMs\":$TIMEOUT_MS}")"
 
@@ -40,7 +55,7 @@ fi
 echo "task:     $TASK_ID"
 
 # Long-poll until the task is terminal (or the relay's max wait elapses), then print it.
-RESULT="$(curl -sS "$RELAY_URL/v1/tasks/$TASK_ID?waitMs=$TIMEOUT_MS")"
+RESULT="$(relay_curl "$RELAY_URL/v1/tasks/$TASK_ID?waitMs=$TIMEOUT_MS")"
 
 printf '%s' "$RESULT" | python3 -c '
 import json, sys

@@ -338,6 +338,15 @@ class RelayTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_healthz_reports_the_registry_file_path(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(input())"]})
+        try:
+            status, health = relay.request("GET", "/healthz")
+            self.assertEqual(status, 200)
+            self.assertEqual(health["registry"], relay.config)
+        finally:
+            relay.close()
+
     def test_reports_effective_limits_and_agent_timeouts(self):
         relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "print(1)"],
                        "timeoutMs": 60000}, env={"A2A_RELAY_MAX_ACTIVE": "2"})
