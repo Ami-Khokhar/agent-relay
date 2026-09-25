@@ -386,12 +386,11 @@ class RelayTests(unittest.TestCase):
 class DefaultConfigPathTests(unittest.TestCase):
     def test_warns_on_stderr_when_falling_back_to_checkout_registry(self):
         with tempfile.TemporaryDirectory() as home:
-            with mock.patch("pathlib.Path.home", return_value=Path(home)):
-                path = default_config_path()
             stderr = io.StringIO()
             with mock.patch("pathlib.Path.home", return_value=Path(home)), redirect_stderr(stderr):
                 path = default_config_path()
-            self.assertIn(str(path), stderr.getvalue())
+            self.assertEqual(path, Path(ROOT) / "config" / "agents.json")
+            self.assertIn(f"falling back to {path}", stderr.getvalue())
 
     def test_silent_when_user_registry_exists(self):
         with tempfile.TemporaryDirectory() as home:
