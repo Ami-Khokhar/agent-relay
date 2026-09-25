@@ -30,7 +30,7 @@ INHERITED_ENV = (
 )
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd"}
+TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd", "parentTaskId"}
 STATUSES = {"queued", "running", "completed", "failed", "timed_out", "cancelled"}
 # On POSIX each adapter runs in its own process group so cancellation reaches descendants.
 PROCESS_GROUPS = os.name == "posix"
@@ -94,6 +94,12 @@ MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
                                       "A2A_RELAY_TASK_RETENTION_MS")
+# Recursive delegation: how many levels below a root task, and how many tasks one root's tree
+# may create in total. 0 depth rejects every task that names a parentTaskId.
+MAX_DELEGATION_DEPTH = _non_negative_int(2, "AGENT_RELAY_MAX_DELEGATION_DEPTH",
+                                         "A2A_RELAY_MAX_DELEGATION_DEPTH")
+MAX_DELEGATED_TASKS = _positive_int(20, "AGENT_RELAY_MAX_DELEGATED_TASKS",
+                                    "A2A_RELAY_MAX_DELEGATED_TASKS")
 EXPLICIT_CONFIG = _env("AGENT_RELAY_AGENTS_FILE", "A2A_AGENTS_FILE")
 
 LOCK = threading.RLock()
@@ -173,6 +179,10 @@ def load_registry(path):
             url = raw.get("url")
             if not isinstance(url, str) or urlsplit(url).scheme not in ("http", "https"):
                 raise ValueError(f"Invalid HTTP agent: {agent_id}")
+        delegate_to = raw.get("delegateTo")
+        if delegate_to is not None and (not isinstance(delegate_to, list) or not all(
+                isinstance(item, str) for item in delegate_to)):
+            raise ValueError(f"Invalid delegateTo: {agent_id}")
         caps = raw.get("capabilities")
         if caps is not None and (not isinstance(caps, dict)
                                  or not all(isinstance(item, bool) for item in caps.values())):
@@ -211,6 +221,13 @@ def environment(agent):
             env[key] = os.environ[key]
     env.update(agent.get("env") or {})
     env["A2A_ADAPTER_PROTOCOL"] = ADAPTER_PROTOCOL
+    return env
+
+
+def task_environment(agent, task):
+    env = environment(agent)
+    # Lets the relay's MCP tools (or any client) attribute delegated work to this task.
+    env["AGENT_RELAY_PARENT_TASK_ID"] = task["id"]
     return env
 
 
@@ -416,7 +433,7 @@ def _task_cwd(agent, task):
 
 
 def _run_command(agent, task):
-    env = environment(agent)
+    env = task_environment(agent, task)
     env["A2A_TASK_ID"] = task["id"]
     env["A2A_SESSION_ID"] = task["sessionId"]
     try:
@@ -445,7 +462,7 @@ def _run_command(agent, task):
 
 
 def _run_stdio(agent, task):
-    env = environment(agent)
+    env = task_environment(agent, task)
     try:
         proc = _spawn(agent, task, [agent["command"], *agent["args"]], env, subprocess.PIPE)
     except OSError as exc:
@@ -746,6 +763,8 @@ def _limits():
         "maxTasks": MAX_TASKS,
         "taskRetentionMs": TASK_RETENTION_MS or None,
         "maxActive": MAX_ACTIVE,
+        "maxDelegationDepth": MAX_DELEGATION_DEPTH,
+        "maxDelegatedTasks": MAX_DELEGATED_TASKS,
     }
 
 
@@ -768,8 +787,33 @@ def _agent_listing():
             entry["cwd"] = agent["cwd"]
         if agent.get("allowedRoots") is not None:
             entry["allowedRoots"] = agent["allowedRoots"]
+        if agent.get("delegateTo") is not None:
+            entry["delegateTo"] = agent["delegateTo"]
         listing.append(entry)
     return listing
+
+
+def _delegation_error(parent, agent):
+    """Return (status, error, message) when the parent task may not delegate to ``agent``."""
+    parent_agent = AGENTS.get(parent["agentId"])
+    if parent_agent is None:
+        # Fail closed: without the parent's registry entry its delegateTo cannot be checked.
+        return 403, "delegation_not_allowed", (
+            f"agent {parent['agentId']} is no longer registered, so it may not delegate")
+    allowed = parent_agent.get("delegateTo")
+    if allowed is not None and agent["id"] not in allowed:
+        return 403, "delegation_not_allowed", (
+            f"agent {parent['agentId']} may not delegate to {agent['id']} (see its delegateTo in GET /v1/agents)")
+    if agent["id"] in parent["_lineage"]:
+        return 409, "delegation_cycle", (
+            f"{agent['id']} is already in this delegation chain: {' > '.join(parent['_lineage'])}")
+    if len(parent["_lineage"]) > MAX_DELEGATION_DEPTH:
+        return 409, "delegation_depth_exceeded", (
+            f"delegation depth would exceed AGENT_RELAY_MAX_DELEGATION_DEPTH ({MAX_DELEGATION_DEPTH})")
+    if parent["_root"]["_delegated"] >= MAX_DELEGATED_TASKS:
+        return 429, "delegation_budget_exhausted", (
+            f"this task tree already created AGENT_RELAY_MAX_DELEGATED_TASKS ({MAX_DELEGATED_TASKS}) tasks")
+    return None
 
 
 def _list_tasks(session_id=None, status=None, limit=100):
@@ -903,6 +947,9 @@ class Handler(BaseHTTPRequestHandler):
         timeout_ms = request.get("timeoutMs")
         if timeout_ms is not None and not _is_positive_int(timeout_ms):
             return self._json(400, {"error": "invalid_timeout"})
+        parent_id = request.get("parentTaskId")
+        if parent_id is not None and not _valid(parent_id):
+            return self._json(400, {"error": "invalid_parent_task_id"})
         task_cwd, cwd_error = _resolve_task_cwd(agent, request.get("cwd"))
         if cwd_error:
             message = (f"cwd is not inside an allowed root for agent {agent['id']}"
@@ -928,9 +975,18 @@ class Handler(BaseHTTPRequestHandler):
                 if (prior["input"] != input_text
                         or prior.get("_requested_session_id") != session_id
                         or prior.get("_requested_timeout_ms") != timeout_ms
-                        or prior.get("_requested_cwd") != request.get("cwd")):
+                        or prior.get("_requested_cwd") != request.get("cwd")
+                        or prior.get("parentTaskId") != parent_id):
                     return self._json(409, {"error": "idempotency_conflict"})
                 return self._json(200, visible(prior))
+            parent = TASKS.get(parent_id) if parent_id is not None else None
+            if parent_id is not None:
+                if parent is None:
+                    return self._json(400, {"error": "unknown_parent_task"})
+                refused = _delegation_error(parent, agent)
+                if refused:
+                    status, error, message = refused
+                    return self._json(status, {"error": error, "message": message})
             if not _make_room():
                 return self._json(503, {"error": "task_capacity_reached"})
             task = {
@@ -942,6 +998,13 @@ class Handler(BaseHTTPRequestHandler):
                 "createdAt": now_iso(),
                 "timeoutMs": task_timeout,
             }
+            if parent is None:
+                task.update(depth=0, _lineage=[agent["id"]], _delegated=0)
+                task["_root"] = task
+            else:
+                task.update(parentTaskId=parent["id"], depth=parent["depth"] + 1,
+                            _lineage=parent["_lineage"] + [agent["id"]], _root=parent["_root"])
+                parent["_root"]["_delegated"] += 1
             if task_cwd:
                 task["cwd"] = task_cwd
             if request_key:
