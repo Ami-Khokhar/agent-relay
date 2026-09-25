@@ -10,7 +10,8 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
 { "ok": true, "agents": 3, "tasks": 0, "active": 0, "queued": 0,
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
-              "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4 } }
+              "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4,
+              "taskRetentionMs": null } }
 ```
 
 `maxTimeoutMs` is `null` when no hard cap is configured. `active` counts running tasks
