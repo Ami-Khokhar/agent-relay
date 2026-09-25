@@ -128,5 +128,6 @@ Register the MCP server (absolute paths; HTTP starts on demand):
 
 Verify:
   curl -sS http://127.0.0.1:43124/healthz
+  curl -sS -H "authorization: Bearer \$(cat ~/.config/agent-relay/token)" http://127.0.0.1:43124/v1/agents
   bash $SRC/scripts/smoke.sh <agentId>
 EOF

@@ -2,6 +2,13 @@
 
 The HTTP service is the source of truth. MCP tools are a thin proxy over it.
 
+Every `/v1/` route requires `Authorization: Bearer <token>`. The token is
+`AGENT_RELAY_TOKEN`, else the file `~/.config/agent-relay/token` (override with
+`AGENT_RELAY_TOKEN_FILE`), which the relay creates with mode `0600` on first start. Requests
+carrying an `Origin` header are refused unless that origin is listed in
+`AGENT_RELAY_ALLOWED_ORIGINS` (meant for non-browser clients; the relay sends no CORS
+headers). Error responses close the connection. `GET /healthz` needs no token.
+
 ## HTTP endpoints
 
 ### `GET /healthz`
@@ -93,8 +100,8 @@ slot until the process exits or the request returns. Terminal tasks are returned
 
 ### `POST /v1/admin/reload`
 
-Reloads the registry from disk without dropping in-memory tasks. Accepted only from
-loopback (`403 forbidden` otherwise). Returns `{ "ok": true, "agents": n, "registry": "..." }`.
+Reloads the registry from disk without dropping in-memory tasks. Requires the token and is
+accepted only from loopback (`403 forbidden` otherwise). Returns `{ "ok": true, "agents": n, "registry": "..." }`.
 An invalid registry returns `400 configuration_error` and keeps the running registry.
 
 `SIGHUP` performs the same reload.
@@ -108,11 +115,13 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 | Status | `error` | Meaning |
 | --- | --- | --- |
 | 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_wait`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
-| 403 | `forbidden`, `delegation_not_allowed` | Admin route called from a non-loopback address; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
+| 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route. |
+| 403 | `forbidden`, `origin_not_allowed`, `delegation_not_allowed` | Admin route called from a non-loopback address; request from a browser origin not in `AGENT_RELAY_ALLOWED_ORIGINS`; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
 | 404 | `unknown_agent`, `unknown_task`, `not_found` | Missing agent/task/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
 | 409 | `idempotency_conflict`, `delegation_cycle`, `delegation_depth_exceeded` | `requestId` reused with different fields; target already in the delegation chain; chain too deep. |
 | 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
+| 415 | `unsupported_media_type` | `POST /v1/tasks` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
 | 503 | `task_capacity_reached` | Store full of non-terminal tasks. |

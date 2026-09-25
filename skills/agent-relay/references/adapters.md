@@ -39,8 +39,11 @@ Validation rules enforced by the relay (a violation fails the task):
 
 A `stdio` adapter must write **only** the result to stdout and send diagnostics to stderr.
 An `http` adapter accepts a `POST` and returns the result with
-`content-type: application/json`. For compatibility, an HTTP response without a JSON
-content type is treated as raw success text when its status is 2xx.
+`content-type: application/json`. It receives the complete prompt, so use `https://` for a
+remote adapter (cleartext `http://` to a non-loopback host needs `"allowInsecureHttp": true`
+in its registry entry). The relay does not follow redirects: a `3xx` fails the task.
+For compatibility, an HTTP response without a JSON content type is treated as raw success
+text when its status is 2xx.
 
 ## Minimal stdio adapter template
 
