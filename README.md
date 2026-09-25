@@ -142,7 +142,7 @@ An agent the relay started can delegate further. The relay supports that under a
 - A target already in the chain (`a > b > a`, or `a > a`) is refused with `409 delegation_cycle`.
 - `AGENT_RELAY_MAX_DELEGATION_DEPTH` (default `2`; `0` forbids delegation) caps levels below the root task (`409 delegation_depth_exceeded`), and `AGENT_RELAY_MAX_DELEGATED_TASKS` (default `20`) caps the tasks one root's tree can create (`429 delegation_budget_exhausted`).
 
-The lineage is cooperative, not a sandbox: a child that can reach the relay and submits without `parentTaskId` starts a new root task outside these limits. If an agent must not delegate, do not configure the relay's MCP server or API access for it, and set `"delegateTo": []` as a second guard.
+The lineage is cooperative, not a sandbox: a child that can reach the relay chooses its own `parentTaskId`. Omitting it starts a new root task outside these limits, and naming another stored task (task IDs are visible through `GET /v1/tasks`) applies that task's `delegateTo` and depth instead. Against a hostile child these limits are advisory; they stop accidental loops and runaway fan-out. If an agent must not delegate, do not configure the relay's MCP server or API access for it, and set `"delegateTo": []` as a second guard.
 
 ## Scope and operation
 
