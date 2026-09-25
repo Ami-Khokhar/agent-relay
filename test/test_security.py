@@ -212,6 +212,41 @@ class ApiTokenTests(unittest.TestCase):
             stop_http_server(target)
 
 
+    def test_reload_accepts_any_loopback_client_address(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]})
+        try:
+            request = (b"POST /v1/admin/reload HTTP/1.1\r\nHost: x\r\nauthorization: Bearer %s\r\n"
+                       b"content-length: 0\r\n\r\n" % TOKEN.encode())
+            with socket.create_connection(("127.0.0.1", relay.port), timeout=3,
+                                          source_address=("127.0.0.2", 0)) as sock:
+                sock.sendall(request)
+                self.assertIn(b" 200 ", sock.recv(65536))
+        finally:
+            relay.close()
+
+    def test_is_loopback_accepts_ipv4_mapped_loopback_addresses(self):
+        for host in ("localhost", "127.0.0.2", "::1", "::ffff:127.0.0.2"):
+            self.assertTrue(server.is_loopback(host), host)
+        for host in ("::ffff:10.0.0.1", "10.0.0.1", "::", "example.com", ""):
+            self.assertFalse(server.is_loopback(host), host)
+
+    def test_smoke_script_uses_the_token_and_rejects_unsafe_ones(self):
+        relay = Relay({"id": "pong", "command": PYTHON, "args": ["-c", "print('PONG')"]})
+        try:
+            smoke = os.path.join(ROOT, "scripts", "smoke.sh")
+            env = {**os.environ, "AGENT_RELAY_URL": relay.base, "AGENT_RELAY_TOKEN": TOKEN}
+            done = subprocess.run(["bash", smoke, "pong", "5000"], env=env, capture_output=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn(b"status:   completed", done.stdout)
+            for bad in ('x"y', "abc\nurl = \"http://evil.example\""):
+                done = subprocess.run(["bash", smoke, "pong", "5000"], capture_output=True, timeout=30,
+                                      env={**env, "AGENT_RELAY_TOKEN": bad})
+                self.assertEqual(done.returncode, 1)
+                self.assertIn(b"may only contain letters, digits", done.stderr)
+        finally:
+            relay.close()
+
+
 class NetworkBoundaryTests(unittest.TestCase):
     def _start(self, host, extra=None):
         directory = tempfile.mkdtemp(prefix="a2a-bind-")
