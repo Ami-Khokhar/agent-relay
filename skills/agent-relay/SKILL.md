@@ -289,12 +289,14 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   store fills. `GET /v1/tasks?sessionId=...` lists what is still stored.
 - Edit the registry and reload without losing tasks: `POST /v1/admin/reload` (token,
   loopback only) or `kill -HUP <pid>`.
-- Limits (positive integers unless noted): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
+- Limits (positive integers unless noted; `0` is allowed where shown): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
   `A2A_RELAY_MAX_COMMAND_INPUT_BYTES` (64 KiB, command adapter only),
   `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (1000),
   `A2A_RELAY_MAX_ACTIVE` (4), `A2A_RELAY_MAX_WAIT_MS` (600000),
   `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap),
-  `AGENT_RELAY_TASK_RETENTION_MS` (0 = keep finished tasks until eviction or restart).
+  `AGENT_RELAY_TASK_RETENTION_MS` (0 = keep finished tasks until eviction or restart),
+  `AGENT_RELAY_MAX_DELEGATION_DEPTH` (2; 0 = spawned agents may not delegate),
+  `AGENT_RELAY_MAX_DELEGATED_TASKS` (20).
   Every variable also accepts an `AGENT_RELAY_*` spelling.
 - Cancellation of a spawned adapter signals its process group; cancellation of an HTTP
   adapter is `request_only`: the request is not aborted and the service may keep working.

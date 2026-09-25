@@ -92,7 +92,9 @@ use `delegate` with `waitMs` or `wait_task` to block until the result is ready.
   under OS argument limits; prefer `stdio` for large prompts.
 - `AGENT_RELAY_MAX_DELEGATION_DEPTH` (default 2) and `AGENT_RELAY_MAX_DELEGATED_TASKS`
   (default 20): cap delegation by agents the relay started. Raise the task budget when a
-  spawned orchestrator fans out to more than 20 tasks.
+  spawned orchestrator fans out to more than 20 tasks. A task whose agent is waiting on a
+  delegated child still holds an `A2A_RELAY_MAX_ACTIVE` slot, so nested or fan-out
+  orchestration from a relay task needs a higher `A2A_RELAY_MAX_ACTIVE` too.
 
 ## Presenting results
 

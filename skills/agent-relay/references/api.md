@@ -21,7 +21,8 @@ headers). Error responses close the connection. `GET /healthz` needs no token.
               "taskRetentionMs": null, "maxDelegationDepth": 2, "maxDelegatedTasks": 20 } }
 ```
 
-`maxTimeoutMs` is `null` when no hard cap is configured. `active` counts running tasks
+`maxTimeoutMs` is `null` when no hard cap is configured, and `taskRetentionMs` is `null` when
+no retention period is set. `active` counts running tasks
 and `queued` counts waiting tasks (the same distinction as the task statuses;
 `scripts/update.sh` defers the first restart while either is non-zero, and treats a relay
 that does not report them as busy on the first pass — a relay still unreadable on the
@@ -71,7 +72,9 @@ original task. Different fields with the same `requestId` return `409`.
 ### `GET /v1/tasks/:id`
 
 Returns the current task. Terminal tasks additionally include `startedAt`, `finishedAt`,
-and usually `output` / `error` / `outputTruncated`.
+and usually `output` / `error` / `outputTruncated`. When `AGENT_RELAY_TASK_RETENTION_MS` is
+set, a terminal task is dropped (and its `requestId` released) once that period has passed,
+so its ID then returns `404 unknown_task`.
 
 Add `?waitMs=<ms>` to long-poll: the server holds the request until the task is terminal or
 the wait elapses (maximum `A2A_RELAY_MAX_WAIT_MS`). An invalid value returns `400 invalid_wait`.
