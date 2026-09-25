@@ -23,6 +23,19 @@ import mcp_server
 import server
 
 
+def _exchange_until_close(test, port, request):
+    """Send raw bytes and read until the server closes; fail if it keeps the connection open."""
+    data = b""
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+        sock.sendall(request)
+        try:
+            for chunk in iter(lambda: sock.recv(65536), b""):
+                data += chunk
+        except socket.timeout:
+            test.fail("connection stayed open after an error response")
+    return data
+
+
 class ApiTokenTests(unittest.TestCase):
     def test_every_task_route_requires_the_token(self):
         relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]})
@@ -107,17 +120,7 @@ class ApiTokenTests(unittest.TestCase):
             smuggled = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n"
             request = (b"POST /v1/tasks HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n"
                        b"content-length: %d\r\n\r\n" % len(smuggled)) + smuggled
-            with socket.create_connection(("127.0.0.1", relay.port), timeout=3) as sock:
-                sock.sendall(request)
-                data = b""
-                try:
-                    while True:
-                        chunk = sock.recv(65536)
-                        if not chunk:
-                            break
-                        data += chunk
-                except socket.timeout:
-                    self.fail("connection stayed open after a 401")
+            data = _exchange_until_close(self, relay.port, request)
             self.assertIn(b" 401 ", data)
             self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
         finally:
@@ -155,17 +158,7 @@ class ApiTokenTests(unittest.TestCase):
             smuggled = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n"
             request = (b"PUT /v1/tasks HTTP/1.1\r\nHost: x\r\nauthorization: Bearer %s\r\n"
                        b"content-length: %d\r\n\r\n" % (TOKEN.encode(), len(smuggled))) + smuggled
-            with socket.create_connection(("127.0.0.1", relay.port), timeout=3) as sock:
-                sock.sendall(request)
-                data = b""
-                try:
-                    while True:
-                        chunk = sock.recv(65536)
-                        if not chunk:
-                            break
-                        data += chunk
-                except socket.timeout:
-                    self.fail("connection stayed open after a 405")
+            data = _exchange_until_close(self, relay.port, request)
             self.assertIn(b" 405 ", data)
             self.assertIn(b"connection: close", data.lower())
             self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
