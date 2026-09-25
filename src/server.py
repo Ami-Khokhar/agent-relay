@@ -319,8 +319,9 @@ def _signal(proc, force):
 def _terminate(proc):
     """SIGTERM the adapter's process group (or the process itself), then SIGKILL after 1 s.
 
-    The group is signalled even when the direct child has already exited, so descendants it
-    left behind are stopped too.
+    The group is signalled while the leader is unreaped. After it has been reaped the group is
+    signalled only where the leader's identity can still be checked (see _group_is_ours), so
+    descendants it left behind are stopped on Linux but not on other POSIX systems.
     """
     if not PROCESS_GROUPS and proc.poll() is not None:
         return

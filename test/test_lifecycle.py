@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -211,19 +210,26 @@ class LifecycleTests(unittest.TestCase):
             relay.close()
             stop_http_server(http_server)
 
-    @unittest.skipUnless(server.PROCESS_GROUPS, "process groups are POSIX-only")
-    def test_a_reaped_leaders_pid_held_by_a_foreign_group_is_not_signalled(self):
+    def _assert_foreign_group_survives(self, recorded):
         foreign = subprocess.Popen([PYTHON, "-c", "import time; time.sleep(30)"], start_new_session=True)
         self.addCleanup(foreign.wait)
         self.addCleanup(foreign.kill)
-        # A reaped adapter leader whose pid (and so group id) now belongs to another group:
-        # either the start time differs (Linux) or it cannot be checked at all.
-        for recorded in (b"not-the-foreign-start-time", None):
-            reaped = types.SimpleNamespace(pid=foreign.pid, returncode=0, relay_start_time=recorded)
-            server._signal(reaped, force=True)
-            server._signal(reaped, force=False)
-            time.sleep(0.2)
-            self.assertIsNone(foreign.poll(), f"foreign group was signalled (recorded={recorded!r})")
+        # A reaped adapter leader whose pid (and so group id) now belongs to another group.
+        reaped = types.SimpleNamespace(pid=foreign.pid, returncode=0, relay_start_time=recorded)
+        server._signal(reaped, force=True)
+        server._signal(reaped, force=False)
+        time.sleep(0.2)
+        self.assertIsNone(foreign.poll(), "a foreign process group was signalled")
+
+    @unittest.skipUnless(server.PROCESS_GROUPS, "process groups are POSIX-only")
+    def test_a_reaped_leaders_group_is_not_signalled_when_it_cannot_be_verified(self):
+        # No start time was recorded (no /proc, e.g. macOS): the relay cannot tell whose it is.
+        self._assert_foreign_group_survives(None)
+
+    @unittest.skipUnless(server.PROCESS_GROUPS and os.path.exists(f"/proc/{os.getpid()}/stat"),
+                         "needs /proc start times")
+    def test_a_reaped_leaders_pid_held_by_a_foreign_group_is_not_signalled(self):
+        self._assert_foreign_group_survives(b"not-the-foreign-start-time")
 
     @unittest.skipUnless(server.PROCESS_GROUPS and os.path.exists(f"/proc/{os.getpid()}/stat"),
                          "needs /proc start times")
@@ -236,7 +242,8 @@ class LifecycleTests(unittest.TestCase):
                                   env={**os.environ, "CHILD_PID": child_pid})
         leader.relay_start_time = server._start_time(leader.pid)
         leader.wait()
-        pid = int(open(child_pid).read())
+        with open(child_pid, encoding="utf-8") as handle:
+            pid = int(handle.read())
         server._signal(leader, force=True)
 
         def gone():
