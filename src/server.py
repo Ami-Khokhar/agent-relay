@@ -471,8 +471,9 @@ def _read_body(stream, task):
     read = getattr(source, "read1", None) or stream.read
     raw_io = getattr(getattr(source, "fp", None), "raw", None)
     sock = getattr(raw_io, "_sock", None)
+    closed = getattr(source, "isclosed", lambda: False)
     chunks, size = [], 0
-    while size <= MAX_OUTPUT:
+    while size <= MAX_OUTPUT and not closed():
         remaining = _remaining(task)
         if remaining <= 0:
             raise TimeoutError(f"Agent exceeded {task['timeoutMs']} ms")
