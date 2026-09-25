@@ -39,6 +39,20 @@ class DelegationPolicyTests(unittest.TestCase):
         self.assertEqual(submitted["depth"], 0)
         self.assertNotIn("parentTaskId", submitted)
 
+    def test_stdio_adapters_receive_their_task_id_for_lineage(self):
+        script = ("import json, os, sys; json.load(sys.stdin); print(json.dumps({'protocolVersion': "
+                  "'relay.adapter/v1', 'status': 'completed', "
+                  "'output': os.environ['AGENT_RELAY_PARENT_TASK_ID']}))")
+        relay = self.start({"id": "wrapped", "type": "stdio", "command": PYTHON, "args": ["-c", script]})
+        _, submitted = relay.submit(agentId="wrapped", input="x")
+        self.assertEqual(relay.wait_task(submitted["id"])["output"], submitted["id"])
+
+    def test_an_empty_delegate_to_list_forbids_delegation(self):
+        relay = self.start([agent("sealed", delegateTo=[]), agent("helper")])
+        _, root = relay.submit(agentId="sealed", input="x")
+        status, payload = self.delegate(relay, root, "helper")
+        self.assertEqual((status, payload["error"]), (403, "delegation_not_allowed"))
+
     def test_rejects_targets_outside_the_parent_agents_delegate_to_list(self):
         relay = self.start([agent("lead", delegateTo=["helper"]), agent("helper"), agent("other")])
         _, root = relay.submit(agentId="lead", input="plan")
