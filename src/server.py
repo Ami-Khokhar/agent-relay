@@ -603,6 +603,15 @@ def _purge_expired():
         _forget(task)
 
 
+def _purge_periodically():
+    """Enforce retention on an idle relay too, not only when a request arrives."""
+    interval = min(TASK_RETENTION_MS / 1000.0, 60.0)
+    while True:
+        time.sleep(interval)
+        with LOCK:
+            _purge_expired()
+
+
 def _make_room():
     if len(TASKS) < MAX_TASKS:
         return True
@@ -752,8 +761,9 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
-            with LOCK:
-                _purge_expired()
+            if path.startswith("/v1/"):
+                with LOCK:
+                    _purge_expired()
             if path == "/healthz":
                 if method == "GET":
                     with LOCK:
@@ -974,6 +984,8 @@ def main():
     except (OSError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
+    if TASK_RETENTION_MS:
+        threading.Thread(target=_purge_periodically, daemon=True).start()
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     if hasattr(signal, "SIGHUP"):

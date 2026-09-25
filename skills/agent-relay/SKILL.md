@@ -266,7 +266,9 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   exposes an unauthenticated service that can run your coding agents — never do it without
   an authenticated HTTPS boundary.
 - Every stored task keeps its full prompt, output, error, and cwd in memory, readable by any
-  API client, until restart, eviction, or `AGENT_RELAY_TASK_RETENTION_MS` after it finishes.
+  API client (including agents the relay started), until restart, eviction, or
+  `AGENT_RELAY_TASK_RETENTION_MS` after it finishes (checked per request and at least every
+  minute; expiry also releases the task's `requestId`).
   Agents run as the relay's OS user and can read that user's files; environment filtering
   is not a sandbox.
 - Tasks are in memory and disappear on restart; old terminal tasks are evicted when the
@@ -277,7 +279,8 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   `A2A_RELAY_MAX_COMMAND_INPUT_BYTES` (64 KiB, command adapter only),
   `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (1000),
   `A2A_RELAY_MAX_ACTIVE` (4), `A2A_RELAY_MAX_WAIT_MS` (600000),
-  `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap).
+  `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap),
+  `AGENT_RELAY_TASK_RETENTION_MS` (0 = keep finished tasks until eviction or restart).
   Every variable also accepts an `AGENT_RELAY_*` spelling.
 - Cancellation of a spawned adapter signals its process group; cancellation of an HTTP
   adapter is `request_only`: the request is not aborted and the service may keep working.

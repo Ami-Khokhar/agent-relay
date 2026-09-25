@@ -30,6 +30,20 @@ class RetentionTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_purges_expired_tasks_on_an_idle_relay(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('ok')"]},
+                      env={"AGENT_RELAY_TASK_RETENTION_MS": "300"})
+        try:
+            relay.run_task(agentId="echo", input="secret prompt")
+            # /healthz does not purge, so only the background sweep can empty the store.
+            self.assertEqual(relay.request("GET", "/healthz")[1]["tasks"], 1)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and relay.request("GET", "/healthz")[1]["tasks"]:
+                time.sleep(0.05)
+            self.assertEqual(relay.request("GET", "/healthz")[1]["tasks"], 0)
+        finally:
+            relay.close()
+
     def test_keeps_terminal_tasks_by_default(self):
         relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('ok')"]})
         try:
