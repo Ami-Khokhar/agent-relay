@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from relay_helpers import PYTHON, Relay, send_json, start_http_server, stop_http_server
+import server
 
 # Larger than any default pipe buffer (64 KiB on Linux, at most 64 KiB on macOS).
 LARGE_INPUT = "x" * 300_000
@@ -172,6 +176,60 @@ class LifecycleTests(unittest.TestCase):
         finally:
             relay.close()
             stop_http_server(server)
+
+
+    def test_http_deadline_bounds_a_response_that_drips_bytes(self):
+        stop = []
+
+        def handler(request):
+            request.rfile.read(int(request.headers.get("content-length", 0)))
+            request.send_response(200)
+            request.send_header("content-type", "text/plain")
+            request.end_headers()
+            for _ in range(50):  # one byte every 0.1 s for 5 s
+                if stop:
+                    return
+                try:
+                    request.wfile.write(b"x")
+                    request.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.1)
+
+        http_server, port = start_http_server(handler)
+        relay = Relay({"id": "drip", "type": "http", "url": f"http://127.0.0.1:{port}"})
+        try:
+            started = time.monotonic()
+            _, submitted = relay.submit(agentId="drip", input="x", timeoutMs=500)
+            task = relay.wait_task(submitted["id"], timeout=3)
+            self.assertEqual(task["status"], "timed_out")
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertTrue(_wait_for(lambda: self.active(relay) == 0))
+        finally:
+            stop.append(True)
+            relay.close()
+            stop_http_server(http_server)
+
+    @unittest.skipUnless(server.PROCESS_GROUPS, "process groups are POSIX-only")
+    def test_delayed_kill_skips_a_process_group_that_no_longer_exists(self):
+        proc = subprocess.Popen([PYTHON, "-c", "pass"], start_new_session=True)
+        proc.wait()
+        sent = []
+        real_killpg = os.killpg
+
+        def recording_killpg(pgid, sig):
+            if pgid == proc.pid and sig != 0:
+                sent.append(sig)
+                return None
+            return real_killpg(pgid, sig)
+
+        original = server.os.killpg
+        server.os.killpg = recording_killpg
+        try:
+            server._signal(proc, force=True)
+        finally:
+            server.os.killpg = original
+        self.assertNotIn(signal.SIGKILL, sent)
 
 
 if __name__ == "__main__":

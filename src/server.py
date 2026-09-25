@@ -272,6 +272,12 @@ def _pump(stream, sink, capture):
 def _signal(proc, force):
     try:
         if PROCESS_GROUPS:
+            if force and proc.returncode is not None:
+                # The leader has been reaped, so its pid is free. Only escalate while its
+                # process group still has members: a live group keeps the id from being reused.
+                # (A group that empties and whose id is recycled by a new session leader within
+                # the 1 s window would still be hit; the kernel makes that very unlikely.)
+                os.killpg(proc.pid, 0)
             os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
         elif proc.poll() is None:
             proc.kill() if force else proc.terminate()
@@ -455,6 +461,31 @@ def _run_stdio(agent, task):
     _finish(task, response["status"], output=response.get("output", ""), error=response.get("error"))
 
 
+def _read_body(stream, task):
+    """Read at most MAX_OUTPUT + 1 bytes, giving up at the task deadline.
+
+    The socket timeout alone bounds each recv, so an adapter that drip-feeds bytes could
+    otherwise hold the task (and its active slot) far past its timeout.
+    """
+    source = getattr(stream, "fp", None) if not hasattr(stream, "read1") else stream
+    read = getattr(source, "read1", None) or stream.read
+    raw_io = getattr(getattr(source, "fp", None), "raw", None)
+    sock = getattr(raw_io, "_sock", None)
+    chunks, size = [], 0
+    while size <= MAX_OUTPUT:
+        remaining = _remaining(task)
+        if remaining <= 0:
+            raise TimeoutError(f"Agent exceeded {task['timeoutMs']} ms")
+        if sock is not None:
+            sock.settimeout(remaining)
+        chunk = read(min(65536, MAX_OUTPUT + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
+
+
 def _run_http(agent, task):
     from urllib import error as urlerror
     from urllib import request as urlrequest
@@ -466,12 +497,16 @@ def _run_http(agent, task):
     try:
         with urlrequest.urlopen(request, timeout=max(_remaining(task), 0.001)) as response:
             content_type = (response.headers.get("content-type") or "").lower()
-            raw = response.read(MAX_OUTPUT + 1)
+            raw = _read_body(response, task)
             code = response.status
             ok = 200 <= code < 300
     except urlerror.HTTPError as exc:
         content_type = ((exc.headers.get("content-type") if exc.headers else "") or "").lower()
-        raw = exc.read(MAX_OUTPUT + 1)
+        try:
+            raw = _read_body(exc, task)
+        except (OSError, socket.timeout) as read_error:
+            _finish(task, "timed_out" if _remaining(task) <= 0 else "failed", error=str(read_error))
+            return
         code = exc.code
         ok = False
     except (urlerror.URLError, socket.timeout, TimeoutError) as exc:
