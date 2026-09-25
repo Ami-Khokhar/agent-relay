@@ -694,7 +694,11 @@ def _agent_listing():
 
 def _delegation_error(parent, agent):
     """Return (status, error, message) when the parent task may not delegate to ``agent``."""
-    parent_agent = AGENTS.get(parent["agentId"]) or {}
+    parent_agent = AGENTS.get(parent["agentId"])
+    if parent_agent is None:
+        # Fail closed: without the parent's registry entry its delegateTo cannot be checked.
+        return 403, "delegation_not_allowed", (
+            f"agent {parent['agentId']} is no longer registered, so it may not delegate")
     allowed = parent_agent.get("delegateTo")
     if allowed is not None and agent["id"] not in allowed:
         return 403, "delegation_not_allowed", (

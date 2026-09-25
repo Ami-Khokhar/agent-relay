@@ -10,7 +10,8 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
 { "ok": true, "agents": 3, "tasks": 0, "active": 0, "queued": 0,
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
-              "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4 } }
+              "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4,
+              "maxDelegationDepth": 2, "maxDelegatedTasks": 20 } }
 ```
 
 `maxTimeoutMs` is `null` when no hard cap is configured. `active` counts running tasks
@@ -104,13 +105,12 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 | Status | `error` | Meaning |
 | --- | --- | --- |
 | 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_wait`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
-| 403 | `forbidden` | Admin route called from a non-loopback address. |
+| 403 | `forbidden`, `delegation_not_allowed` | Admin route called from a non-loopback address; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
 | 404 | `unknown_agent`, `unknown_task`, `not_found` | Missing agent/task/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
-| 403 | `delegation_not_allowed` | Parent task's agent does not list the target in `delegateTo`. |
 | 409 | `idempotency_conflict`, `delegation_cycle`, `delegation_depth_exceeded` | `requestId` reused with different fields; target already in the delegation chain; chain too deep. |
-| 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
+| 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
 | 503 | `task_capacity_reached` | Store full of non-terminal tasks. |
 

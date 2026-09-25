@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-from relay_helpers import PYTHON, Relay, send_json, start_http_server, stop_http_server
+from relay_helpers import PYTHON, ROOT, SERVER, Relay, send_json, start_http_server, stop_http_server
 import mcp_server
 
 SLEEP = ["-c", "import time; time.sleep(10)"]
@@ -81,6 +84,35 @@ class DelegationPolicyTests(unittest.TestCase):
         # A new root task has its own budget.
         _, other_root = relay.submit(agentId="a", input="y")
         self.assertEqual(self.delegate(relay, other_root, "b")[0], 202)
+
+    def test_fails_closed_when_the_parent_agent_is_no_longer_registered(self):
+        relay = self.start([agent("lead", delegateTo=["helper"]), agent("helper"), agent("other")])
+        _, root = relay.submit(agentId="lead", input="plan")
+        with open(relay.config, "w", encoding="utf-8") as handle:
+            json.dump({"agents": [agent("helper"), agent("other")]}, handle)
+        self.assertEqual(relay.request("POST", "/v1/admin/reload")[0], 200)
+        status, payload = self.delegate(relay, root, "other")
+        self.assertEqual((status, payload["error"]), (403, "delegation_not_allowed"))
+
+    def test_rejects_an_invalid_delegate_to_list_at_startup(self):
+        directory = tempfile.mkdtemp(prefix="a2a-delegate-to-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        config = os.path.join(directory, "agents.json")
+        with open(config, "w", encoding="utf-8") as handle:
+            json.dump({"agents": [agent("lead", delegateTo="helper")]}, handle)
+        proc = subprocess.run([PYTHON, SERVER], cwd=ROOT, env={**os.environ, "A2A_AGENTS_FILE": config},
+                              capture_output=True, timeout=10)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Invalid delegateTo: lead", proc.stderr.decode())
+
+    def test_reports_delegation_limits_in_healthz(self):
+        relay = self.start(agent("a"), env={"AGENT_RELAY_MAX_DELEGATION_DEPTH": "0",
+                                            "AGENT_RELAY_MAX_DELEGATED_TASKS": "5"})
+        limits = relay.request("GET", "/healthz")[1]["limits"]
+        self.assertEqual((limits["maxDelegationDepth"], limits["maxDelegatedTasks"]), (0, 5))
+        defaults = self.start(agent("a"))
+        limits = defaults.request("GET", "/healthz")[1]["limits"]
+        self.assertEqual((limits["maxDelegationDepth"], limits["maxDelegatedTasks"]), (2, 20))
 
     def test_rejects_an_unknown_parent_task(self):
         relay = self.start(agent("a"))
