@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -211,26 +212,102 @@ class LifecycleTests(unittest.TestCase):
             stop_http_server(http_server)
 
     @unittest.skipUnless(server.PROCESS_GROUPS, "process groups are POSIX-only")
-    def test_delayed_kill_skips_a_process_group_that_no_longer_exists(self):
-        proc = subprocess.Popen([PYTHON, "-c", "pass"], start_new_session=True)
-        proc.wait()
-        sent = []
-        real_killpg = os.killpg
+    def test_a_reaped_leaders_pid_held_by_a_foreign_group_is_not_signalled(self):
+        foreign = subprocess.Popen([PYTHON, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.addCleanup(foreign.wait)
+        self.addCleanup(foreign.kill)
+        # A reaped adapter leader whose pid (and so group id) now belongs to another group:
+        # either the start time differs (Linux) or it cannot be checked at all.
+        for recorded in (b"not-the-foreign-start-time", None):
+            reaped = types.SimpleNamespace(pid=foreign.pid, returncode=0, relay_start_time=recorded)
+            server._signal(reaped, force=True)
+            server._signal(reaped, force=False)
+            time.sleep(0.2)
+            self.assertIsNone(foreign.poll(), f"foreign group was signalled (recorded={recorded!r})")
 
-        def recording_killpg(pgid, sig):
-            if pgid == proc.pid and sig != 0:
-                sent.append(sig)
-                return None
-            return real_killpg(pgid, sig)
+    @unittest.skipUnless(server.PROCESS_GROUPS and os.path.exists(f"/proc/{os.getpid()}/stat"),
+                         "needs /proc start times")
+    def test_a_reaped_leaders_own_surviving_group_is_still_signalled(self):
+        child_pid = self.path("child.pid")
+        script = ("import os, subprocess, sys\n"
+                  "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                  "open(os.environ['CHILD_PID'], 'w').write(str(child.pid))\n")
+        leader = subprocess.Popen([PYTHON, "-c", script], start_new_session=True,
+                                  env={**os.environ, "CHILD_PID": child_pid})
+        leader.relay_start_time = server._start_time(leader.pid)
+        leader.wait()
+        pid = int(open(child_pid).read())
+        server._signal(leader, force=True)
 
-        original = server.os.killpg
-        server.os.killpg = recording_killpg
+        def gone():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        self.assertTrue(_wait_for(gone), "a descendant of the reaped leader survived")
+
+    def _http_error_task(self, handler, timeout_ms):
+        http_server, port = start_http_server(handler)
+        relay = Relay({"id": "failing", "type": "http", "url": f"http://127.0.0.1:{port}"})
         try:
-            server._signal(proc, force=True)
+            started = time.monotonic()
+            _, submitted = relay.submit(agentId="failing", input="x", timeoutMs=timeout_ms)
+            task = relay.wait_task(submitted["id"], timeout=6)
+            return task, time.monotonic() - started
         finally:
-            server.os.killpg = original
-        self.assertNotIn(signal.SIGKILL, sent)
+            relay.close()
+            stop_http_server(http_server)
 
+    def test_http_error_body_that_stalls_times_out_at_the_deadline(self):
+        def handler(request):
+            request.rfile.read(int(request.headers.get("content-length", 0)))
+            time.sleep(1.0)  # spend most of the deadline before the headers arrive
+            request.send_response(500)
+            request.send_header("content-type", "text/plain")
+            request.send_header("content-length", "100")
+            request.end_headers()
+            request.wfile.write(b"partial")
+            request.wfile.flush()
+            time.sleep(4)
+
+        task, elapsed = self._http_error_task(handler, 1500)
+        self.assertEqual(task["status"], "timed_out")
+        # The socket timeout must be reset to what is left, not the 1.5 s set at request time.
+        self.assertLess(elapsed, 2.3)
+
+    def test_http_error_body_that_drips_times_out(self):
+        def handler(request):
+            request.rfile.read(int(request.headers.get("content-length", 0)))
+            request.send_response(500)
+            request.send_header("content-type", "text/plain")
+            request.end_headers()
+            for _ in range(40):
+                try:
+                    request.wfile.write(b"x")
+                    request.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.1)
+
+        task, elapsed = self._http_error_task(handler, 500)
+        self.assertEqual(task["status"], "timed_out")
+        self.assertLess(elapsed, 3)
+
+    def test_http_error_body_cut_short_fails(self):
+        def handler(request):
+            request.rfile.read(int(request.headers.get("content-length", 0)))
+            request.send_response(500)
+            request.send_header("content-type", "text/plain")
+            request.send_header("content-length", "100")
+            request.end_headers()
+            request.wfile.write(b"short")
+            request.wfile.flush()
+            request.close_connection = True
+
+        task, _ = self._http_error_task(handler, 5000)
+        self.assertEqual(task["status"], "failed")
 
 if __name__ == "__main__":
     unittest.main()

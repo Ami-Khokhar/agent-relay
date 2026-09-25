@@ -7,6 +7,7 @@ registry of adapters. See README.md for the HTTP API and the relay.adapter/v1 co
 from __future__ import annotations
 
 import errno
+import http.client
 import json
 import os
 import re
@@ -269,15 +270,41 @@ def _pump(stream, sink, capture):
     return thread
 
 
+def _start_time(pid):
+    """The process start time from /proc (Linux), or None when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            fields = handle.read().rsplit(b")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    return fields[19] if len(fields) > 19 else None  # field 22 of stat; fields[0] is field 3
+
+
+def _group_is_ours(proc):
+    """Whether the process group named by the adapter's pid still belongs to this task.
+
+    Until the leader is reaped its pid, and so the group id, cannot be reused. Afterwards the
+    id stays reserved only while group members remain; once it is free another process may
+    take it. On Linux the leader's start time, recorded at spawn, tells the two apart: a process
+    now holding that pid with a different start time is foreign. Elsewhere there is no way to
+    check, so a reaped leader's group is never signalled.
+    """
+    if proc.returncode is None:
+        return True
+    recorded = getattr(proc, "relay_start_time", None)
+    if recorded is None:
+        return False
+    current = _start_time(proc.pid)
+    # No process with that pid: the id is either free (the signal fails with ESRCH) or still
+    # held by our surviving group members.
+    return current is None or current == recorded
+
+
 def _signal(proc, force):
     try:
         if PROCESS_GROUPS:
-            if force and proc.returncode is not None:
-                # The leader has been reaped, so its pid is free. Only escalate while its
-                # process group still has members: a live group keeps the id from being reused.
-                # (A group that empties and whose id is recycled by a new session leader within
-                # the 1 s window would still be hit; the kernel makes that very unlikely.)
-                os.killpg(proc.pid, 0)
+            if not _group_is_ours(proc):
+                return
             os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
         elif proc.poll() is None:
             proc.kill() if force else proc.terminate()
@@ -346,6 +373,7 @@ def _spawn(agent, task, argv, env, stdin):
         argv, cwd=_task_cwd(agent, task), env=env, stdin=stdin,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=PROCESS_GROUPS,
     )
+    proc.relay_start_time = _start_time(proc.pid)
     with LOCK:
         task["_proc"] = proc
         cancelled = task["status"] != "running"
@@ -465,13 +493,18 @@ def _read_body(stream, task):
     """Read at most MAX_OUTPUT + 1 bytes, giving up at the task deadline.
 
     The socket timeout alone bounds each recv, so an adapter that drip-feeds bytes could
-    otherwise hold the task (and its active slot) far past its timeout.
+    otherwise hold the task (and its active slot) far past its timeout. The loop ends when
+    read1 returns nothing (Content-Length consumed, chunked terminator, or EOF) or the
+    response reports that it is closed.
     """
-    source = getattr(stream, "fp", None) if not hasattr(stream, "read1") else stream
-    read = getattr(source, "read1", None) or stream.read
-    raw_io = getattr(getattr(source, "fp", None), "raw", None)
-    sock = getattr(raw_io, "_sock", None)
-    closed = getattr(source, "isclosed", lambda: False)
+    # ``stream`` is an HTTPResponse, or an HTTPError wrapping one in ``fp``; the socket
+    # timeout must be set on the response that owns the connection.
+    response = stream if isinstance(stream, http.client.HTTPResponse) else getattr(stream, "fp", None)
+    if not isinstance(response, http.client.HTTPResponse):
+        response = None
+    read = response.read1 if response is not None else stream.read
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    closed = response.isclosed if response is not None else (lambda: False)
     chunks, size = [], 0
     while size <= MAX_OUTPUT and not closed():
         remaining = _remaining(task)
