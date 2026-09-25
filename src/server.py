@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import errno
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -354,9 +355,41 @@ def _pump(stream, sink, capture):
     return thread
 
 
+def _start_time(pid):
+    """The process start time from /proc (Linux), or None when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            fields = handle.read().rsplit(b")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    return fields[19] if len(fields) > 19 else None  # field 22 of stat; fields[0] is field 3
+
+
+def _group_is_ours(proc):
+    """Whether the process group named by the adapter's pid still belongs to this task.
+
+    Until the leader is reaped its pid, and so the group id, cannot be reused. Afterwards the
+    id stays reserved only while group members remain; once it is free another process may
+    take it. On Linux the leader's start time, recorded at spawn, tells the two apart: a process
+    now holding that pid with a different start time is foreign. Elsewhere there is no way to
+    check, so a reaped leader's group is never signalled.
+    """
+    if proc.returncode is None:
+        return True
+    recorded = getattr(proc, "relay_start_time", None)
+    if recorded is None:
+        return False
+    current = _start_time(proc.pid)
+    # No process with that pid: the id is either free (the signal fails with ESRCH) or still
+    # held by our surviving group members.
+    return current is None or current == recorded
+
+
 def _signal(proc, force):
     try:
         if PROCESS_GROUPS:
+            if not _group_is_ours(proc):
+                return
             os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
         elif proc.poll() is None:
             proc.kill() if force else proc.terminate()
@@ -367,8 +400,9 @@ def _signal(proc, force):
 def _terminate(proc):
     """SIGTERM the adapter's process group (or the process itself), then SIGKILL after 1 s.
 
-    The group is signalled even when the direct child has already exited, so descendants it
-    left behind are stopped too.
+    The group is signalled while the leader is unreaped. After it has been reaped the group is
+    signalled only where the leader's identity can still be checked (see _group_is_ours), so
+    descendants it left behind are stopped on Linux but not on other POSIX systems.
     """
     if not PROCESS_GROUPS and proc.poll() is not None:
         return
@@ -425,6 +459,7 @@ def _spawn(agent, task, argv, env, stdin):
         argv, cwd=_task_cwd(agent, task), env=env, stdin=stdin,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=PROCESS_GROUPS,
     )
+    proc.relay_start_time = _start_time(proc.pid)
     with LOCK:
         task["_proc"] = proc
         cancelled = task["status"] != "running"
@@ -547,6 +582,37 @@ class _NoRedirect(urlrequest.HTTPRedirectHandler):
         return None
 
 
+def _read_body(stream, task):
+    """Read at most MAX_OUTPUT + 1 bytes, giving up at the task deadline.
+
+    The socket timeout alone bounds each recv, so an adapter that drip-feeds bytes could
+    otherwise hold the task (and its active slot) far past its timeout. The loop ends when
+    read1 returns nothing (Content-Length consumed, chunked terminator, or EOF) or the
+    response reports that it is closed.
+    """
+    # ``stream`` is an HTTPResponse, or an HTTPError wrapping one in ``fp``; the socket
+    # timeout must be set on the response that owns the connection.
+    response = stream if isinstance(stream, http.client.HTTPResponse) else getattr(stream, "fp", None)
+    if not isinstance(response, http.client.HTTPResponse):
+        response = None
+    read = response.read1 if response is not None else stream.read
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    closed = response.isclosed if response is not None else (lambda: False)
+    chunks, size = [], 0
+    while size <= MAX_OUTPUT and not closed():
+        remaining = _remaining(task)
+        if remaining <= 0:
+            raise TimeoutError(f"Agent exceeded {task['timeoutMs']} ms")
+        if sock is not None:
+            sock.settimeout(remaining)
+        chunk = read(min(65536, MAX_OUTPUT + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
+
+
 def _run_http(agent, task):
     from urllib import error as urlerror
 
@@ -558,7 +624,7 @@ def _run_http(agent, task):
     try:
         with opener.open(request, timeout=max(_remaining(task), 0.001)) as response:
             content_type = (response.headers.get("content-type") or "").lower()
-            raw = response.read(MAX_OUTPUT + 1)
+            raw = _read_body(response, task)
             code = response.status
             ok = 200 <= code < 300
     except urlerror.HTTPError as exc:
@@ -566,9 +632,16 @@ def _run_http(agent, task):
             location = exc.headers.get("location") if exc.headers else None
             _finish(task, "failed", error=f"HTTP adapter redirected ({exc.code} to {location}); "
                                           "redirects are not followed")
+            exc.close()
             return
         content_type = ((exc.headers.get("content-type") if exc.headers else "") or "").lower()
-        raw = exc.read(MAX_OUTPUT + 1)
+        try:
+            raw = _read_body(exc, task)
+        except (OSError, socket.timeout) as read_error:
+            _finish(task, "timed_out" if _remaining(task) <= 0 else "failed", error=str(read_error))
+            return
+        finally:
+            exc.close()  # read1 never closes a fully read response; release the connection
         code = exc.code
         ok = False
     except (urlerror.URLError, socket.timeout, TimeoutError) as exc:
@@ -615,7 +688,8 @@ def _run_http(agent, task):
 
 
 def _worker(agent, task):
-    # One deadline covers process startup, request delivery, execution, and result collection.
+    # One deadline covers process startup, request delivery, execution, and reading an HTTP
+    # adapter's response; a spawned adapter's output is collected under a short post-exit grace.
     task["_deadline"] = time.monotonic() + task["timeoutMs"] / 1000.0
     try:
         kind = agent["type"]
