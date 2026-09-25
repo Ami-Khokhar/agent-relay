@@ -156,3 +156,4 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `output` | success | Captured result text. |
 | `error` | failure/timeout | Failure reason. |
 | `outputTruncated` | on truncation | True when output hit the byte limit. |
+| `cancellation` | cancelled while running | `process_signal` (adapter process group signalled) or `request_only` (HTTP request not aborted). |

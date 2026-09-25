@@ -33,6 +33,8 @@ TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd"}
 STATUSES = {"queued", "running", "completed", "failed", "timed_out", "cancelled"}
 # On POSIX each adapter runs in its own process group so cancellation reaches descendants.
 PROCESS_GROUPS = os.name == "posix"
+# Seconds to wait for adapter pipes to drain after the adapter process has exited.
+COLLECT_GRACE_S = 2.0
 
 
 def _env(*names, default=None):
@@ -242,10 +244,13 @@ class _Capture:
 
 
 def _pump(stream, sink, capture):
+    # read1 returns what is available; read(n) would wait for n bytes or EOF.
+    read = getattr(stream, "read1", stream.read)
+
     def run():
         try:
             while True:
-                chunk = stream.read(65536)
+                chunk = read(65536)
                 if not chunk:
                     break
                 kept = capture.feed(chunk)
@@ -300,6 +305,26 @@ def _wait(proc, task):
         _terminate(proc)
         proc.wait()
         return True
+
+
+def _join_all(threads, seconds):
+    deadline = time.monotonic() + seconds
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return not any(thread.is_alive() for thread in threads)
+
+
+def _collect(proc, threads):
+    """Wait a bounded time for the adapter's I/O threads once the adapter has exited.
+
+    A descendant that still holds a pipe (for example one that called setsid(), or any child on
+    Windows) could block a write or delay EOF forever. After a short grace the group is signalled
+    once more and then the relay stops waiting: the daemon I/O threads are abandoned, whatever
+    output was captured is used, and the task's slot is released.
+    """
+    if not _join_all(threads, COLLECT_GRACE_S):
+        _terminate(proc)
+        _join_all(threads, 1.5)
 
 
 def _spawn(agent, task, argv, env, stdin):
@@ -367,8 +392,7 @@ def _run_command(agent, task):
     out, err = [], []
     readers = (_pump(proc.stdout, out, capture), _pump(proc.stderr, err, capture))
     timed_out = _wait(proc, task)
-    for reader in readers:
-        reader.join()
+    _collect(proc, readers)
     output = b"".join(out).decode("utf-8", "replace").strip()
     error = b"".join(err).decode("utf-8", "replace").strip()
     if timed_out:
@@ -395,13 +419,8 @@ def _run_stdio(agent, task):
     readers = (_pump(proc.stdout, out, capture), _pump(proc.stderr, err, capture))
     writer, fed = _feed(proc, (json.dumps(adapter_request(task)) + "\n").encode("utf-8"))
     timed_out = _wait(proc, task)
-    if writer.is_alive():
-        # The adapter exited but a descendant still holds stdin without reading it.
-        _terminate(proc)
-    writer.join()
+    _collect(proc, (writer, *readers))
     stdin_error = fed.get("error")
-    for reader in readers:
-        reader.join()
     stdout = b"".join(out).decode("utf-8", "replace")
     stderr = b"".join(err).decode("utf-8", "replace")
     if timed_out:

@@ -124,6 +124,33 @@ class LifecycleTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_a_detached_descendant_holding_stdin_cannot_pin_the_task(self):
+        # The adapter exits at once; a child in its own session inherits stdin and never reads it.
+        script = ("import subprocess, sys; subprocess.Popen([sys.executable, '-c', "
+                  "'import time; time.sleep(8)'], start_new_session=True)")
+        relay = Relay({"id": "leaky", "type": "stdio", "command": PYTHON, "args": ["-c", script]},
+                      env={"A2A_RELAY_MAX_ACTIVE": "1"})
+        try:
+            _, submitted = relay.submit(agentId="leaky", input=LARGE_INPUT)
+            task = relay.wait_task(submitted["id"], timeout=6)
+            self.assertEqual(task["status"], "failed")
+            self.assertTrue(_wait_for(lambda: self.active(relay) == 0))
+        finally:
+            relay.close()
+
+    def test_a_detached_descendant_holding_stdout_cannot_pin_the_task(self):
+        script = ("import subprocess, sys; subprocess.Popen([sys.executable, '-c', "
+                  "'import time; time.sleep(8)'], start_new_session=True); print('done')")
+        relay = Relay({"id": "daemonizes", "command": PYTHON, "args": ["-c", script]})
+        try:
+            _, submitted = relay.submit(agentId="daemonizes", input="x")
+            task = relay.wait_task(submitted["id"], timeout=6)
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["output"], "done")
+            self.assertTrue(_wait_for(lambda: self.active(relay) == 0))
+        finally:
+            relay.close()
+
     def test_http_cancellation_is_reported_as_request_only(self):
         def handler(request):
             time.sleep(1)
