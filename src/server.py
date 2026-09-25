@@ -1159,7 +1159,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"tasks": _list_tasks(session_id, status, limit)})
 
     def _reload(self):
-        if self.client_address[0] not in ("127.0.0.1", "::1", "localhost"):
+        if not is_loopback(self.client_address[0]):
             return self._json(403, {"error": "forbidden"})
         try:
             path = reload_registry()
