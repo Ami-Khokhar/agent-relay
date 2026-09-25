@@ -1,6 +1,7 @@
 """HTTP relay behaviour tests."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import signal
@@ -9,9 +10,15 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr
+from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_helpers import ROOT, PYTHON, Relay, SERVER, start_http_server, stop_http_server
+
+sys.path.insert(0, os.path.join(ROOT, "src"))
+from server import default_config_path
 
 
 class RelayTests(unittest.TestCase):
@@ -383,6 +390,27 @@ class RelayTests(unittest.TestCase):
             self.assertNotIn("Traceback (most recent call last)", text)
         finally:
             relay.close()
+
+
+class DefaultConfigPathTests(unittest.TestCase):
+    def test_warns_on_stderr_when_falling_back_to_checkout_registry(self):
+        with tempfile.TemporaryDirectory() as home:
+            stderr = io.StringIO()
+            with mock.patch("pathlib.Path.home", return_value=Path(home)), redirect_stderr(stderr):
+                path = default_config_path()
+            self.assertEqual(path, Path(ROOT) / "config" / "agents.json")
+            self.assertIn(f"falling back to {path}", stderr.getvalue())
+
+    def test_silent_when_user_registry_exists(self):
+        with tempfile.TemporaryDirectory() as home:
+            registry_dir = Path(home) / ".config" / "agent-relay"
+            registry_dir.mkdir(parents=True)
+            (registry_dir / "agents.json").write_text("{}", encoding="utf-8")
+            stderr = io.StringIO()
+            with mock.patch("pathlib.Path.home", return_value=Path(home)), redirect_stderr(stderr):
+                path = default_config_path()
+            self.assertEqual(path, registry_dir / "agents.json")
+            self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":
