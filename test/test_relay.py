@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_helpers import ROOT, PYTHON, Relay, SERVER, start_http_server, stop_http_server
 
 sys.path.insert(0, os.path.join(ROOT, "src"))
-from server import default_config_path
+from server import _WARNED_FALLBACK, default_config_path
 
 
 class RelayTests(unittest.TestCase):
@@ -396,10 +396,21 @@ class DefaultConfigPathTests(unittest.TestCase):
     def test_warns_on_stderr_when_falling_back_to_checkout_registry(self):
         with tempfile.TemporaryDirectory() as home:
             stderr = io.StringIO()
-            with mock.patch("pathlib.Path.home", return_value=Path(home)), redirect_stderr(stderr):
+            with mock.patch("pathlib.Path.home", return_value=Path(home)), redirect_stderr(stderr), \
+                    mock.patch("server._WARNED_FALLBACK", False):
                 path = default_config_path()
-            self.assertEqual(path, Path(ROOT) / "config" / "agents.json")
+            self.assertEqual(path, (Path(ROOT) / "config" / "agents.json").resolve())
             self.assertIn(f"falling back to {path}", stderr.getvalue())
+
+    def test_warns_on_fallback_only_once_per_process(self):
+        with tempfile.TemporaryDirectory() as home:
+            stderr = io.StringIO()
+            with mock.patch("pathlib.Path.home", return_value=Path(home)), redirect_stderr(stderr), \
+                    mock.patch("server._WARNED_FALLBACK", False):
+                path = default_config_path()
+                self.assertEqual(path, (Path(ROOT) / "config" / "agents.json").resolve())
+                default_config_path()
+            self.assertEqual(stderr.getvalue().count("falling back"), 1)
 
     def test_silent_when_user_registry_exists(self):
         with tempfile.TemporaryDirectory() as home:
