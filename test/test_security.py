@@ -229,10 +229,9 @@ class ApiTokenTests(unittest.TestCase):
             # 127.0.0.2 is a second loopback address on Linux; macOS only configures
             # 127.0.0.1, so send from whichever loopback source address binds.
             sources = ["127.0.0.2", "127.0.0.17", "127.0.0.1"]
-            source = next(host for host in sources if self._binds_loopback(host))
             replies = 0
             for host in sources:
-                if host != source and self._binds_loopback(host):
+                if not self._binds_loopback(host):
                     continue
                 with socket.create_connection(("127.0.0.1", relay.port), timeout=3,
                                               source_address=(host, 0)) as sock:
