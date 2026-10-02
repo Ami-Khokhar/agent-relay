@@ -77,11 +77,11 @@ jobs:
     # Runs only when `resolve` ran (skipped PRs never get this far).
     if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
     needs: resolve
-    uses: Ami-Khokhar/pr-gatekeeper-workflow/.github/workflows/gatekeeper.yml@v1
+    uses: Ami-Khokhar/pr-gatekeeper-workflow/.github/workflows/gatekeeper.yml@59540639b38a08733f7222adfdcde36d3a8552e1
     with:
       pr: ${{ github.event.pull_request.number || inputs.pr }}
       base_sha: ${{ needs.resolve.outputs.base_sha || github.event.pull_request.base.sha || '' }}
-      gatekeeper_ref: v1
+      gatekeeper_ref: e9f2380fbb040a962ab3d888df578d0625415a70
     secrets:
       OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
       GATEKEEPER_READ_TOKEN: ${{ secrets.GATEKEEPER_READ_TOKEN }}
