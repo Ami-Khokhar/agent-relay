@@ -212,15 +212,34 @@ class ApiTokenTests(unittest.TestCase):
             stop_http_server(target)
 
 
+    def _binds_loopback(self, host):
+        """True when the source address is configured, so a connection can come from it."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind((host, 0))
+            except OSError:
+                return False
+        return True
+
     def test_reload_accepts_any_loopback_client_address(self):
         relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]})
         try:
             request = (b"POST /v1/admin/reload HTTP/1.1\r\nHost: x\r\nauthorization: Bearer %s\r\n"
                        b"content-length: 0\r\n\r\n" % TOKEN.encode())
-            with socket.create_connection(("127.0.0.1", relay.port), timeout=3,
-                                          source_address=("127.0.0.2", 0)) as sock:
-                sock.sendall(request)
-                self.assertIn(b" 200 ", sock.recv(65536))
+            # 127.0.0.2 is a second loopback address on Linux; macOS only configures
+            # 127.0.0.1, so send from whichever loopback source address binds.
+            sources = ["127.0.0.2", "127.0.0.17", "127.0.0.1"]
+            source = next(host for host in sources if self._binds_loopback(host))
+            replies = 0
+            for host in sources:
+                if host != source and self._binds_loopback(host):
+                    continue
+                with socket.create_connection(("127.0.0.1", relay.port), timeout=3,
+                                              source_address=(host, 0)) as sock:
+                    sock.sendall(request)
+                    self.assertIn(b" 200 ", sock.recv(65536))
+                    replies += 1
+            self.assertGreater(replies, 0)
         finally:
             relay.close()
 
