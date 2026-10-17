@@ -151,6 +151,49 @@ class RelayTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_task_snapshots_leave_out_the_input_and_report_its_length(self):
+        text = "naïve prompt ✓"
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('ok')"]})
+        try:
+            status, submitted = relay.submit(agentId="echo", requestId="snap-1", input=text)
+            self.assertEqual(status, 202)
+            status, replay = relay.submit(agentId="echo", requestId="snap-1", input=text)
+            self.assertEqual(status, 200)
+            task_id = submitted["id"]
+            relay.wait_task(task_id)
+            _, polled = relay.request("GET", f"/v1/tasks/{task_id}")
+            _, waited = relay.request("GET", f"/v1/tasks/{task_id}?waitMs=5000")
+            _, listing = relay.request("GET", "/v1/tasks")
+            _, cancelled = relay.request("DELETE", f"/v1/tasks/{task_id}")
+            for snapshot in (submitted, replay, polled, waited, listing["tasks"][0], cancelled):
+                self.assertNotIn("input", snapshot)
+                self.assertEqual(snapshot["inputChars"], len(text))
+            self.assertEqual(polled["output"], "ok")
+        finally:
+            relay.close()
+
+    def test_get_task_returns_the_input_only_when_include_input_is_true(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('ok')"]})
+        try:
+            task = relay.run_task(agentId="echo", input="secret prompt")
+            path = f"/v1/tasks/{task['id']}"
+            status, opted_in = relay.request("GET", path + "?includeInput=true")
+            self.assertEqual(status, 200)
+            self.assertEqual(opted_in["input"], "secret prompt")
+            self.assertEqual(opted_in["inputChars"], len("secret prompt"))
+            _, waited = relay.request("GET", path + "?waitMs=1000&includeInput=true")
+            self.assertEqual(waited["input"], "secret prompt")
+            _, opted_out = relay.request("GET", path + "?includeInput=false")
+            self.assertNotIn("input", opted_out)
+            status, payload = relay.request("GET", path + "?includeInput=maybe")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_include_input")
+            # The list endpoint never carries inputs, whatever the query says.
+            _, listing = relay.request("GET", "/v1/tasks?includeInput=true")
+            self.assertNotIn("input", listing["tasks"][0])
+        finally:
+            relay.close()
+
     def test_terminates_running_agent_processes_when_the_relay_shuts_down(self):
         directory = tempfile.mkdtemp(prefix="a2a-shutdown-")
         marker = os.path.join(directory, "killed")

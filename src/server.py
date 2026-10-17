@@ -129,8 +129,15 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def visible(task):
-    return {key: value for key, value in task.items() if not key.startswith("_")}
+def visible(task, include_input=False):
+    """The task as clients see it. The prompt is left out unless asked for: callers already
+    hold it, and echoing it on every poll fills their context. inputChars is always there."""
+    snapshot = {key: value for key, value in task.items()
+                if not key.startswith("_") and key != "input"}
+    snapshot["inputChars"] = len(task["input"])
+    if include_input:
+        snapshot["input"] = task["input"]
+    return snapshot
 
 
 def default_config_path():
@@ -1136,6 +1143,10 @@ class Handler(BaseHTTPRequestHandler):
         _drain()
 
     def _get_task(self, task_id, query):
+        include_input = query.get("includeInput", ["false"])[0]
+        if include_input not in ("true", "false"):
+            return self._json(400, {"error": "invalid_include_input",
+                                    "message": "includeInput must be true or false"})
         wait_raw = query.get("waitMs", [None])[0]
         if wait_raw is None:
             task = TASKS.get(task_id)
@@ -1147,7 +1158,9 @@ class Handler(BaseHTTPRequestHandler):
             if wait_ms <= 0 or wait_ms > MAX_WAIT_MS:
                 return self._json(400, {"error": "invalid_wait"})
             task = _wait_for_terminal(task_id, wait_ms)
-        return self._json(200, visible(task)) if task else self._json(404, {"error": "unknown_task"})
+        if not task:
+            return self._json(404, {"error": "unknown_task"})
+        return self._json(200, visible(task, include_input == "true"))
 
     def _list(self, query):
         session_id = query.get("sessionId", [None])[0]

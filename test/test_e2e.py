@@ -7,7 +7,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from relay_helpers import McpClient, Relay, send_json, start_http_server, stop_http_server
+from relay_helpers import PYTHON, McpClient, Relay, send_json, start_http_server, stop_http_server
 
 
 class EndToEndTests(unittest.TestCase):
@@ -57,6 +57,28 @@ class EndToEndTests(unittest.TestCase):
             client.close()
             relay.close()
             stop_http_server(server)
+
+
+    def test_mcp_results_leave_out_the_input_unless_get_task_asks_for_it(self):
+        text = "review this change"
+        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('done')"]})
+        client = McpClient(relay.base)
+        try:
+            delegated = client.call_tool("delegate", {
+                "agentId": "echo", "input": text, "waitMs": 5000})["structuredContent"]
+            task_id = delegated["id"]
+            waited = client.call_tool("wait_task", {"taskId": task_id})["structuredContent"]
+            fetched = client.call_tool("get_task", {"taskId": task_id})["structuredContent"]
+            listed = client.call_tool("list_tasks", {})["structuredContent"]["tasks"][0]
+            self.assertEqual(delegated["status"], "completed")
+            for snapshot in (delegated, waited, fetched, listed):
+                self.assertNotIn("input", snapshot)
+                self.assertEqual(snapshot["inputChars"], len(text))
+            opted_in = client.call_tool("get_task", {"taskId": task_id, "includeInput": True})
+            self.assertEqual(opted_in["structuredContent"]["input"], text)
+        finally:
+            client.close()
+            relay.close()
 
 
 if __name__ == "__main__":
