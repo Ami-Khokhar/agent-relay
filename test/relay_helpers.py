@@ -55,7 +55,11 @@ class Relay:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.base = f"http://127.0.0.1:{self.port}"
-        self._wait_ready()
+        try:
+            self._wait_ready()
+        except BaseException:
+            self.close()  # a relay that never became ready must not outlive the failed start
+            raise
 
     def _wait_ready(self):
         deadline = time.time() + 5

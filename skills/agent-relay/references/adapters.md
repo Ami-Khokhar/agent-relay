@@ -143,10 +143,16 @@ arguments; the `relay.adapter/v1` request does not change. An `http` entry canno
 
 A task can ask for a read-only run with `"readOnly": true` when the agent's registry entry has a
 `readOnly` profile (`{"args": ["--exclude-tools", "edit,write"], "sandbox": true}`). The profile
-`args` follow the option args and precede the task input. With `"sandbox": true` on macOS the
+`args` follow the option args and precede the task input. A `command` profile may also set
+`"inputSeparator": "--"`: the relay puts it after the profile `args` and before the input, so any
+input is data. Without one, and when the profile has `args`, a read-only task whose input starts
+with `-` is refused (`400 invalid_input`), because the input is the last argument and could be read
+as an option that overrides the profile (`--access=read` then `--access=write`). A `stdio` entry
+cannot declare a separator: its input is on stdin. With `"sandbox": true` on macOS the
 relay starts the adapter under `/usr/bin/sandbox-exec` with a profile that denies file writes
 under the task's `cwd`, the agent's `allowedRoots` and the git metadata of the `cwd` (a worktree's
-own git directory and the shared one, found with `git rev-parse`; reads stay allowed), renaming or
+own git directory and the shared one, found with `git rev-parse`; a bare repository's git
+directory too; reads stay allowed), renaming or
 deleting any directory above those trees (the ancestor rule), reading the
 relay token file, and connecting to the relay's TCP port, and allows everything else (the relay also removes
 `AGENT_RELAY_TOKEN` and `A2A_RELAY_TOKEN` from the adapter's environment). It does not stop a
@@ -154,8 +160,12 @@ hard link that already exists outside the tree, writes made for the adapter by a
 service such as a Docker socket, reads of other files, or other network access. macOS does not
 nest sandboxes, so an adapter that applies its own sandbox fails under `"sandbox": true`; use
 `args` for such an adapter. An `http` entry cannot declare a profile. The git lookup fails closed:
-when a `.git` entry exists at or above the `cwd` and git cannot answer, the task fails with
-`read_only_git_unknown` and the adapter does not start. The relay checks a queued task against the
+when a `.git` entry (or a directory with `HEAD`, `objects` and `refs`, as a bare repository has)
+exists at or above the `cwd` and git cannot answer, the task fails with `read_only_git_unknown`
+and the adapter does not start. The lookup runs outside the sandbox, so it runs `/usr/bin/git` (or
+the owner's `AGENT_RELAY_GIT`) by absolute path, never through `PATH`, with only `PATH=/usr/bin:/bin`,
+`HOME`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`: the global git config is not read,
+so a repository that needs `safe.directory` there is refused. The relay checks a queued task against the
 registry entry again when it dispatches it, so a reload that removed the profile fails the task
 with `read_only_unsupported` instead of running it.
 

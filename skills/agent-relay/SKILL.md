@@ -130,7 +130,8 @@ Per-agent optional fields:
   agent's args and options; `sandbox: true` (macOS) runs the agent under `sandbox-exec` so it
   cannot write under the task's `cwd`, the agent's `allowedRoots` or the git metadata of the
   `cwd` (a worktree's too), read the relay token, or connect to the relay port. Must set `args`, `sandbox`, or both. `command` and `stdio` agents
-  only. See "Read-only tasks" below.
+  only. A `command` profile may add `"inputSeparator": "--"`, which the relay puts before the
+  input so the input cannot be read as an option. See "Read-only tasks" below.
 - `capabilities` may only declare what is true; the relay rejects `nativeSessions: true`,
   `streaming: true`, and `newTasks: false` in this version.
 
@@ -248,31 +249,43 @@ in a worktree, for example); do not rely on the prompt alone. Call `list_agents`
 an agent that shows `readOnly: supported` (`readOnlySandboxed: true` means the relay also runs it
 in the macOS sandbox). An agent that is `unsupported` refuses the task
 (`400 read_only_unsupported`) and nothing runs. A sandboxed agent needs a `cwd` on the task or
-the agent (`400 cwd_required`). `readOnly` is part of the `requestId` comparison. The checks run
+the agent (`400 cwd_required`). The input of a `command` agent is its last argument: if the agent's profile
+has `args` and no `inputSeparator`, a read-only input that starts with `-` is refused
+(`400 invalid_input`), because it could override the profile's args (`--access=write` after
+`--access=read`); start the input with another character. A `stdio` agent is not affected.
+`readOnly` is part of the `requestId` comparison. The checks run
 again when a queued task is dispatched: if a registry reload meanwhile removed the profile or made
-the agent an `http` adapter, the task ends `failed` with `read_only_unsupported: ...` and never runs.
+the agent an `http` adapter, or removed the `inputSeparator` that made the input safe, the task ends
+`failed` with `read_only_unsupported: ...` (or `invalid_input: ...`) and never runs.
 
 What the sandbox blocks: writes under the task's `cwd` and the agent's `allowedRoots` (a new hard
 link to a file there too); writes to the git metadata of the `cwd`, which for a git worktree lives
 outside the `cwd` (its own `.git/worktrees/<name>` with the index, and the shared `.git` with refs
-and objects), so a review cannot stage, commit or move a branch (`git log`, `diff` and `show` still
-work); renaming or deleting any directory above those trees (the ancestor rule: otherwise
+and objects, or a bare repository's own directory), so a review cannot stage, commit or move a
+branch (`git log`, `diff` and `show` still work); renaming or deleting any directory above those trees (the ancestor rule: otherwise
 `/tmp/review` could be moved away and written through its new path; writes beside a protected tree
 stay allowed); reading the relay token file, or renaming it or a directory above it;
 connecting to the relay's TCP port, so the agent cannot call the relay; and the
 `AGENT_RELAY_TOKEN` / `A2A_RELAY_TOKEN` variables, which a sandboxed task never receives. A
 sandboxed agent therefore cannot delegate through the relay.
 
-The git lookup fails closed: if a `.git` file or directory exists at or above the `cwd` and git
-cannot say where the metadata is (missing, slower than five seconds or the task's remaining time,
-non-zero exit, unusable output), the task ends `failed` with an error that starts
-`read_only_git_unknown:` and does not run. A `cwd` with no `.git` above it runs without git. Fix
-git for that directory (for example `safe.directory`) or submit without `readOnly`.
+The git lookup fails closed: if a `.git` file or directory (or a directory with `HEAD`, `objects`
+and `refs`, as a bare repository has) exists at or above the `cwd` and git cannot say where the
+metadata is (missing, slower than five seconds or the task's remaining time, non-zero exit,
+unusable output), the task ends `failed` with an error that starts `read_only_git_unknown:` and
+does not run. A `cwd` with no such sign above it runs without git. The lookup runs outside the
+sandbox, so the relay runs `/usr/bin/git` (or the owner's `AGENT_RELAY_GIT`, an absolute path set
+in the relay's environment) by absolute path, never through `PATH`, in a minimal environment
+(`PATH=/usr/bin:/bin`, `HOME`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`). It does not
+read the global git config, which a read-only task could have written, so `safe.directory` there
+does not help: fix the directory's ownership, or submit without `readOnly`.
 
 What it does not block: a hard link that already exists outside the tree and points into it;
 writes made for the agent by another local service it can reach (for example a Docker socket, a
 daemon on another port, a proxy in front of the relay); reads of any other file; other network
-access (the model API still works); writes outside the protected directories; and, when the relay
+access (the model API still works); writes outside the protected directories (so a task can plant
+a file another program trusts later, such as an executable on your `PATH` or `~/.gitconfig`; the
+relay's own git ignores both); and, when the relay
 took its token from `AGENT_RELAY_TOKEN` and not from the token file, reading the relay process's
 environment. It is not general confinement.
 
@@ -413,14 +426,16 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 | Symptom | Cause / fix |
 | --- | --- |
 | Relay exits with `Configuration error: ...` | Invalid registry; the message names the agent. |
+| Relay exits with `AGENT_RELAY_GIT must be an absolute path to an executable file` | The owner's git override is relative, missing, a directory or not executable. Fix or unset `AGENT_RELAY_GIT` in the relay's environment. |
 | Relay exits with `port ... is in use` | Another relay is running; set `A2A_RELAY_PORT`. |
 | `404 unknown_agent` | `agentId` not in the registry, or reload after editing. |
 | `400 cwd_not_allowed` | Per-task `cwd` is outside the agent's `allowedRoots`/`cwd`; add the root. |
 | `400 invalid_wait` | `waitMs` is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS`; the message names the range. The MCP `wait_task` and `delegate` clamp instead. |
 | `400 unknown_field` | A request field is misspelled or unsupported; the message names it. |
 | `400 read_only_unsupported` / `cwd_required` / `invalid_read_only` | `readOnly: true` was sent to an agent without a readOnly profile (or whose sandbox needs macOS), to a sandboxed agent with no `cwd`, or `readOnly` is not a boolean; pick an agent that `list_agents` shows as `readOnly: supported`. |
+| `400 invalid_input` | A `readOnly` task's input starts with `-` and the `command` agent's profile has `args` but no `inputSeparator`, so the input could be read as an option. Start the input with another character, or ask the owner to add `inputSeparator` (for example `"--"`) to the profile. |
 | `400 unknown_option` / `invalid_option_value` / `invalid_options` | `options` names an option the agent does not declare, a value it does not allow, or is not an object of strings; check `list_agents`. |
-| Task `failed`, error starts `read_only_git_unknown:` | A `readOnly` sandboxed task's `cwd` is in a git repository but git could not locate its metadata, so the relay did not run it with less protection. Fix git for that directory or submit without `readOnly`. |
+| Task `failed`, error starts `read_only_git_unknown:` | A `readOnly` sandboxed task's `cwd` is in a git repository but git could not locate its metadata, so the relay did not run it with less protection. Fix git for that directory (the relay ignores the global git config, so `safe.directory` there does not apply) or submit without `readOnly`. |
 | Task `failed`, error starts with a submission code (`read_only_unsupported:`, `unknown_option:`, `cwd_required:` ...) | The registry was reloaded while the task was queued and the new entry no longer allows what the task asked for. Resubmit against the current `list_agents`. |
 | `413 command_input_too_large` | Input exceeds `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`; use a `stdio` adapter for large prompts. |
 | `503 task_capacity_reached` | Store full of non-terminal tasks; raise `A2A_RELAY_MAX_TASKS`/`A2A_RELAY_MAX_ACTIVE` or wait. |

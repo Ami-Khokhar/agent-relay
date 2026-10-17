@@ -84,6 +84,20 @@ GIT_RUN = (
     "        sys.exit(1)\n"
     "    print(done.stdout)\n"
 )
+BROKEN_CONFIG = "[core\n\tfsmonitor = /nonexistent\n"
+NO_BARE_CONFIG = "[safe]\n\tbareRepository = explicit\n"
+# An agent whose --access flag decides whether it writes the file named by $WROTE; the last flag wins,
+# as with most command-line parsers, and the prompt is optional so a lone flag is not a parse error.
+ACCESS_AGENT = (
+    "import argparse, json, os\n"
+    "parser = argparse.ArgumentParser()\n"
+    "parser.add_argument('--access', choices=['read', 'write'], default='write')\n"
+    "parser.add_argument('prompt', nargs='?')\n"
+    "args = parser.parse_args()\n"
+    "if args.access == 'write':\n"
+    "    open(os.environ['WROTE'], 'w').write('written')\n"
+    "print(json.dumps([args.access, args.prompt]))\n"
+)
 
 
 def fake(**extra):
@@ -240,6 +254,73 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertEqual(json.loads(done["output"]), ["--base", *NO_WRITE, "review"])
         plain = client.call_tool("delegate", {"agentId": "fake", "input": "x"})["structuredContent"]
         self.assertNotIn("readOnly", plain)
+
+
+class ReadOnlyInputTests(unittest.TestCase):
+    """A command agent gets the input as its last argument, after the profile's args and with no
+    boundary, so an input that starts with "-" is an option and, for most parsers, the last
+    --access wins: a caller could turn an args-only read-only profile back into a write run."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="a2a-input-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.wrote = os.path.join(self.dir, "wrote")
+
+    def start(self, profile):
+        agent = {"id": "access", "command": PYTHON, "args": ["-c", ACCESS_AGENT],
+                 "env": {"WROTE": self.wrote}, "readOnly": profile}
+        relay = Relay(agent)
+        self.addCleanup(relay.close)
+        return relay
+
+    def test_refuses_an_input_that_starts_with_a_dash_unless_the_profile_names_a_separator(self):
+        relay = self.start({"args": ["--access=read"]})
+        for text in ("--access=write", "-h", "-", "--", "- a list item"):
+            status, payload = relay.submit(agentId="access", input=text, readOnly=True)
+            self.assertEqual((status, payload["error"]), (400, "invalid_input"), text)
+            self.assertIn("inputSeparator", payload["message"])
+            self.assertIn("access", payload["message"])
+        self.assertEqual(relay.request("GET", "/v1/tasks")[1]["tasks"], [])
+        self.assertFalse(os.path.exists(self.wrote), "a caller's input turned a read-only run into a write run")
+        # A dash anywhere but first is ordinary text, and a task that is not read-only is not checked.
+        for text in ("review the diff", "review --access=write", " --access=write", "a\n--access=write"):
+            task = relay.run_task(agentId="access", input=text, readOnly=True)
+            self.assertEqual((task["status"], json.loads(task["output"])), ("completed", ["read", text]), text)
+        self.assertFalse(os.path.exists(self.wrote))
+        control = relay.run_task(agentId="access", input="--access=write")
+        self.assertEqual(control["status"], "completed", control)
+        self.assertTrue(os.path.exists(self.wrote), "without readOnly the same input selects write mode")
+        # A stdio agent gets its input on stdin, so no input can be an option.
+        stdio = Relay({"id": "wrapped", "type": "stdio", "command": PYTHON, "args": ["-c", STDIO_ARGV],
+                       "readOnly": {"args": ["--access=read"]}})
+        self.addCleanup(stdio.close)
+        task = stdio.run_task(agentId="wrapped", input="--access=write", readOnly=True)
+        self.assertEqual((task["status"], json.loads(task["output"])), ("completed", ["--access=read"]), task)
+
+    def test_with_an_input_separator_the_input_follows_it_and_is_never_an_option(self):
+        relay = self.start({"args": ["--access=read"], "inputSeparator": "--"})
+        for text in ("--access=write", "-h", "plain"):
+            task = relay.run_task(agentId="access", input=text, readOnly=True)
+            self.assertEqual((task["status"], json.loads(task["output"])), ("completed", ["read", text]), text)
+        self.assertFalse(os.path.exists(self.wrote), "the input was read as an option")
+
+    def test_the_separator_goes_after_the_profile_args_and_only_into_a_read_only_task(self):
+        relay = Relay(fake(options={"effort": {"high": ["--high"]}},
+                           readOnly={"args": NO_WRITE, "inputSeparator": "--"}))
+        self.addCleanup(relay.close)
+        task = relay.run_task(agentId="fake", input="-x", readOnly=True, options={"effort": "high"})
+        self.assertEqual(json.loads(task["output"]), ["--base", "--high", *NO_WRITE, "--", "-x"])
+        task = relay.run_task(agentId="fake", input="-x", options={"effort": "high"})
+        self.assertEqual(json.loads(task["output"]), ["--base", "--high", "-x"])
+
+    def test_a_profile_without_args_has_nothing_for_the_input_to_override(self):
+        # The sandbox is that profile's contract, and a prompt such as "- item" is ordinary text.
+        for profile in ({"sandbox": True}, {"sandbox": True, "inputSeparator": "--"}):
+            agent = {"id": "sandboxed", "type": "command", "readOnly": profile}
+            self.assertIsNone(server._input_refusal(agent, "--access=write"), profile)
+        agent = {"id": "args", "type": "command", "readOnly": {"args": NO_WRITE}}
+        self.assertIn("inputSeparator", server._input_refusal(agent, "--access=write"))
+        self.assertIsNone(server._input_refusal(agent, "access"))
 
 
 @unittest.skipUnless(SANDBOX, "the write-blocking sandbox needs sandbox-exec (macOS)")
@@ -532,8 +613,9 @@ class ReadOnlyRelayAccessTests(unittest.TestCase):
 
 
 def run_git(cwd, *args):
-    """Run git in ``cwd`` with a fixed identity and none of the caller's GIT_* variables."""
+    """Run git in ``cwd`` with a fixed identity, none of the caller's GIT_* variables and no global configuration."""
     env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     done = subprocess.run(["git", "-c", "user.name=tester", "-c", "user.email=tester@example.com", *args],
                           cwd=cwd, env=env, capture_output=True, text=True, check=True)
     return done.stdout.strip()
@@ -571,6 +653,33 @@ class GitFixture(unittest.TestCase):
     def index_bytes(self):
         with open(self.git_path(self.worktree, "index"), "rb") as handle:
             return handle.read()
+
+    def planted_git(self, name="planted bin"):
+        """A directory holding a ``git`` that records that it ran and then fails; returns (directory, marker)."""
+        directory = os.path.join(self.base, name)
+        os.mkdir(directory)
+        marker = os.path.join(self.base, name + " ran")
+        script = os.path.join(directory, "git")
+        write(script, f'#!/bin/sh\necho ran > "{marker}"\nexit 1\n')
+        os.chmod(script, 0o755)
+        return directory, marker
+
+    def home_with_git_config(self, text):
+        """A HOME whose global git configuration (~/.gitconfig and the XDG file) is ``text``.
+
+        A read-only task may write both files, so git must not read either. ``BROKEN_CONFIG`` makes git
+        die when it reads it; ``NO_BARE_CONFIG`` is valid but makes git refuse every bare repository."""
+        home = os.path.join(self.base, "relay home")
+        os.makedirs(os.path.join(home, ".config", "git"))
+        write(os.path.join(home, ".gitconfig"), text)
+        write(os.path.join(home, ".config", "git", "config"), text)
+        return home
+
+    def bare_repository(self):
+        """A bare repository under ``base`` (real ``git init --bare``); returns its path."""
+        bare = os.path.join(self.base, "mirror.git")
+        run_git(self.base, "init", "--bare", "-q", bare)
+        return bare
 
 
 class GitMetadataTests(GitFixture):
@@ -655,6 +764,78 @@ class GitMetadataTests(GitFixture):
             with mock.patch.dict(os.environ, {name: value}):
                 self.assertEqual(server._git_metadata(self.worktree), expected, name)
 
+    def test_runs_the_trusted_git_and_never_one_found_through_path(self):
+        planted, marker = self.planted_git()
+        expected = server._git_metadata(self.worktree)
+        with mock.patch.dict(os.environ, {"PATH": planted + os.pathsep + os.environ["PATH"]}):
+            self.assertEqual(server._git_metadata(self.worktree), expected)
+        self.assertFalse(os.path.exists(marker), "a git found through PATH ran, outside the sandbox")
+
+    def test_runs_git_by_absolute_path_in_a_minimal_environment(self):
+        home = self.home_with_git_config("")
+        # None of these may reach git: each could redirect the /usr/bin/git shim, load code or pick a config.
+        outside = {"HOME": home, "DEVELOPER_DIR": os.path.join(self.base, "no developer dir"),
+                   "SDKROOT": self.outside, "TOOLCHAINS": "none", "XDG_CONFIG_HOME": self.outside,
+                   "GIT_EXEC_PATH": self.outside, "GIT_CONFIG_SYSTEM": self.outside,
+                   "DYLD_INSERT_LIBRARIES": self.outside, "LD_PRELOAD": self.outside}
+        seen, real_run = [], subprocess.run
+
+        def spy(argv, **kwargs):
+            seen.append((argv, kwargs["env"]))
+            return real_run(argv, **kwargs)
+
+        with mock.patch.dict(os.environ, outside), mock.patch.object(server.subprocess, "run", side_effect=spy):
+            server._git_metadata(self.worktree)
+        self.assertEqual(len(seen), 2)
+        for argv, env in seen:
+            self.assertTrue(os.path.isabs(argv[0]), argv)
+            self.assertEqual(argv[0], server.TRUSTED_GIT)
+            self.assertEqual(env, {"PATH": "/usr/bin:/bin", "HOME": home, "GIT_CONFIG_NOSYSTEM": "1",
+                                   "GIT_CONFIG_GLOBAL": os.devnull})
+
+    def test_ignores_the_global_git_configuration_in_the_relays_home(self):
+        expected = server._git_metadata(self.worktree)
+        with mock.patch.dict(os.environ, {"HOME": self.home_with_git_config(BROKEN_CONFIG)}):
+            self.assertEqual(server._git_metadata(self.worktree), expected)
+
+    def test_refuses_to_guess_when_the_relay_has_no_trusted_git(self):
+        with mock.patch.object(server, "TRUSTED_GIT", None), mock.patch.object(server.subprocess, "run") as run:
+            with self.assertRaisesRegex(server.GitUnknown, "AGENT_RELAY_GIT"):
+                server._git_metadata(self.worktree)
+            self.assertEqual(server._git_metadata(self.outside), [])
+        run.assert_not_called()
+
+    def test_finds_the_git_directory_of_a_bare_repository_from_inside_it(self):
+        bare = self.bare_repository()
+        link = os.path.join(self.base, "link to hooks")
+        os.symlink(os.path.join(bare, "hooks"), link)
+        for cwd in (os.path.join(bare, "hooks"), os.path.join(bare, "refs", "heads"), bare, link):
+            self.assertEqual(server._git_metadata(cwd), [bare], cwd)
+
+    def test_finds_a_bare_repository_even_when_the_relays_home_forbids_them(self):
+        bare = self.bare_repository()
+        with mock.patch.dict(os.environ, {"HOME": self.home_with_git_config(NO_BARE_CONFIG)}):
+            self.assertEqual(server._git_metadata(os.path.join(bare, "hooks")), [bare])
+
+    def test_a_directory_with_head_objects_and_refs_counts_as_a_repository(self):
+        bare = self.bare_repository()
+        self.assertEqual(server._git_entry(os.path.join(bare, "hooks")), bare)
+        self.assertEqual(server._git_entry(self.main), os.path.join(self.main, ".git"))
+        partial = os.path.join(self.base, "partial")
+        os.makedirs(os.path.join(partial, "objects"))
+        write(os.path.join(partial, "HEAD"), "ref: refs/heads/main\n")
+        self.assertIsNone(server._git_entry(partial), "refs/ is missing, so git would not accept it either")
+        self.assertIsNone(server._git_entry(self.outside))
+
+    def test_refuses_to_guess_when_a_directory_looks_like_a_git_directory_but_git_disagrees(self):
+        lookalike = os.path.join(self.base, "lookalike")
+        os.makedirs(os.path.join(lookalike, "objects"))
+        os.makedirs(os.path.join(lookalike, "refs"))
+        os.mkdir(os.path.join(lookalike, "sub"))
+        write(os.path.join(lookalike, "HEAD"), "not a valid HEAD\n")
+        with self.assertRaisesRegex(server.GitUnknown, "lookalike"):
+            server._git_metadata(os.path.join(lookalike, "sub"))
+
     def test_the_sandbox_profile_gets_the_git_directories_as_parameters(self):
         argv = server._sandboxed({"id": "a"}, {"cwd": self.worktree}, ["agent"])
         profile = argv[argv.index("-p") + 1]
@@ -709,7 +890,7 @@ class ReadOnlyGitMetadataTests(GitFixture):
             ["add", "f.txt"], env={"GIT_CONFIG_COUNT": "invalid"})
 
     def fake_git(self, script):
-        """A PATH whose first entry holds a ``git`` that runs the shell ``script``.
+        """The path of a ``git`` that runs the shell ``script``, for the relay's AGENT_RELAY_GIT.
 
         The relay itself runs ``git log`` once at startup to report its revision (``/healthz``), so
         that command goes to the real git: a fake that hangs there would keep the relay from starting
@@ -721,15 +902,23 @@ class ReadOnlyGitMetadataTests(GitFixture):
         passthrough = f'case " $* " in *" log "*) exec "{GIT}" "$@";; esac\n'
         write(path, "#!/bin/sh\n" + passthrough + script + "\n")
         os.chmod(path, 0o755)
-        return directory + os.pathsep + os.environ["PATH"]
+        return path
 
-    def marker_relay(self, path_env):
+    def unrunnable_git(self):
+        """An executable the relay accepts as its git but the system cannot start (its interpreter is missing)."""
+        path = os.path.join(self.base, "broken git")
+        write(path, "#!/nonexistent/interpreter\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def marker_relay(self, git=None, env=None):
         """A relay whose agents write the path in their input; ``in-repo`` runs in the worktree and
-        ``outside`` in a directory that is not in any repository. Both write outside what they protect."""
+        ``outside`` in a directory that is not in any repository. Both write outside what they protect.
+        ``git`` is the owner's AGENT_RELAY_GIT override."""
         agents = [{"id": name, "command": PYTHON, "cwd": cwd, "readOnly": {"sandbox": True},
                    "args": ["-c", "import sys; open(sys.argv[1], 'w').write('ran')"]}
                   for name, cwd in (("in-repo", self.worktree), ("outside", self.outside))]
-        relay = Relay(agents, env={"PATH": path_env})
+        relay = Relay(agents, env={**({"AGENT_RELAY_GIT": git} if git else {}), **(env or {})})
         self.addCleanup(relay.close)
         return relay
 
@@ -745,16 +934,16 @@ class ReadOnlyGitMetadataTests(GitFixture):
         self.assertEqual(control["status"], "completed", control)
         self.assertTrue(os.path.exists(marker))
 
-    def test_a_read_only_task_in_a_repository_is_refused_when_git_is_missing(self):
-        relay = self.marker_relay(os.path.join(self.base, "no git here"))
-        self.assert_refused_and_only_an_unrestricted_run_starts(relay, "git")
+    def test_a_read_only_task_in_a_repository_is_refused_when_git_cannot_run(self):
+        relay = self.marker_relay(self.unrunnable_git())
+        self.assert_refused_and_only_an_unrestricted_run_starts(relay, "could not run")
 
     def test_a_read_only_task_in_a_repository_is_refused_when_git_fails(self):
         relay = self.marker_relay(self.fake_git("echo 'fatal: detected dubious ownership' >&2; exit 128"))
         self.assert_refused_and_only_an_unrestricted_run_starts(relay, "dubious ownership")
 
-    def test_a_read_only_task_outside_a_repository_runs_even_when_git_is_missing(self):
-        relay = self.marker_relay(os.path.join(self.base, "no git here"))
+    def test_a_read_only_task_outside_a_repository_runs_even_when_git_cannot_run(self):
+        relay = self.marker_relay(self.unrunnable_git())
         marker = os.path.join(self.base, "ran")
         task = relay.run_task(agentId="outside", input=marker, readOnly=True)
         self.assertEqual(task["status"], "completed", task)
@@ -768,6 +957,84 @@ class ReadOnlyGitMetadataTests(GitFixture):
         self.assertEqual(task["status"], "timed_out", task)
         self.assertLess(time.monotonic() - started, server.GIT_TIMEOUT_S - 1, "git was not limited to the task's time")
         self.assertFalse(os.path.exists(marker), "the adapter started after its deadline")
+
+    def test_a_read_only_task_uses_the_git_the_owner_names_in_agent_relay_git(self):
+        used = os.path.join(self.base, "override used")
+        relay = self.marker_relay(self.fake_git(f'echo used > "{used}"\nexec "{GIT}" "$@"'))
+        marker = os.path.join(self.base, "ran")
+        task = relay.run_task(agentId="in-repo", input=marker, readOnly=True)
+        self.assertEqual(task["status"], "completed", task)
+        self.assertTrue(os.path.exists(used), "the relay did not run the git named in AGENT_RELAY_GIT")
+        self.assertTrue(os.path.exists(marker))
+
+    def test_a_read_only_task_cannot_plant_a_git_or_a_git_config_that_runs_outside_the_sandbox(self):
+        """The attack from the review: a task writes an executable ``git`` into a writable PATH directory
+        and a ~/.gitconfig, and the next read-only task's unsandboxed git lookup runs or obeys them."""
+        bin_dir, home = os.path.join(self.base, "writable bin"), os.path.join(self.base, "relay home")
+        os.mkdir(bin_dir)
+        os.mkdir(home)
+        marker = os.path.join(self.base, "planted git ran")
+        git_dir = os.path.dirname(self.git_path(self.worktree, "index"))
+        git_source = f'#!/bin/sh\necho ran > "{marker}"\nexit 1\n'
+        plant = (
+            "import os\n"
+            f"git = os.path.join({bin_dir!r}, 'git')\n"
+            f"open(git, 'w').write({git_source!r})\n"
+            "os.chmod(git, 0o755)\n"
+            f"open(os.path.join({home!r}, '.gitconfig'), 'w').write({BROKEN_CONFIG!r})\n"
+        )
+        probe = f"open({os.path.join(git_dir, 'probe')!r}, 'w').write('changed')"
+        agents = [{"id": name, "command": PYTHON, "cwd": self.worktree, "readOnly": {"sandbox": True},
+                   "args": ["-c", script]} for name, script in (("plant", plant), ("probe", probe))]
+        relay = Relay(agents, env={"PATH": bin_dir + os.pathsep + os.environ["PATH"], "HOME": home})
+        self.addCleanup(relay.close)
+        planted = relay.run_task(agentId="plant", input="x", readOnly=True)
+        self.assertEqual(planted["status"], "completed", planted)
+        self.assertTrue(os.path.exists(os.path.join(bin_dir, "git")) and
+                        os.path.exists(os.path.join(home, ".gitconfig")), "the task could not plant them")
+        blocked = relay.run_task(agentId="probe", input="x", readOnly=True)
+        self.assertFalse(os.path.exists(marker), "the planted git ran outside the sandbox")
+        self.assertEqual(blocked["status"], "failed", blocked)
+        self.assertIn("Operation not permitted", blocked["error"])
+        self.assertFalse(os.path.exists(os.path.join(git_dir, "probe")))
+        # Without readOnly the same write succeeds, so the block above comes from the sandbox.
+        control = relay.run_task(agentId="probe", input="x")
+        self.assertEqual(control["status"], "completed", control)
+        self.assertTrue(os.path.exists(os.path.join(git_dir, "probe")))
+        self.assertFalse(os.path.exists(marker))
+
+    def test_a_read_only_task_cannot_write_the_head_of_the_bare_repository_it_works_inside(self):
+        bare = self.bare_repository()
+        hooks, head = os.path.join(bare, "hooks"), os.path.join(bare, "HEAD")
+        with open(head, "rb") as handle:
+            before = handle.read()
+        script = f"open({head!r}, 'w').write({'ref: refs/heads/other' + chr(10)!r})"
+        relay = Relay({"id": "mirror", "command": PYTHON, "args": ["-c", script], "cwd": hooks,
+                       "readOnly": {"sandbox": True}})
+        self.addCleanup(relay.close)
+        blocked = relay.run_task(agentId="mirror", input="x", readOnly=True)
+        self.assertEqual(blocked["status"], "failed", blocked)
+        self.assertIn("Operation not permitted", blocked["error"])
+        with open(head, "rb") as handle:
+            self.assertEqual(handle.read(), before, "the read-only task rewrote the bare repository's HEAD")
+        # Without readOnly the same write works, so the block above comes from the sandbox.
+        control = relay.run_task(agentId="mirror", input="x")
+        self.assertEqual(control["status"], "completed", control)
+        with open(head, "rb") as handle:
+            self.assertNotEqual(handle.read(), before)
+
+    def test_a_read_only_task_in_a_directory_that_only_looks_like_a_repository_is_refused(self):
+        lookalike = os.path.join(self.base, "lookalike")
+        os.makedirs(os.path.join(lookalike, "objects"))
+        os.makedirs(os.path.join(lookalike, "refs"))
+        os.mkdir(os.path.join(lookalike, "sub"))
+        write(os.path.join(lookalike, "HEAD"), "not a valid HEAD\n")
+        relay = Relay({"id": "look", "command": PYTHON, "cwd": os.path.join(lookalike, "sub"),
+                       "readOnly": {"sandbox": True}, "args": ["-c", "print(1)"]})
+        self.addCleanup(relay.close)
+        refused = relay.run_task(agentId="look", input="x", readOnly=True)
+        self.assertEqual(refused["status"], "failed", refused)
+        self.assertTrue(refused["error"].startswith("read_only_git_unknown"), refused)
 
     def test_a_read_only_task_cannot_stage_a_change_in_the_worktree(self):
         self.assert_blocked_and_only_a_writable_run_changes_the_index(["add", "f.txt"])
@@ -873,6 +1140,75 @@ class ReadOnlyRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "agent remote: readOnly needs a command or stdio agent"):
             self.load({"id": "remote", "type": "http", "url": "http://127.0.0.1:9000/run",
                        "readOnly": {"args": NO_WRITE}})
+
+    def test_accepts_an_input_separator_on_a_command_agent(self):
+        for profile in ({"args": NO_WRITE, "inputSeparator": "--"}, {"sandbox": True, "inputSeparator": "--"},
+                        {"args": NO_WRITE, "inputSeparator": "---input"}):
+            agents = self.load(fake(readOnly=profile))
+            self.assertEqual(agents["fake"]["readOnly"]["inputSeparator"], profile["inputSeparator"])
+
+    def test_rejects_a_malformed_input_separator_with_a_clear_error(self):
+        cases = [
+            ("readOnly inputSeparator must be a non-empty string", {"args": NO_WRITE, "inputSeparator": ""}),
+            ("readOnly inputSeparator must be a non-empty string", {"args": NO_WRITE, "inputSeparator": 5}),
+            ("readOnly inputSeparator must be a non-empty string", {"args": NO_WRITE, "inputSeparator": ["--"]}),
+            ("readOnly must set args, sandbox, or both", {"inputSeparator": "--"}),
+        ]
+        for message, profile in cases:
+            with self.subTest(profile=profile):
+                with self.assertRaisesRegex(ValueError, f"Invalid readOnly: agent fake: {message}"):
+                    self.load(fake(readOnly=profile))
+
+    def test_rejects_an_input_separator_on_a_stdio_agent_whose_input_is_on_stdin(self):
+        with self.assertRaisesRegex(ValueError, "agent wrapped: readOnly inputSeparator needs a command agent"):
+            self.load({"id": "wrapped", "type": "stdio", "command": PYTHON,
+                       "readOnly": {"args": NO_WRITE, "inputSeparator": "--"}})
+
+
+class TrustedGitTests(unittest.TestCase):
+    """The relay runs git outside any sandbox, so it must be a git a read-only task cannot replace."""
+
+    def setUp(self):
+        self.dir = os.path.realpath(tempfile.mkdtemp(prefix="a2a-trusted-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.script = os.path.join(self.dir, "git")
+        write(self.script, "#!/bin/sh\nexit 0\n")
+        os.chmod(self.script, 0o755)
+
+    def test_uses_the_override_the_owner_gives_in_the_relays_environment(self):
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_GIT": self.script}):
+            self.assertEqual(server._trusted_git(), self.script)
+
+    def test_without_an_override_uses_the_first_system_git_and_never_searches_path(self):
+        missing = os.path.join(self.dir, "missing")
+        with mock.patch.dict(os.environ, {"PATH": self.dir + os.pathsep + os.environ["PATH"]}):
+            os.environ.pop("AGENT_RELAY_GIT", None)
+            with mock.patch.object(server, "TRUSTED_GIT_PATHS", (missing, self.script)):
+                self.assertEqual(server._trusted_git(), self.script)
+            with mock.patch.object(server, "TRUSTED_GIT_PATHS", (missing,)):
+                self.assertIsNone(server._trusted_git(), "git was found through PATH")
+        self.assertTrue(server.TRUSTED_GIT_PATHS)
+        self.assertTrue(all(os.path.isabs(path) for path in server.TRUSTED_GIT_PATHS))
+        self.assertEqual(server.TRUSTED_GIT_PATHS[0], "/usr/bin/git")
+
+    def test_rejects_an_override_that_is_not_an_absolute_path_to_an_executable_file(self):
+        plain = os.path.join(self.dir, "plain")
+        write(plain, "not executable")
+        for bad in ("git", "bin/git", os.path.join(self.dir, "missing"), self.dir, plain):
+            with mock.patch.dict(os.environ, {"AGENT_RELAY_GIT": bad}):
+                with self.assertRaises(SystemExit, msg=bad) as caught:
+                    server._trusted_git()
+            self.assertIn("AGENT_RELAY_GIT must be an absolute path to an executable file", str(caught.exception))
+
+    def test_the_relay_does_not_start_with_a_bad_override(self):
+        relay = None
+        try:
+            with self.assertRaisesRegex(RuntimeError, "AGENT_RELAY_GIT must be an absolute path"):
+                relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]},
+                              env={"AGENT_RELAY_GIT": "git"})
+        finally:
+            if relay is not None:
+                relay.close()
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ class QueuedTaskReloadTests(unittest.TestCase):
         relay = Relay([BLOCKER, before], env={"A2A_RELAY_MAX_ACTIVE": "1"})
         self.addCleanup(relay.close)
         _, first = relay.submit(agentId="blocker", input=self.gate)
-        status, queued = relay.submit(agentId="probe", input="review", **body)
+        status, queued = relay.submit(agentId="probe", **{"input": "review", **body})
         self.assertEqual((status, queued["status"]), (202, "queued"))
         with open(relay.config, "w", encoding="utf-8") as handle:
             json.dump({"agents": [BLOCKER, after]}, handle)
@@ -74,6 +74,21 @@ class QueuedTaskReloadTests(unittest.TestCase):
             probe(readOnly={"args": ["--old"]}), probe(readOnly={"args": ["--new"]}), readOnly=True)
         self.assertEqual(task["status"], "completed", task)
         self.assertEqual(json.loads(task["output"]), ["--base", "--new", "review"])
+
+    def test_a_queued_read_only_task_fails_when_its_input_is_no_longer_behind_a_separator(self):
+        # The input "--flag" was accepted because the profile put "--" before it; the entry that
+        # runs it now has no separator, so the input would be read as an option and must not run.
+        task = self.queued_task_after_reload(
+            probe(readOnly={"args": ["--no-write"], "inputSeparator": "--"}),
+            probe(readOnly={"args": ["--no-write"]}), readOnly=True, input="--flag")
+        self.assert_failed_with(task, "invalid_input")
+
+    def test_a_queued_read_only_task_runs_with_the_input_separator_the_registry_now_has(self):
+        task = self.queued_task_after_reload(
+            probe(readOnly={"args": ["--no-write"], "inputSeparator": "--"}),
+            probe(readOnly={"args": ["--no-write"], "inputSeparator": "---"}), readOnly=True, input="--flag")
+        self.assertEqual(task["status"], "completed", task)
+        self.assertEqual(json.loads(task["output"]), ["--base", "--no-write", "---", "--flag"])
 
     def test_a_queued_task_runs_with_the_option_args_the_registry_now_maps(self):
         task = self.queued_task_after_reload(

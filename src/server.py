@@ -47,6 +47,9 @@ COLLECT_GRACE_S = 2.0
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # Seconds to wait for each git call that locates the git metadata of a sandboxed task's cwd.
 GIT_TIMEOUT_S = 5
+# Where the relay looks for git when the owner names none (AGENT_RELAY_GIT). It never searches PATH.
+# These directories belong to the system, so a task running as the relay's user cannot replace the file.
+TRUSTED_GIT_PATHS = ("/usr/bin/git", "/bin/git")
 
 
 def _env(*names, default=None):
@@ -134,16 +137,56 @@ UNKNOWN_REVISION = {"commit": "unknown", "short": "unknown", "date": "unknown"}
 REVISION = UNKNOWN_REVISION
 
 
+def _trusted_git():
+    """The absolute path of the git the relay runs, or None when it has none. Call once, at startup.
+
+    The relay runs git outside any sandbox (to locate a repository's metadata, and for its own
+    revision), as the user a read-only task runs as. A task may write anywhere outside the trees it
+    protects, so a git found through PATH could be one the task planted. The relay therefore never
+    searches PATH: the owner may name git in AGENT_RELAY_GIT (read here, from the relay's own
+    environment, which a task cannot change), else the first of TRUSTED_GIT_PATHS that is an
+    executable file. The owner's choice must be an absolute path to an executable file, or the
+    relay exits; it should be a file the agents cannot write.
+    """
+    override = _env("AGENT_RELAY_GIT")
+    if override is not None:
+        if not (os.path.isabs(override) and os.path.isfile(override) and os.access(override, os.X_OK)):
+            sys.exit("AGENT_RELAY_GIT must be an absolute path to an executable file")
+        return override
+    return next((path for path in TRUSTED_GIT_PATHS
+                 if os.path.isfile(path) and os.access(path, os.X_OK)), None)
+
+
+TRUSTED_GIT = _trusted_git()
+
+
+def _git_env():
+    """The environment git runs in: a fixed PATH, the relay's HOME and no configuration but the repository's.
+
+    Built from nothing, so no variable of the relay's reaches git: not a GIT_* one that could point
+    it at another repository or a hostile config, and not DEVELOPER_DIR or the like, which would
+    redirect the /usr/bin/git shim on macOS. The system and the global configuration are switched
+    off: a read-only task can write ~/.gitconfig, so git must not read it. Cost: a repository that
+    needs safe.directory from the global configuration is refused, and the task fails closed.
+    """
+    env = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    if os.environ.get("HOME"):
+        env["HOME"] = os.environ["HOME"]
+    return env
+
+
 def deployed_revision(root):
     """Commit and commit date of the git checkout at ``root``.
 
     Every field is "unknown" when ``root`` is not the top of a git checkout or git cannot
-    answer, so a missing git never stops the relay from starting.
+    answer, so a missing git never stops the relay from starting. git is the trusted one, in the
+    minimal environment (see _trusted_git and _git_env): a git planted on PATH must not run at startup.
     """
-    if not os.path.exists(os.path.join(root, ".git")):
+    if TRUSTED_GIT is None or not os.path.exists(os.path.join(root, ".git")):
         return dict(UNKNOWN_REVISION)
     try:
-        result = subprocess.run(["git", "-C", root, "log", "-1", "--format=%H%n%h%n%cI"],
+        result = subprocess.run([TRUSTED_GIT, "-C", root, "log", "-1", "--format=%H%n%h%n%cI"],
+                                env=_git_env(), stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return dict(UNKNOWN_REVISION)
@@ -256,16 +299,26 @@ def _check_options(agent_id, options):
                 raise bad(f"option {name} value {value} must be an array of strings")
 
 
-def _check_read_only(agent_id, profile):
-    """Raise ValueError unless ``profile`` is {"args": [...], "sandbox": bool} and enforces something."""
+def _check_read_only(agent_id, agent_type, profile):
+    """Raise ValueError unless ``profile`` is a readOnly profile that enforces something.
+
+    A profile is {"args": [...], "sandbox": bool, "inputSeparator": str}. ``inputSeparator`` is the
+    argument the relay puts before the task input. Only a command agent gets its input on the command
+    line, so a stdio agent may not declare one.
+    """
     def bad(problem):
         return ValueError(f"Invalid readOnly: agent {agent_id}: {problem}")
 
     if not isinstance(profile, dict):
         raise bad("readOnly must be an object")
-    unknown = sorted(set(profile) - {"args", "sandbox"})
+    unknown = sorted(set(profile) - {"args", "sandbox", "inputSeparator"})
     if unknown:
-        raise bad(f"readOnly has an unknown field {unknown[0]} (allowed: args, sandbox)")
+        raise bad(f"readOnly has an unknown field {unknown[0]} (allowed: args, sandbox, inputSeparator)")
+    if "inputSeparator" in profile:
+        if agent_type != "command":
+            raise bad("readOnly inputSeparator needs a command agent: a stdio agent gets its input on stdin")
+        if not isinstance(profile["inputSeparator"], str) or not profile["inputSeparator"]:
+            raise bad("readOnly inputSeparator must be a non-empty string")
     args = profile.get("args", [])
     if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
         raise bad("readOnly args must be an array of strings")
@@ -333,7 +386,7 @@ def load_registry(path):
         if raw.get("readOnly") is not None:
             if agent_type == "http":
                 raise ValueError(f"Invalid readOnly: agent {agent_id}: readOnly needs a command or stdio agent")
-            _check_read_only(agent_id, raw["readOnly"])
+            _check_read_only(agent_id, agent_type, raw["readOnly"])
         delegate_to = raw.get("delegateTo")
         if delegate_to is not None and (not isinstance(delegate_to, list) or not all(
                 isinstance(item, str) for item in delegate_to)):
@@ -559,7 +612,9 @@ def _spawn(agent, task, argv, env, stdin):
             if _remaining(task) > 0:  # without time left the deadline check below ends the task
                 _finish(task, "failed", error=(
                     f"read_only_git_unknown: cannot protect the git metadata of {_task_cwd(agent, task)}, "
-                    f"so the task did not start: {exc}. Fix git for this directory, or submit without readOnly"))
+                    f"so the task did not start: {exc}. Fix git for this directory (the relay ignores the "
+                    "global git configuration, so safe.directory there does not apply), "
+                    "or submit without readOnly"))
                 return None
     if _remaining(task) <= 0:  # git discovery may have used the task's time up
         _finish(task, "timed_out", error=f"Agent exceeded {task['timeoutMs']} ms")
@@ -613,11 +668,24 @@ class GitUnknown(Exception):
     """git could not say where a repository's git metadata is, so the relay cannot protect it."""
 
 
+def _looks_like_git_dir(path):
+    """True when ``path`` has what git itself asks of a git directory: a HEAD, an objects/ and a refs/."""
+    head = os.path.join(path, "HEAD")
+    return ((os.path.isfile(head) or os.path.islink(head))
+            and os.path.isdir(os.path.join(path, "objects")) and os.path.isdir(os.path.join(path, "refs")))
+
+
 def _git_entry(directory):
-    """The nearest ``.git`` (file or directory) at or above ``directory``, or None when there is none."""
+    """The nearest sign of a repository at or above ``directory``, or None when there is none.
+
+    A sign is a ``.git`` entry (file or directory), or a directory that is itself a git directory, as
+    a bare repository is: git finds it from any directory inside it, and it has no ``.git``.
+    """
     for candidate in (Path(directory), *Path(directory).parents):
         if os.path.lexists(candidate / ".git"):
             return str(candidate / ".git")
+        if _looks_like_git_dir(candidate):
+            return str(candidate)
     return None
 
 
@@ -626,18 +694,21 @@ def _git_path(cwd, arg, deadline=None):
 
     Failures are: git missing, slower than GIT_TIMEOUT_S or than the time left before ``deadline`` (a
     time.monotonic() value), a non-zero exit (not a repository, unsafe owner), and output that is not an
-    existing directory (an old git echoes an option it does not know). Git runs without any GIT_*
-    variable of the relay's, so none can point it at another repository or break its configuration.
-    The path is read as bytes: it ends in git's one newline and may contain others. A relative path
-    is relative to ``cwd``.
+    existing directory (an old git echoes an option it does not know). It runs outside the sandbox, so
+    it is the relay's trusted git by absolute path, in the minimal environment of _git_env: a git a
+    task planted on PATH, or a ~/.gitconfig it wrote, must not run or apply. The path is read as bytes:
+    it ends in git's one newline and may contain others. A relative path is relative to ``cwd``.
     """
     timeout = GIT_TIMEOUT_S if deadline is None else min(GIT_TIMEOUT_S, deadline - time.monotonic())
     if timeout <= 0:
         raise GitUnknown("the task's time ran out first")
-    env = {name: value for name, value in os.environ.items() if not name.upper().startswith("GIT_")}
+    if TRUSTED_GIT is None:
+        raise GitUnknown("the relay has no trusted git (it never searches PATH); "
+                         "set AGENT_RELAY_GIT to an absolute path in the relay's environment")
     try:
-        done = subprocess.run(["git", "-C", cwd, "rev-parse", arg], env=env, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        done = subprocess.run([TRUSTED_GIT, "-C", cwd, "rev-parse", arg], env=_git_env(),
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout)
     except subprocess.TimeoutExpired:
         raise GitUnknown(f"git rev-parse {arg} took longer than {timeout:.1f} s") from None
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -661,9 +732,11 @@ def _git_metadata(cwd, deadline=None):
     these is under the cwd, so a deny on the cwd alone would let a read-only agent rewrite them (for
     example ``git --work-tree=/tmp/x checkout <rev> -- <path>`` rewrites the real worktree's index).
 
-    Fails closed. With no ``.git`` entry at or above the cwd the cwd is outside any repository, git is
-    not asked, and the result is []. With one, git must answer: any failure raises GitUnknown, because
-    a read-only task must not run with less protection than it promises.
+    Fails closed. With no sign of a repository at or above the cwd (a ``.git`` entry, or a directory
+    that looks like a git directory, as a bare repository does) the cwd is outside any repository, git
+    is not asked, and the result is []. With one, git must answer: any failure raises GitUnknown,
+    because a read-only task must not run with less protection than it promises. A directory that only
+    looks like a git directory, and that git does not accept, is therefore refused too.
     """
     real = os.path.realpath(cwd)
     entry = _git_entry(real)
@@ -672,7 +745,7 @@ def _git_metadata(cwd, deadline=None):
     try:
         paths = [_git_path(real, arg, deadline) for arg in ("--absolute-git-dir", "--git-common-dir")]
     except GitUnknown as exc:
-        raise GitUnknown(f"{exc} (a .git entry exists at {entry})") from None
+        raise GitUnknown(f"{exc} (git metadata was expected at {entry})") from None
     return list(dict.fromkeys(os.path.realpath(path) for path in paths))
 
 
@@ -1118,14 +1191,37 @@ def _cwd_required(agent, task_cwd):
     return None
 
 
+def _input_refusal(agent, task_input):
+    """Why a read-only task's input may not go on the command line as it is, or None.
+
+    ``agent`` has a readOnly profile. A command agent gets the input as its last argument, after the
+    profile's args and with nothing between them. An input that starts with "-" is then an option, and
+    with most parsers the last one wins: input "--access=write" would undo the profile's
+    "--access=read". So the profile must say how the input is separated: with an ``inputSeparator``
+    (for example "--") the relay puts it before the input and any input is data; without one, an
+    input that starts with "-" is refused. A stdio agent gets its input on stdin, so nothing is
+    refused. A profile without args has no argument for the input to override: the sandbox is its
+    contract.
+    """
+    profile = agent["readOnly"]
+    if (agent["type"] != "command" or not profile.get("args") or profile.get("inputSeparator")
+            or not task_input.startswith("-")):
+        return None
+    return (f"agent {agent['id']} takes its input as a command-line argument, and an input that starts with "
+            "\"-\" could be read as an option that overrides its read-only arguments: start the input with "
+            "another character, or ask the owner to set inputSeparator (for example \"--\") in the agent's "
+            "readOnly profile")
+
+
 def _dispatch_plan(agent, task):
     """Re-check a queued task against the registry entry that is about to run it.
 
     Returns (extra_args, sandbox, error). The registry may have been reloaded since the task was
     accepted, so what was valid then proves nothing now: the task's options must still resolve, and a
-    read-only task needs an entry that still promises it on this host. ``error`` is the (code, message)
-    that submission would give, and the task must not run. The extra args and the sandbox flag come from
-    the entry as it is now, so a task never runs with the options or profile of an entry that is gone.
+    read-only task needs an entry that still promises it on this host and still lets its input onto the
+    command line. ``error`` is the (code, message) that submission would give, and the task must not
+    run. The extra args and the sandbox flag come from the entry as it is now, so a task never runs
+    with the options or profile of an entry that is gone.
     """
     _, option_args, error = _resolve_options(agent, task.get("options"))
     if error:
@@ -1138,8 +1234,14 @@ def _dispatch_plan(agent, task):
     refusal = _cwd_required(agent, task.get("cwd"))
     if refusal:
         return None, False, ("cwd_required", refusal)
-    # The profile's args go last, so no option's args can follow and override them.
-    return option_args + agent["readOnly"].get("args", []), bool(agent["readOnly"].get("sandbox")), None
+    refusal = _input_refusal(agent, task["input"])
+    if refusal:
+        return None, False, ("invalid_input", refusal)
+    profile = agent["readOnly"]
+    # The profile's args go last, so no option's args can follow and override them, then the separator
+    # that keeps the input (appended after these) from being read as an option.
+    separator = [profile["inputSeparator"]] if profile.get("inputSeparator") else []
+    return option_args + profile.get("args", []) + separator, bool(profile.get("sandbox")), None
 
 
 def _limits():
@@ -1410,6 +1512,9 @@ class Handler(BaseHTTPRequestHandler):
         no_cwd = _cwd_required(agent, task_cwd) if read_only else None
         if no_cwd:
             return self._json(400, {"error": "cwd_required", "message": no_cwd})
+        bad_input = _input_refusal(agent, input_text) if read_only else None
+        if bad_input:
+            return self._json(400, {"error": "invalid_input", "message": bad_input})
         if agent["type"] == "command" and len(input_text.encode("utf-8")) > MAX_COMMAND_INPUT:
             return self._json(413, {"error": "command_input_too_large"})
         if timeout_ms is not None:
