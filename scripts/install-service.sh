@@ -5,10 +5,18 @@
 # Linux: ~/.config/systemd/user/agent-relay.service (systemd --user)
 #
 # Usage:
-#   scripts/install-service.sh            install and start
+#   scripts/install-service.sh            install and start the service, and a
+#                                   scheduled update that runs scripts/update.sh
+#                                   every 6 hours so the checkout cannot fall
+#                                   behind unnoticed
+#   scripts/install-service.sh --no-update-timer
+#                                   install the service only and remove an
+#                                   update timer left by an earlier install;
+#                                   update the checkout yourself with
+#                                   scripts/update.sh
 #   scripts/install-service.sh --with-update-timer
-#                                   also install a scheduled update that runs
-#                                   scripts/update.sh every 6 hours
+#                                   accepted for old callers; the timer is now
+#                                   the default
 #   scripts/install-service.sh --uninstall   (removes the service and the
 #                                   update timer if one is installed)
 #
@@ -29,11 +37,12 @@ PORT="${A2A_RELAY_PORT:-${AGENT_RELAY_PORT:-43124}}"
 LABEL="com.agent-relay"
 LOG_DIR="$HOME/.local/state/agent-relay"
 
-WITH_UPDATE_TIMER=0
+WITH_UPDATE_TIMER=1
 UNINSTALL=0
 for arg in "$@"; do
   case "$arg" in
-    --with-update-timer) WITH_UPDATE_TIMER=1 ;;
+    --with-update-timer) ;;
+    --no-update-timer) WITH_UPDATE_TIMER=0 ;;
     --uninstall) UNINSTALL=1 ;;
     *) echo "warning: unknown argument: $arg" >&2 ;;
   esac
@@ -144,8 +153,38 @@ fi
 
 echo "verify: curl -sS http://127.0.0.1:$PORT/healthz"
 
-# Optional scheduled update: keep the checkout current and restart the service
-# when the code changed. See scripts/update.sh.
+# Scheduled update (on unless --no-update-timer): keep the checkout current and restart
+# the service when the code changed. See scripts/update.sh. It updates only a git clone,
+# so a timer for any other directory would fail on every run.
+if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -d "$TARGET_DIR/.git" ]; then
+  echo "warning: $TARGET_DIR is not a git checkout, so scripts/update.sh cannot update it; no update timer installed" >&2
+  WITH_UPDATE_TIMER=0
+elif [ "$WITH_UPDATE_TIMER" = "0" ]; then
+  # --no-update-timer also removes a timer that an earlier install left behind. Only the
+  # update timer goes: the relay service installed above stays as it is.
+  REMOVED_TIMER=0
+  if [ "$(uname -s)" = "Darwin" ]; then
+    UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
+    if [ -f "$UPDATE_PLIST" ]; then
+      launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
+      rm -f "$UPDATE_PLIST"
+      REMOVED_TIMER=1
+    fi
+  else
+    UNIT_DIR="$HOME/.config/systemd/user"
+    if [ -f "$UNIT_DIR/agent-relay-update.timer" ] || [ -f "$UNIT_DIR/agent-relay-update.service" ]; then
+      systemctl --user disable --now agent-relay-update.timer 2>/dev/null || true
+      rm -f "$UNIT_DIR/agent-relay-update.service" "$UNIT_DIR/agent-relay-update.timer"
+      systemctl --user daemon-reload 2>/dev/null || true
+      REMOVED_TIMER=1
+    fi
+  fi
+  if [ "$REMOVED_TIMER" = "1" ]; then
+    echo "removed the existing update timer (--no-update-timer): this checkout changes only when you run scripts/update.sh"
+  else
+    echo "no update timer installed (--no-update-timer): this checkout changes only when you run scripts/update.sh"
+  fi
+fi
 if [ "$WITH_UPDATE_TIMER" = "1" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"

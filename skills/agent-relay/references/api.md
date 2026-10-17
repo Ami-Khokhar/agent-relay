@@ -18,9 +18,14 @@ headers). Error responses close the connection. `GET /healthz` needs no token.
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
               "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4,
-              "taskRetentionMs": null, "maxDelegationDepth": 2, "maxDelegatedTasks": 20 } }
+              "taskRetentionMs": null, "maxDelegationDepth": 2, "maxDelegatedTasks": 20 },
+  "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
+                "date": "2026-10-02T19:10:52Z" } }
 ```
 
+`revision` is the git commit and commit date (ISO 8601) of the checkout the relay started
+from, read once at startup. Each of its fields is `"unknown"` when the relay does not run
+from a git checkout or git cannot answer. A relay older than this field omits `revision`.
 `maxTimeoutMs` is `null` when no hard cap is configured, and `taskRetentionMs` is `null` when
 no retention period is set. `active` counts running tasks
 and `queued` counts waiting tasks (the same distinction as the task statuses;
@@ -37,10 +42,11 @@ next run is restarted, since an old relay cannot report counts).
     "cwd": "/path/to/project", "allowedRoots": ["/path/to/project"],
     "capabilities": { "newTasks": true, "nativeSessions": false, "streaming": false,
                       "cancellation": "process_signal" } }
-] }
+], "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
+                 "date": "2026-10-02T19:10:52Z" } }
 ```
 
-`timeoutMs` is the effective timeout for that agent. `cancellation` is `process_signal`
+`revision` is the same object as in `GET /healthz`. `timeoutMs` is the effective timeout for that agent. `cancellation` is `process_signal`
 for command/stdio adapters and `request_only` for HTTP. `cwd`, `allowedRoots`, and
 `delegateTo` (the agents its tasks may delegate to) appear only when configured.
 
@@ -143,7 +149,7 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `list_agents` | `{}` | Same payload as `GET /v1/agents`. |
+| `list_agents` | `{}` | Same payload as `GET /v1/agents`, including `revision`. |
 | `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` | Submitted task; with `waitMs`, the terminal task. |
 | `wait_task` | `{ taskId, maxWaitMs? }` | Terminal task, or the current task if the wait elapses. |
 | `get_task` | `{ taskId, includeInput? }` | Current task. With `includeInput: true` it also carries `input`. |

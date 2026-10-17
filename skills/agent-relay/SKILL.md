@@ -149,9 +149,10 @@ To pick up new features merged on the project's `main`, run `bash
 it fast-forwards the checkout and restarts the service only when the code changed. The
 first restart is deferred while tasks are in flight (or while the relay cannot report
 counts), and the next run escalates — restarting unless tasks are visibly busy — so an
-update lands at most one cycle late. `install-service.sh --with-update-timer` schedules
-that update every 6 hours. MCP clients need no reconfiguration — the tool list refreshes
-on each client's next session start.
+update lands at most one cycle late. `install-service.sh` also schedules that update every
+6 hours when the install directory is a git clone; pass `--no-update-timer` to opt out
+(`--with-update-timer` is still accepted and does nothing). MCP clients need no
+reconfiguration — the tool list refreshes on each client's next session start.
 
 Register the MCP server in the orchestrating client (point `args` at the absolute path).
 The setup script prints these for your checkout:
@@ -182,7 +183,10 @@ bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints
 ```
 
 `/v1/agents` lists your entries with `adapter`, effective `timeoutMs`, and `capabilities`.
-If it is empty, the registry did not parse — the relay prints `Configuration error: ...`
+`/healthz`, `/v1/agents`, and the `list_agents` tool also report `revision`: the commit
+(`commit`, `short`) and commit `date` of the checkout the relay started from. A `date` weeks
+old means the running relay is stale: run `scripts/update.sh`. A field is `"unknown"` when
+the relay does not run from a git checkout. If the list is empty, the registry did not parse — the relay prints `Configuration error: ...`
 and exits on a bad registry, so check the server log.
 
 ## 5. Delegate work

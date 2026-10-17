@@ -123,6 +123,27 @@ QUEUE = []
 ACTIVE = 0
 SHUTTING_DOWN = False
 _WARNED_FALLBACK = False
+UNKNOWN_REVISION = {"commit": "unknown", "short": "unknown", "date": "unknown"}
+REVISION = UNKNOWN_REVISION
+
+
+def deployed_revision(root):
+    """Commit and commit date of the git checkout at ``root``.
+
+    Every field is "unknown" when ``root`` is not the top of a git checkout or git cannot
+    answer, so a missing git never stops the relay from starting.
+    """
+    if not os.path.exists(os.path.join(root, ".git")):
+        return dict(UNKNOWN_REVISION)
+    try:
+        result = subprocess.run(["git", "-C", root, "log", "-1", "--format=%H%n%h%n%cI"],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            return dict(UNKNOWN_REVISION)
+        commit, short, date = result.stdout.splitlines()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return dict(UNKNOWN_REVISION)
+    return {"commit": commit, "short": short, "date": date}
 
 
 def now_iso():
@@ -997,11 +1018,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"ok": True, "agents": len(AGENTS),
                                             "registry": REGISTRY_PATH,
                                             "tasks": len(TASKS), "active": active,
-                                            "queued": queued, "limits": _limits()})
+                                            "queued": queued, "limits": _limits(),
+                                            "revision": REVISION})
                 return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/agents":
                 if method == "GET":
-                    return self._json(200, {"agents": _agent_listing()})
+                    return self._json(200, {"agents": _agent_listing(), "revision": REVISION})
                 return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/tasks":
                 if method == "POST":
@@ -1238,7 +1260,7 @@ def _reload_signal(_signum, _frame):
 
 
 def main():
-    global AGENTS, REGISTRY_PATH, TOKEN
+    global AGENTS, REGISTRY_PATH, REVISION, TOKEN
     if not is_loopback(HOST) and not ALLOW_NON_LOOPBACK:
         print(f"error: refusing to listen on non-loopback address {HOST}: the relay has no TLS and "
               "is a single-user local service. Put it behind an authenticated HTTPS proxy and set "
@@ -1251,6 +1273,7 @@ def main():
     except (OSError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
+    REVISION = deployed_revision(str(Path(__file__).resolve().parent.parent))
     if TASK_RETENTION_MS:
         threading.Thread(target=_purge_periodically, daemon=True).start()
     signal.signal(signal.SIGTERM, _shutdown)

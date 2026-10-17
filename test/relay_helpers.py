@@ -32,7 +32,7 @@ def free_port():
 class Relay:
     """Spawns src/server.py with the given agent (or list of agents) as its registry and talks to it over HTTP."""
 
-    def __init__(self, agent, env=None):
+    def __init__(self, agent, env=None, server=SERVER):
         self.dir = tempfile.mkdtemp(prefix="a2a-relay-")
         self.config = os.path.join(self.dir, "agents.json")
         with open(self.config, "w", encoding="utf-8") as handle:
@@ -42,7 +42,7 @@ class Relay:
                      "AGENT_RELAY_TOKEN": TOKEN}
         child_env.update(env or {})
         self.proc = subprocess.Popen(
-            [PYTHON, SERVER], cwd=ROOT, env=child_env,
+            [PYTHON, server], cwd=ROOT, env=child_env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.base = f"http://127.0.0.1:{self.port}"
