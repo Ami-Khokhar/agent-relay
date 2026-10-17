@@ -138,7 +138,8 @@ def deployed_revision(root):
     try:
         result = subprocess.run(["git", "-C", root, "log", "-1", "--format=%H%n%h%n%cI"],
                                 capture_output=True, text=True, timeout=5)
-        # A failed git prints nothing to stdout, so the unpack raises ValueError.
+        if result.returncode != 0:
+            return dict(UNKNOWN_REVISION)
         commit, short, date = result.stdout.splitlines()
     except (OSError, subprocess.SubprocessError, ValueError):
         return dict(UNKNOWN_REVISION)

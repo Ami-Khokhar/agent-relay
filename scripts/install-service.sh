@@ -10,8 +10,10 @@
 #                                   every 6 hours so the checkout cannot fall
 #                                   behind unnoticed
 #   scripts/install-service.sh --no-update-timer
-#                                   install the service only; update the
-#                                   checkout yourself with scripts/update.sh
+#                                   install the service only and remove an
+#                                   update timer left by an earlier install;
+#                                   update the checkout yourself with
+#                                   scripts/update.sh
 #   scripts/install-service.sh --with-update-timer
 #                                   accepted for old callers; the timer is now
 #                                   the default
@@ -158,7 +160,30 @@ if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -d "$TARGET_DIR/.git" ]; then
   echo "warning: $TARGET_DIR is not a git checkout, so scripts/update.sh cannot update it; no update timer installed" >&2
   WITH_UPDATE_TIMER=0
 elif [ "$WITH_UPDATE_TIMER" = "0" ]; then
-  echo "update timer not installed (--no-update-timer): this checkout changes only when you run scripts/update.sh"
+  # --no-update-timer also removes a timer that an earlier install left behind. Only the
+  # update timer goes: the relay service installed above stays as it is.
+  REMOVED_TIMER=0
+  if [ "$(uname -s)" = "Darwin" ]; then
+    UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
+    if [ -f "$UPDATE_PLIST" ]; then
+      launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
+      rm -f "$UPDATE_PLIST"
+      REMOVED_TIMER=1
+    fi
+  else
+    UNIT_DIR="$HOME/.config/systemd/user"
+    if [ -f "$UNIT_DIR/agent-relay-update.timer" ] || [ -f "$UNIT_DIR/agent-relay-update.service" ]; then
+      systemctl --user disable --now agent-relay-update.timer 2>/dev/null || true
+      rm -f "$UNIT_DIR/agent-relay-update.service" "$UNIT_DIR/agent-relay-update.timer"
+      systemctl --user daemon-reload 2>/dev/null || true
+      REMOVED_TIMER=1
+    fi
+  fi
+  if [ "$REMOVED_TIMER" = "1" ]; then
+    echo "removed the existing update timer (--no-update-timer): this checkout changes only when you run scripts/update.sh"
+  else
+    echo "no update timer installed (--no-update-timer): this checkout changes only when you run scripts/update.sh"
+  fi
 fi
 if [ "$WITH_UPDATE_TIMER" = "1" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then

@@ -348,11 +348,15 @@ class UpdateTimerTests(unittest.TestCase):
         os.makedirs(os.path.join(checkout, "src"), exist_ok=True)
         open(os.path.join(checkout, "src", "server.py"), "w").close()
 
-    def _env(self, tmp, checkout):
+    def _env(self, tmp, checkout, system="Darwin"):
+        """Stub uname, launchctl and systemctl; each service-manager call is
+        appended to <tmp>/service-manager.log as '<tool> <arguments>'."""
         stubs = os.path.join(tmp, "stubs")
         os.makedirs(stubs)
-        for name, body in (("uname", "echo Darwin\n"),
-                           ("launchctl", "exit 0\n")):
+        log = os.path.join(tmp, "service-manager.log")
+        for name, body in (("uname", f"echo {system}\n"),
+                           ("launchctl", f'echo "launchctl $*" >> "{log}"\n'),
+                           ("systemctl", f'echo "systemctl $*" >> "{log}"\n')):
             stub = os.path.join(stubs, name)
             with open(stub, "w", encoding="utf-8") as handle:
                 handle.write(f"#!/bin/sh\n{body}")
@@ -360,6 +364,17 @@ class UpdateTimerTests(unittest.TestCase):
         return {**os.environ, "HOME": tmp, "AGENT_RELAY_DIR": checkout,
                 "PATH": f"{stubs}:{os.environ['PATH']}",
                 "AGENT_RELAY_PYTHON": PYTHON}
+
+    @staticmethod
+    def _take_log(tmp):
+        """Return the service-manager calls since the last call, then clear the log."""
+        log = os.path.join(tmp, "service-manager.log")
+        if not os.path.exists(log):
+            return []
+        with open(log, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        os.remove(log)
+        return lines
 
     def test_with_update_timer_installs_and_uninstall_removes_both(self):
         install_service = os.path.join(ROOT, "scripts", "install-service.sh")
@@ -445,7 +460,71 @@ class UpdateTimerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("unknown argument", result.stderr)
             self.assertEqual(os.listdir(agents), ["com.agent-relay.plist"])
-            self.assertIn("update timer not installed", result.stdout)
+            self.assertIn("no update timer installed", result.stdout)
+            self.assertNotIn("removed", result.stdout)
+            # Nothing existed, so nothing is unloaded for the update timer.
+            self.assertFalse([line for line in self._take_log(tmp) if "update" in line])
+
+    def test_no_update_timer_removes_an_update_timer_from_an_earlier_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            env = self._env(tmp, checkout)
+            self._fake_checkout(checkout)
+            agents = os.path.join(tmp, "Library", "LaunchAgents")
+            service_plist = os.path.join(agents, "com.agent-relay.plist")
+            update_plist = os.path.join(agents, "com.agent-relay.update.plist")
+
+            self.assertEqual(self._install(env).returncode, 0)
+            self.assertTrue(os.path.exists(update_plist))
+            self._take_log(tmp)
+
+            result = self._install(env, "--no-update-timer")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(os.path.exists(update_plist))
+            self.assertTrue(os.path.exists(service_plist))
+            self.assertEqual(os.listdir(agents), ["com.agent-relay.plist"])
+            self.assertIn(f"launchctl unload {update_plist}", self._take_log(tmp))
+            self.assertIn("removed the existing update timer", result.stdout)
+            self.assertNotIn("no update timer installed", result.stdout)
+
+    def test_no_update_timer_removes_the_systemd_update_units_but_keeps_the_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            env = self._env(tmp, checkout, system="Linux")
+            self._fake_checkout(checkout)
+            units = os.path.join(tmp, ".config", "systemd", "user")
+
+            self.assertEqual(self._install(env).returncode, 0)
+            self.assertEqual(sorted(os.listdir(units)),
+                             ["agent-relay-update.service", "agent-relay-update.timer",
+                              "agent-relay.service"])
+            self._take_log(tmp)
+
+            result = self._install(env, "--no-update-timer")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(os.listdir(units), ["agent-relay.service"])
+            self.assertIn("systemctl --user disable --now agent-relay-update.timer",
+                          self._take_log(tmp))
+            self.assertIn("removed the existing update timer", result.stdout)
+            self.assertNotIn("no update timer installed", result.stdout)
+
+    def test_no_update_timer_on_linux_without_an_earlier_timer_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            env = self._env(tmp, checkout, system="Linux")
+            self._fake_checkout(checkout)
+            units = os.path.join(tmp, ".config", "systemd", "user")
+
+            result = self._install(env, "--no-update-timer")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(os.listdir(units), ["agent-relay.service"])
+            self.assertIn("no update timer installed", result.stdout)
+            self.assertNotIn("removed", result.stdout)
+            self.assertFalse([line for line in self._take_log(tmp)
+                              if "update.timer" in line])
 
     def test_update_timer_is_skipped_with_a_warning_outside_a_git_checkout(self):
         """update.sh cannot update a directory that is not a git clone, so a
@@ -509,6 +588,19 @@ class DeployedRevisionTests(unittest.TestCase):
             # A repository with no commit makes git exit non-zero.
             empty = init_repo(os.path.join(tmp, "empty"), commits=0)
             self.assertEqual(server.deployed_revision(empty), UNKNOWN_REVISION)
+
+    def test_reports_unknown_when_git_exits_non_zero_even_with_plausible_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._checkout(tmp)
+            stubs = os.path.join(tmp, "stubs")
+            os.makedirs(stubs)
+            stub = os.path.join(stubs, "git")
+            with open(stub, "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\necho 0123456789abcdef0123456789abcdef01234567\n"
+                             "echo 0123456\necho 2026-09-23T10:00:00+05:30\nexit 1\n")
+            os.chmod(stub, 0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{stubs}:{os.environ['PATH']}"}):
+                self.assertEqual(server.deployed_revision(repo), UNKNOWN_REVISION)
 
     def test_a_running_relay_and_its_mcp_list_agents_report_the_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
