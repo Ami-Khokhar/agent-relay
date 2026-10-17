@@ -135,6 +135,30 @@ Codex: `--skip-git-repo-check` allows `codex exec` outside a git repository, and
 files (checked against codex-cli 0.155.1). Without the second flag, a task can succeed
 while making no changes.
 
+A task can choose among the per-task `options` the agent declares in its registry entry
+(`"options": {"effort": {"high": ["-c", "model_reasoning_effort=high"]}}`, chosen with
+`"options": {"effort": "high"}`). The mapped args are added after the entry's `args` and before
+the task input, for `command` and `stdio` agents. A `stdio` adapter sees them as its own
+arguments; the `relay.adapter/v1` request does not change. An `http` entry cannot declare options.
+
+A task can ask for a read-only run with `"readOnly": true` when the agent's registry entry has a
+`readOnly` profile (`{"args": ["--exclude-tools", "edit,write"], "sandbox": true}`). The profile
+`args` follow the option args and precede the task input. With `"sandbox": true` on macOS the
+relay starts the adapter under `/usr/bin/sandbox-exec` with a profile that denies file writes
+under the task's `cwd`, the agent's `allowedRoots` and the git metadata of the `cwd` (a worktree's
+own git directory and the shared one, found with `git rev-parse`; reads stay allowed), renaming or
+deleting any directory above those trees (the ancestor rule), reading the
+relay token file, and connecting to the relay's TCP port, and allows everything else (the relay also removes
+`AGENT_RELAY_TOKEN` and `A2A_RELAY_TOKEN` from the adapter's environment). It does not stop a
+hard link that already exists outside the tree, writes made for the adapter by another local
+service such as a Docker socket, reads of other files, or other network access. macOS does not
+nest sandboxes, so an adapter that applies its own sandbox fails under `"sandbox": true`; use
+`args` for such an adapter. An `http` entry cannot declare a profile. The git lookup fails closed:
+when a `.git` entry exists at or above the `cwd` and git cannot answer, the task fails with
+`read_only_git_unknown` and the adapter does not start. The relay checks a queued task against the
+registry entry again when it dispatches it, so a reload that removed the profile fails the task
+with `read_only_unsupported` instead of running it.
+
 A task can override the working directory with `cwd` on `POST /v1/tasks` / MCP `delegate`.
 The relay resolves the path and accepts it only when it is inside the agent's
 `allowedRoots` (or equal to the agent's `cwd`); otherwise it returns `400 cwd_not_allowed`

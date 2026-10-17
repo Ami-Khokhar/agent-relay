@@ -120,6 +120,17 @@ Per-agent optional fields:
 - `description` — free text shown by `GET /v1/agents`.
 - `delegateTo` — agent IDs this agent's tasks may delegate to; `[]` forbids delegation. Omit
   to allow any registered agent.
+- `options` — named per-task options, each value mapped to fixed args, for example
+  `"options": {"effort": {"low": ["-c", "model_reasoning_effort=low"], "high": ["-c", "model_reasoning_effort=high"]}}`.
+  A task picks values with `"options": {"effort": "high"}`; the relay runs the agent's `args`,
+  then the mapped args, then the input. `command` and `stdio` agents only. See
+  "Per-task options" below.
+- `readOnly` — what a read-only task means for this agent:
+  `{"args": ["--exclude-tools", "edit,write"], "sandbox": true}`. `args` are added after the
+  agent's args and options; `sandbox: true` (macOS) runs the agent under `sandbox-exec` so it
+  cannot write under the task's `cwd`, the agent's `allowedRoots` or the git metadata of the
+  `cwd` (a worktree's too), read the relay token, or connect to the relay port. Must set `args`, `sandbox`, or both. `command` and `stdio` agents
+  only. See "Read-only tasks" below.
 - `capabilities` may only declare what is true; the relay rejects `nativeSessions: true`,
   `streaming: true`, and `newTasks: false` in this version.
 
@@ -208,7 +219,7 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 **Via MCP** tools:
 
 - `list_agents {}` → registered agents.
-- `delegate { agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` → task.
+- `delegate { agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, options?, readOnly?, waitMs? }` → task.
   With `waitMs`, `delegate` long-polls and returns the terminal task, or the current task
   with `waitExpired: true` when the wait ends first. A `waitMs` above the relay limit creates
   no task: `delegate` retries once with the limit (never longer than asked) and adds `waitMs`
@@ -222,6 +233,70 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 Task objects leave out `input` and carry `inputChars` (its length) instead, because you
 already hold the prompt you sent. Pass `includeInput: true` to `get_task` (or
 `?includeInput=true` on `GET /v1/tasks/:id`) only when you need the prompt back.
+
+**Per-task options.** `list_agents` shows each agent's `options`: names and the values the
+owner allows. Pass `options: {"effort": "high"}` to `delegate` (or in the HTTP body) to pick
+one. A name or value the agent does not allow is refused (`400 unknown_option` or
+`400 invalid_option_value`) and no task is created; do not invent values. Options are part of
+the `requestId` comparison, so a retry must send the same options. The relay checks the options
+again when a queued task is dispatched: if the owner reloaded the registry meanwhile and the
+option is gone, the task ends `failed` with that code at the start of its error (for example
+`unknown_option: ...`) and never runs.
+
+**Read-only tasks.** Pass `readOnly: true` when the agent must not change files (a code review
+in a worktree, for example); do not rely on the prompt alone. Call `list_agents` first and pick
+an agent that shows `readOnly: supported` (`readOnlySandboxed: true` means the relay also runs it
+in the macOS sandbox). An agent that is `unsupported` refuses the task
+(`400 read_only_unsupported`) and nothing runs. A sandboxed agent needs a `cwd` on the task or
+the agent (`400 cwd_required`). `readOnly` is part of the `requestId` comparison. The checks run
+again when a queued task is dispatched: if a registry reload meanwhile removed the profile or made
+the agent an `http` adapter, the task ends `failed` with `read_only_unsupported: ...` and never runs.
+
+What the sandbox blocks: writes under the task's `cwd` and the agent's `allowedRoots` (a new hard
+link to a file there too); writes to the git metadata of the `cwd`, which for a git worktree lives
+outside the `cwd` (its own `.git/worktrees/<name>` with the index, and the shared `.git` with refs
+and objects), so a review cannot stage, commit or move a branch (`git log`, `diff` and `show` still
+work); renaming or deleting any directory above those trees (the ancestor rule: otherwise
+`/tmp/review` could be moved away and written through its new path; writes beside a protected tree
+stay allowed); reading the relay token file, or renaming it or a directory above it;
+connecting to the relay's TCP port, so the agent cannot call the relay; and the
+`AGENT_RELAY_TOKEN` / `A2A_RELAY_TOKEN` variables, which a sandboxed task never receives. A
+sandboxed agent therefore cannot delegate through the relay.
+
+The git lookup fails closed: if a `.git` file or directory exists at or above the `cwd` and git
+cannot say where the metadata is (missing, slower than five seconds or the task's remaining time,
+non-zero exit, unusable output), the task ends `failed` with an error that starts
+`read_only_git_unknown:` and does not run. A `cwd` with no `.git` above it runs without git. Fix
+git for that directory (for example `safe.directory`) or submit without `readOnly`.
+
+What it does not block: a hard link that already exists outside the tree and points into it;
+writes made for the agent by another local service it can reach (for example a Docker socket, a
+daemon on another port, a proxy in front of the relay); reads of any other file; other network
+access (the model API still works); writes outside the protected directories; and, when the relay
+took its token from `AGENT_RELAY_TOKEN` and not from the token file, reading the relay process's
+environment. It is not general confinement.
+
+Example registry entries (flags checked against codex-cli 0.162.1 and pi 1.0.4):
+
+```json
+{ "agents": [
+  { "id": "codex", "name": "Codex", "command": "codex", "args": ["exec", "--skip-git-repo-check"],
+    "cwd": "/path/to/git/project", "allowedRoots": ["/path/to/git/project"],
+    "options": {
+      "effort": { "low": ["-c", "model_reasoning_effort=low"], "high": ["-c", "model_reasoning_effort=high"] },
+      "access": { "write": ["-s", "workspace-write"] }
+    },
+    "readOnly": { "args": ["--sandbox", "read-only"] } },
+  { "id": "pi", "name": "Pi", "command": "pi", "args": ["--print"],
+    "cwd": "/path/to/project", "allowedRoots": ["/path/to/project"],
+    "readOnly": { "args": ["--exclude-tools", "edit,write"], "sandbox": true } }
+] }
+```
+
+Codex rejects a repeated `--sandbox`/`-s`, so its entry leaves `-s` out of `args` (read-only is
+its default) and offers `-s workspace-write` as the `access` option; a task that edits files
+passes `options: {"access": "write"}`. Codex applies its own sandbox, and macOS does not nest
+sandboxes, so the Codex entry uses `args` only and no `"sandbox": true`.
 
 **Prefer `wait_task` over a `get_task` polling loop** — one call instead of many, and it
 does not stop polling too early.
@@ -311,7 +386,8 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   tasks per tree (`AGENT_RELAY_MAX_DELEGATED_TASKS`, 20). It is cooperative: do not give the
   relay's MCP server or API access to an agent that must not delegate.
 - Every stored task keeps its full prompt, output, error, and cwd in memory, readable by any
-  token holder (including agents the relay started, which can read the token file), until
+  token holder (including agents the relay started, which can read the token file, except a
+  sandboxed read-only task, which cannot read it or call the relay), until
   restart, eviction, or `AGENT_RELAY_TASK_RETENTION_MS` after it finishes (checked on every
   `/v1/` request and at least every minute; expiry also releases the task's `requestId`).
   Agents run as the relay's OS user and can read that user's files; environment filtering
@@ -342,6 +418,10 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 | `400 cwd_not_allowed` | Per-task `cwd` is outside the agent's `allowedRoots`/`cwd`; add the root. |
 | `400 invalid_wait` | `waitMs` is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS`; the message names the range. The MCP `wait_task` and `delegate` clamp instead. |
 | `400 unknown_field` | A request field is misspelled or unsupported; the message names it. |
+| `400 read_only_unsupported` / `cwd_required` / `invalid_read_only` | `readOnly: true` was sent to an agent without a readOnly profile (or whose sandbox needs macOS), to a sandboxed agent with no `cwd`, or `readOnly` is not a boolean; pick an agent that `list_agents` shows as `readOnly: supported`. |
+| `400 unknown_option` / `invalid_option_value` / `invalid_options` | `options` names an option the agent does not declare, a value it does not allow, or is not an object of strings; check `list_agents`. |
+| Task `failed`, error starts `read_only_git_unknown:` | A `readOnly` sandboxed task's `cwd` is in a git repository but git could not locate its metadata, so the relay did not run it with less protection. Fix git for that directory or submit without `readOnly`. |
+| Task `failed`, error starts with a submission code (`read_only_unsupported:`, `unknown_option:`, `cwd_required:` ...) | The registry was reloaded while the task was queued and the new entry no longer allows what the task asked for. Resubmit against the current `list_agents`. |
 | `413 command_input_too_large` | Input exceeds `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`; use a `stdio` adapter for large prompts. |
 | `503 task_capacity_reached` | Store full of non-terminal tasks; raise `A2A_RELAY_MAX_TASKS`/`A2A_RELAY_MAX_ACTIVE` or wait. |
 | `409 idempotency_conflict` | Same `requestId` reused with different fields; use a new ID. |

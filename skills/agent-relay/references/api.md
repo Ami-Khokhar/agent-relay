@@ -40,6 +40,8 @@ next run is restarted, since an old relay cannot report counts).
   { "id": "claude", "name": "Claude Code", "description": "...",
     "adapter": "command", "timeoutMs": 900000,
     "cwd": "/path/to/project", "allowedRoots": ["/path/to/project"],
+    "options": { "effort": ["low", "high"] },
+    "readOnly": "supported", "readOnlySandboxed": true,
     "capabilities": { "newTasks": true, "nativeSessions": false, "streaming": false,
                       "cancellation": "process_signal" } }
 ], "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
@@ -48,7 +50,15 @@ next run is restarted, since an old relay cannot report counts).
 
 `revision` is the same object as in `GET /healthz`. `timeoutMs` is the effective timeout for that agent. `cancellation` is `process_signal`
 for command/stdio adapters and `request_only` for HTTP. `cwd`, `allowedRoots`, and
-`delegateTo` (the agents its tasks may delegate to) appear only when configured.
+`delegateTo` (the agents its tasks may delegate to) appear only when configured. `options`
+maps each option name the agent declares to its allowed values, and appears only when the agent
+declares options. `readOnly` is `supported` or `unsupported` for every agent: `supported` means
+the agent has a `readOnly` profile that works on this host, and `readOnlySandboxed` (present only
+then) says whether the relay also runs it under a sandbox that blocks writes under the task's
+`cwd`, the agent's `allowedRoots` and the git metadata of the `cwd` (a worktree's too), renaming or
+deleting any directory above those trees, reading the relay token, and connecting to the relay port.
+The sandbox does not block reads, other network access, or writes made for the agent by other
+local services; see the README section "What the sandbox blocks, and what it does not".
 
 ### `POST /v1/tasks`
 
@@ -63,6 +73,8 @@ Body:
 | `timeoutMs` | no | Positive integer. Overrides the agent/global timeout; rejected if above `A2A_RELAY_MAX_TIMEOUT_MS`. |
 | `cwd` | no | Absolute or relative path. Must be inside the agent's `allowedRoots` (or equal to its `cwd`), else `400 cwd_not_allowed`. |
 | `waitMs` | no | The wait you mean to use next on `GET /v1/tasks/:id?waitMs=`. The relay checks it before it creates the task: a value that is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS` returns `400 invalid_wait` (message names the range) and creates nothing. The submission does not wait; it still returns `202`. It is not stored on the task. |
+| `options` | no | Object of option name to value string, for example `{"effort": "high"}`. Each name and value must be declared in the agent's registry `options`; the relay adds the args the owner mapped to them after the agent's `args` and before `input`. An undeclared name is `400 unknown_option`, an undeclared value `400 invalid_option_value`, a non-object or non-string value `400 invalid_options`. |
+| `readOnly` | no | `true` requires a run that cannot change files: the agent's `readOnly` profile args are added after its `args` and options and, when the profile sets `sandbox`, the run is wrapped in `sandbox-exec`. An agent without a profile (or whose sandbox needs macOS) returns `400 read_only_unsupported`; a sandboxed profile with no `cwd` on the task or agent returns `400 cwd_required`; a value that is not `true` or `false`, including `null`, returns `400 invalid_read_only`. The relay checks the task against the registry entry again when it dispatches a queued task, so a reload in between cannot turn a read-only task into an unenforced one: the task ends `failed` and its `error` starts with the code submission would have given (see "Task errors" below). Default `false`. |
 | `parentTaskId` | no | Task delegating this one (the MCP `delegate` tool sends `AGENT_RELAY_PARENT_TASK_ID`). Applies the delegation policy: `delegateTo`, cycles, `AGENT_RELAY_MAX_DELEGATION_DEPTH`, `AGENT_RELAY_MAX_DELEGATED_TASKS`. |
 
 Unknown fields are rejected with `400 unknown_field`. Returns `202` with the task:
@@ -77,7 +89,7 @@ Task objects never echo `input`: they carry `inputChars` (its length in characte
 `GET /v1/tasks/:id?includeInput=true` returns it.
 
 Idempotent replay with the same `requestId` and identical fields returns `200` with the
-original task. Different fields with the same `requestId` return `409`.
+original task. Different fields with the same `requestId` (including different `options` or `readOnly`) return `409`.
 
 ### `GET /v1/tasks/:id`
 
@@ -131,7 +143,7 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
-| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
+| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
 | 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route. |
 | 403 | `forbidden`, `origin_not_allowed`, `delegation_not_allowed` | Admin route called from a non-loopback address; request from a browser origin not in `AGENT_RELAY_ALLOWED_ORIGINS`; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
 | 404 | `unknown_agent`, `unknown_task`, `not_found` | Missing agent/task/route. |
@@ -142,6 +154,18 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
 | 503 | `task_capacity_reached` | Store full of non-terminal tasks. |
+
+### Task errors
+
+A task can also end `failed` after it was accepted, with a code at the start of `error`
+(`<code>: <message>`):
+
+| Code | Meaning |
+| --- | --- |
+| `read_only_unsupported`, `cwd_required`, `unknown_option`, `invalid_option_value` | A registry reload while the task was queued changed its agent, and the current entry no longer allows what the task asked for. The same codes as at submission; nothing ran. |
+| `read_only_git_unknown` | A sandboxed `readOnly` task's `cwd` is in a git repository (a `.git` file or directory exists at or above it) but `git rev-parse` could not say where its git metadata is: git missing, slower than 5 s or than the task's remaining time, non-zero exit, or unusable output. The relay fails closed and does not run the task with less protection. This is a failed task and not a `400`, because the lookup runs when the sandbox is built, at dispatch. A `cwd` with no `.git` above it needs no git and runs. |
+
+A task whose time runs out while the relay is still locating git metadata ends `timed_out` and its adapter never starts.
 
 ## MCP tools
 
@@ -155,7 +179,7 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `list_agents` | `{}` | Same payload as `GET /v1/agents`, including `revision`. |
-| `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` | Submitted task; with `waitMs`, the terminal task, or the current task with `waitExpired: true` if the wait elapses first. A `waitMs` above the relay limit is refused with `invalid_wait` before the task is created, so nothing runs without an ID. The tool then retries once with the limit (read from `/healthz` `limits.maxWaitMs`, never longer than asked) and adds `waitMs` and `waitClamped: true` to the result. Even with a `requestId` the retry makes one task, because the refused attempt created none. |
+| `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, options?, readOnly?, waitMs? }` | Submitted task; with `waitMs`, the terminal task, or the current task with `waitExpired: true` if the wait elapses first. A `waitMs` above the relay limit is refused with `invalid_wait` before the task is created, so nothing runs without an ID. The tool then retries once with the limit (read from `/healthz` `limits.maxWaitMs`, never longer than asked) and adds `waitMs` and `waitClamped: true` to the result. Even with a `requestId` the retry makes one task, because the refused attempt created none. |
 | `wait_task` | `{ taskId, maxWaitMs? }` | Terminal task, or the current task with `waitExpired: true`, `waitedMs` and `hint` if the wait elapses. A `maxWaitMs` above the relay limit is clamped to it, and the result adds `waitMs` and `waitClamped: true`. |
 | `get_task` | `{ taskId, includeInput? }` | Current task. With `includeInput: true` it also carries `input`. |
 | `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
@@ -183,6 +207,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `createdAt` | always | ISO-8601. |
 | `timeoutMs` | always | Effective timeout. |
 | `cwd` | if set | Effective working directory for the task. |
+| `options` | if supplied | The option values the task chose, for example `{"effort": "high"}`. |
+| `readOnly` | if `true` | The task was submitted as read-only. |
 | `requestId` | if supplied | Echoed idempotency key. |
 | `parentTaskId` | delegated tasks | Task that delegated this one. |
 | `depth` | always | `0` for a root task, parent depth + 1 when delegated. |

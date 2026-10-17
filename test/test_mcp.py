@@ -402,6 +402,126 @@ class McpHandlerTests(unittest.TestCase):
             finally:
                 upstream.close()
 
+    def test_delegate_forwards_options_and_validates_their_shape(self):
+        upstream = FakeUpstream(lambda method, path, body: (202, {"id": "task-3", "status": "queued"}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            handle({"method": "tools/call", "params": {
+                "name": "delegate",
+                "arguments": {"agentId": "fake", "input": "work", "options": {"effort": "high"}}}})
+            self.assertEqual(upstream.calls[0][2],
+                             {"agentId": "fake", "input": "work", "options": {"effort": "high"}})
+            for bad in ("high", ["effort"], {"effort": 3}, {"effort": ["high"]}, {"": "high"}):
+                with self.assertRaises(mcp_server.RpcError, msg=repr(bad)) as raised:
+                    handle({"method": "tools/call", "params": {
+                        "name": "delegate",
+                        "arguments": {"agentId": "fake", "input": "work", "options": bad}}})
+                self.assertEqual(raised.exception.code, -32602)
+            self.assertEqual(len(upstream.calls), 1)
+        finally:
+            upstream.close()
+
+    def test_delegate_forwards_read_only_and_requires_a_boolean(self):
+        upstream = FakeUpstream(lambda method, path, body: (202, {"id": "task-4", "status": "queued"}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            handle({"method": "tools/call", "params": {
+                "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "readOnly": True}}})
+            self.assertEqual(upstream.calls[0][2], {"agentId": "fake", "input": "work", "readOnly": True})
+            for bad in ("true", 1, None):
+                with self.assertRaises(mcp_server.RpcError, msg=repr(bad)) as raised:
+                    handle({"method": "tools/call", "params": {
+                        "name": "delegate",
+                        "arguments": {"agentId": "fake", "input": "work", "readOnly": bad}}})
+                self.assertEqual(raised.exception.code, -32602)
+            self.assertEqual(len(upstream.calls), 1)
+        finally:
+            upstream.close()
+
+    def test_delegate_sends_options_read_only_and_the_wait_in_one_submission(self):
+        def responder(method, path, body):
+            if method == "POST":
+                return 202, {"id": "task-7", "status": "queued"}
+            return 200, {"id": "task-7", "status": "completed", "output": "ok"}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {"name": "delegate", "arguments": {
+                "agentId": "fake", "input": "work", "options": {"effort": "high"}, "readOnly": True,
+                "waitMs": 3000}}})
+            self.assertEqual(result["structuredContent"]["status"], "completed")
+            self.assertEqual(upstream.calls[0][2],
+                             {"agentId": "fake", "input": "work", "options": {"effort": "high"},
+                              "readOnly": True, "waitMs": 3000})
+            self.assertIn("waitMs=3000", upstream.calls[1][1])
+        finally:
+            upstream.close()
+
+    def test_old_relay_fallback_drops_only_the_wait_and_keeps_options_and_read_only(self):
+        def relay_before_waitms(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+            if method == "POST":
+                if "waitMs" in body:
+                    return 400, {"error": "unknown_field", "message": "Unknown request field: waitMs"}
+                return 202, {"id": "task-8", "status": "queued"}
+            return 200, {"id": "task-8", "status": "completed", "output": "ok"}
+
+        upstream = FakeUpstream(relay_before_waitms)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {"name": "delegate", "arguments": {
+                "agentId": "fake", "input": "work", "options": {"effort": "high"}, "readOnly": True,
+                "waitMs": 3000}}})
+            self.assertNotIn("isError", result)
+            self.assertEqual(result["structuredContent"]["status"], "completed")
+            retry = upstream.calls[2][2]
+            self.assertNotIn("waitMs", retry)
+            self.assertEqual((retry["options"], retry["readOnly"]), ({"effort": "high"}, True))
+        finally:
+            upstream.close()
+
+    def test_a_relay_that_refuses_read_only_or_options_is_not_retried_without_them(self):
+        # A relay that predates a field names the first unknown one, in sorted order, so options and
+        # readOnly come before waitMs. The error must reach the caller: dropping the field would run
+        # a task that was meant to be read-only, or to use other options, without them.
+        for field, value in (("readOnly", True), ("options", {"effort": "high"})):
+            def old_relay(method, path, body):
+                unknown = sorted(set(body) - {"agentId", "input", "waitMs"})
+                if unknown:
+                    return 400, {"error": "unknown_field", "message": f"Unknown request field: {unknown[0]}"}
+                return 202, {"id": "task-9", "status": "queued"}
+
+            upstream = FakeUpstream(old_relay)
+            handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+            try:
+                result = handle({"method": "tools/call", "params": {"name": "delegate", "arguments": {
+                    "agentId": "fake", "input": "work", field: value, "waitMs": 3000}}})
+                self.assertTrue(result["isError"], field)
+                self.assertEqual(result["structuredContent"]["error"], "unknown_field", field)
+                self.assertIn(field, result["structuredContent"]["message"])
+                self.assertEqual([call[1] for call in upstream.calls], ["/v1/tasks"], field)
+            finally:
+                upstream.close()
+
+    def test_delegate_and_list_agents_describe_read_only(self):
+        handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+        tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+        read_only = tools["delegate"]["inputSchema"]["properties"]["readOnly"]
+        self.assertEqual(read_only["type"], "boolean")
+        self.assertIn("list_agents", read_only["description"])
+        self.assertIn("readOnly", tools["list_agents"]["description"])
+
+    def test_delegate_and_list_agents_describe_options(self):
+        handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+        tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+        options = tools["delegate"]["inputSchema"]["properties"]["options"]
+        self.assertEqual(options["type"], "object")
+        self.assertEqual(options["additionalProperties"], {"type": "string"})
+        self.assertIn("list_agents", options["description"])
+        self.assertIn("options", tools["list_agents"]["description"])
+
     def test_retries_a_loopback_request_after_starting_the_relay(self):
         calls = []
 
