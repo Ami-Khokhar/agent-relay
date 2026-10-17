@@ -363,6 +363,83 @@ class RelayTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_a_terminal_wait_result_does_not_carry_waitExpired(self):
+        relay = Relay({"id": "quick", "command": PYTHON, "args": ["-c", "print('done')"]})
+        try:
+            _, submitted = relay.submit(agentId="quick", input="x")
+            status, task = relay.request("GET", f"/v1/tasks/{submitted['id']}?waitMs=5000")
+            self.assertEqual((status, task["status"]), (200, "completed"))
+            self.assertNotIn("waitExpired", task)
+            self.assertNotIn("waitedMs", task)
+            self.assertNotIn("hint", task)
+
+            # A task that is already terminal when the wait starts is terminal too.
+            status, task = relay.request("GET", f"/v1/tasks/{submitted['id']}?waitMs=5000")
+            self.assertEqual((status, task["status"]), (200, "completed"))
+            self.assertNotIn("waitExpired", task)
+        finally:
+            relay.close()
+
+    def test_a_wait_that_ends_before_the_task_is_terminal_says_so(self):
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(30)"]})
+        try:
+            _, submitted = relay.submit(agentId="slow", input="x")
+            started = time.monotonic()
+            status, task = relay.request("GET", f"/v1/tasks/{submitted['id']}?waitMs=300")
+            elapsed = time.monotonic() - started
+            self.assertEqual(status, 200)
+            self.assertIn(task["status"], ("queued", "running"))
+            self.assertIs(task["waitExpired"], True)
+            self.assertEqual(task["waitedMs"], 300)
+            self.assertIn("wait_task again with the same taskId", task["hint"])
+            self.assertGreaterEqual(elapsed, 0.25)
+
+            # The marker describes this wait only. It is not stored on the task.
+            status, plain = relay.request("GET", f"/v1/tasks/{submitted['id']}")
+            self.assertEqual(status, 200)
+            self.assertNotIn("waitExpired", plain)
+            relay.request("DELETE", f"/v1/tasks/{submitted['id']}")
+        finally:
+            relay.close()
+
+    def test_an_invalid_wait_error_names_the_valid_range(self):
+        relay = Relay({"id": "quick", "command": PYTHON, "args": ["-c", "print('done')"]},
+                      env={"A2A_RELAY_MAX_WAIT_MS": "2000"})
+        try:
+            _, submitted = relay.submit(agentId="quick", input="x")
+            for value in ("2001", "900000", "0", "-5", "soon"):
+                status, payload = relay.request("GET", f"/v1/tasks/{submitted['id']}?waitMs={value}")
+                self.assertEqual(status, 400, value)
+                self.assertEqual(payload["error"], "invalid_wait", value)
+                self.assertIn("1 to 2000", payload["message"], value)
+            status, _ = relay.request("GET", f"/v1/tasks/{submitted['id']}?waitMs=2000")
+            self.assertEqual(status, 200)
+        finally:
+            relay.close()
+
+    def test_a_submission_with_an_invalid_wait_is_refused_before_it_creates_a_task(self):
+        relay = Relay({"id": "quick", "command": PYTHON, "args": ["-c", "print('done')"]},
+                      env={"A2A_RELAY_MAX_WAIT_MS": "2000"})
+        try:
+            for value in (2001, 900000, 0, -5, "soon", 1.5, True):
+                status, payload = relay.submit(agentId="quick", input="x", requestId="r-1", waitMs=value)
+                self.assertEqual(status, 400, value)
+                self.assertEqual(payload["error"], "invalid_wait", value)
+                self.assertIn("1 to 2000", payload["message"], value)
+            status, listed = relay.request("GET", "/v1/tasks")
+            self.assertEqual((status, listed["tasks"]), (200, []))
+
+            # The refusals left nothing behind: the same requestId still makes one new task.
+            status, task = relay.submit(agentId="quick", input="x", requestId="r-1", waitMs=2000)
+            self.assertEqual(status, 202)
+            status, replay = relay.submit(agentId="quick", input="x", requestId="r-1", waitMs=2000)
+            self.assertEqual((status, replay["id"]), (200, task["id"]))
+            status, listed = relay.request("GET", "/v1/tasks")
+            self.assertEqual([item["id"] for item in listed["tasks"]], [task["id"]])
+            self.assertNotIn("waitMs", task)
+        finally:
+            relay.close()
+
     def test_lists_tasks_by_session_and_rejects_a_bad_status(self):
         relay = Relay({"id": "echo", "command": PYTHON,
                        "args": ["-c", "import sys; print(sys.argv[1])"]})

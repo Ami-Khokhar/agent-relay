@@ -209,8 +209,12 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 
 - `list_agents {}` → registered agents.
 - `delegate { agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` → task.
-  With `waitMs`, `delegate` long-polls and returns the terminal task.
-- `wait_task { taskId, maxWaitMs? }` → holds the call until terminal or the wait elapses.
+  With `waitMs`, `delegate` long-polls and returns the terminal task, or the current task
+  with `waitExpired: true` when the wait ends first. A `waitMs` above the relay limit creates
+  no task: `delegate` retries once with the limit (never longer than asked) and adds `waitMs`
+  and `waitClamped: true` to the result.
+- `wait_task { taskId, maxWaitMs? }` → holds the call until terminal or the wait elapses
+  (default 60000 ms).
 - `get_task { taskId, includeInput? }` → current task state and result.
 - `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
 - `cancel_task { taskId }` → cancel a queued or running task.
@@ -221,6 +225,25 @@ already hold the prompt you sent. Pass `includeInput: true` to `get_task` (or
 
 **Prefer `wait_task` over a `get_task` polling loop** — one call instead of many, and it
 does not stop polling too early.
+
+**Tell "finished" from "my wait ended".** When the wait ends and the task is still not
+terminal, the result has `waitExpired: true`, `waitedMs` (the wait that elapsed) and a
+`hint`: call `wait_task` again with the same `taskId`. A terminal result has no
+`waitExpired`. Loop while `waitExpired` is true; do not read a `running` status as a
+finished task. The same fields appear on the HTTP `?waitMs=` path and on a `delegate`
+call that used `waitMs`.
+
+**Keep `maxWaitMs` short in clients with a tool-call budget.** Claude Code moves an MCP
+call that runs longer than 120 s to the background, and its "completed" notice then
+carries a task that is still `running`. In Claude Code use `maxWaitMs` of about 110000
+or less and loop on `waitExpired`.
+
+A `maxWaitMs` above the relay's limit (`A2A_RELAY_MAX_WAIT_MS`, default 600000, shown as
+`limits.maxWaitMs` in `/healthz`) is cut to that limit by the MCP `wait_task` and `delegate` tools. The result then
+has `waitMs` (the wait used) and `waitClamped: true`. Over HTTP a `waitMs` outside
+`1..limit` returns `400 invalid_wait`, and its message names the range. This holds for
+`POST /v1/tasks` too: the relay checks `waitMs` before it creates the task, so a refused
+submission leaves no task behind.
 
 ## Task lifecycle
 
@@ -317,6 +340,7 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
 | Relay exits with `port ... is in use` | Another relay is running; set `A2A_RELAY_PORT`. |
 | `404 unknown_agent` | `agentId` not in the registry, or reload after editing. |
 | `400 cwd_not_allowed` | Per-task `cwd` is outside the agent's `allowedRoots`/`cwd`; add the root. |
+| `400 invalid_wait` | `waitMs` is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS`; the message names the range. The MCP `wait_task` and `delegate` clamp instead. |
 | `400 unknown_field` | A request field is misspelled or unsupported; the message names it. |
 | `413 command_input_too_large` | Input exceeds `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`; use a `stdio` adapter for large prompts. |
 | `503 task_capacity_reached` | Store full of non-terminal tasks; raise `A2A_RELAY_MAX_TASKS`/`A2A_RELAY_MAX_ACTIVE` or wait. |

@@ -11,6 +11,14 @@ long poll — `GET /v1/tasks/:id?waitMs=<ms>` (or MCP `wait_task`) — over a `g
 one call instead of many, and it does not stop too early. Use `GET /v1/tasks?sessionId=...`
 (or `list_tasks`) to recover task IDs after an orchestrator context reset.
 
+Keep each wait short, and loop. A wait that ends before the task is terminal returns the
+task with `waitExpired: true` and a still `queued` or `running` status. That is not a
+result: wait again with the same task ID until a result has no `waitExpired`. A client with
+a short tool-call budget (Claude Code moves an MCP call that runs longer than 120 s to the
+background) uses a `maxWaitMs` of about 110000 or less. The relay refuses a wait above
+`A2A_RELAY_MAX_WAIT_MS` (default 600000); the MCP `wait_task` and `delegate` cut it to that
+limit.
+
 ## 1. Single delegation
 
 The user wants agent A to do a job on agent B.
@@ -18,7 +26,9 @@ The user wants agent A to do a job on agent B.
 1. Pick the agent whose `cwd` is the project B should edit, or pass a per-task `cwd` that
    is inside the agent's `allowedRoots`.
 2. Submit one task with a self-contained `input` and a `requestId`.
-3. `wait_task` until terminal; report `output` (or `error`).
+3. `wait_task` with `maxWaitMs` of about 110000 or less. Call it again with the same
+   task ID while the result has `waitExpired: true`. Report `output` (or `error`) from the
+   terminal result.
 4. If the user changes their mind, `cancel_task`.
 
 Use a generous `timeoutMs` for real coding work. The default is 15 minutes; set a
@@ -33,13 +43,20 @@ Run the same prompt on several agents, then compare.
   (a correlation tag) and distinct `requestId`s.
 - Keep within `A2A_RELAY_MAX_ACTIVE`; the rest queue automatically.
 - `wait_task` on each task ID (or `list_tasks` for the session), then present a table of
-  agent → status → output.
+  agent → status → output. Submit every task first and wait after: a `waitMs` on each
+  `delegate` would make the agents run one after another.
 
 ```
 sessionId = "compare-<date>"
+tasks = []
 for agent in claude codex pi:
-    task = delegate(agentId=agent, input=PROMPT, sessionId=sessionId,
-                    requestId=f"{agent}-compare", waitMs=600000)
+    tasks.append(delegate(agentId=agent, input=PROMPT, sessionId=sessionId,
+                          requestId=f"{agent}-compare"))     # returns at once
+for task in tasks:
+    while True:
+        task = wait_task(taskId=task.id, maxWaitMs=110000)
+        if not task.waitExpired:
+            break                                            # terminal: read output or error
 ```
 
 ## 3. Pipeline / chaining
@@ -49,6 +66,9 @@ A produces, B reviews, C fixes. Pass each output into the next `input`.
 1. `outA = delegate(A, spec)` → `wait_task`
 2. `outB = delegate(B, "Review this and list concrete problems:\n" + outA.output)` → `wait_task`
 3. `outC = delegate(C, "Apply these fixes:\n" + outB.output)` → `wait_task`
+
+Each `wait_task` here means the loop from the fan-out pattern: wait about 110000 ms or less,
+and wait again while `waitExpired` is true. Read `.output` only from a terminal result.
 
 Give the whole chain one `sessionId` for traceability. If an agent the relay started is
 itself wired to the relay as an MCP client, it can delegate further: its `delegate` calls carry
@@ -78,7 +98,8 @@ If the harness exposes only an API or needs structured output:
 Add the MCP server to the client's config and start the HTTP service alongside it (or let
 the MCP process start it on demand). The client then sees `list_agents`, `delegate`,
 `wait_task`, `get_task`, `list_tasks`, `cancel_task`. Because submission is asynchronous,
-use `delegate` with `waitMs` or `wait_task` to block until the result is ready.
+use `wait_task` (or `delegate` with `waitMs`) to block until the result is ready. Use a wait
+of about 110000 ms or less, and wait again while the result has `waitExpired: true`.
 
 ## Choosing limits
 

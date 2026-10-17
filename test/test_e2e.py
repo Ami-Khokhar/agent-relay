@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -57,6 +58,60 @@ class EndToEndTests(unittest.TestCase):
             client.close()
             relay.close()
             stop_http_server(server)
+
+    def test_wait_task_above_the_relay_limit_waits_the_limit_and_reports_the_expired_wait(self):
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(30)"]},
+                      env={"A2A_RELAY_MAX_WAIT_MS": "500"})
+        client = McpClient(relay.base)
+        try:
+            task_id = client.call_tool("delegate", {"agentId": "slow", "input": "x"})["structuredContent"]["id"]
+            started = time.monotonic()
+            result = client.call_tool("wait_task", {"taskId": task_id, "maxWaitMs": 900000})
+            elapsed = time.monotonic() - started
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertIn(task["status"], ("queued", "running"))
+            self.assertIs(task["waitExpired"], True)
+            self.assertEqual(task["waitedMs"], 500)
+            self.assertEqual(task["waitMs"], 500)
+            self.assertIs(task["waitClamped"], True)
+            self.assertIn("wait_task again with the same taskId", task["hint"])
+            self.assertGreaterEqual(elapsed, 0.4)
+
+            client.call_tool("cancel_task", {"taskId": task_id})
+            done = client.call_tool("wait_task", {"taskId": task_id, "maxWaitMs": 500})["structuredContent"]
+            self.assertEqual(done["status"], "cancelled")
+            self.assertNotIn("waitExpired", done)
+        finally:
+            client.close()
+            relay.close()
+
+    def test_delegate_with_a_wait_above_the_relay_limit_creates_exactly_one_task(self):
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(30)"]},
+                      env={"A2A_RELAY_MAX_WAIT_MS": "500"})
+        client = McpClient(relay.base)
+        try:
+            arguments = {"agentId": "slow", "input": "x", "requestId": "once", "waitMs": 900000}
+            result = client.call_tool("delegate", arguments)
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertTrue(task["id"])
+            self.assertEqual(task["waitMs"], 500)
+            self.assertIs(task["waitClamped"], True)
+            self.assertIs(task["waitExpired"], True)
+            self.assertEqual(task["waitedMs"], 500)
+
+            # The refused first attempt created nothing, so one task exists, and a retry finds it.
+            listed = client.call_tool("list_tasks", {})["structuredContent"]["tasks"]
+            self.assertEqual([item["id"] for item in listed], [task["id"]])
+            again = client.call_tool("delegate", arguments)["structuredContent"]
+            self.assertEqual(again["id"], task["id"])
+            listed = client.call_tool("list_tasks", {})["structuredContent"]["tasks"]
+            self.assertEqual(len(listed), 1)
+            client.call_tool("cancel_task", {"taskId": task["id"]})
+        finally:
+            client.close()
+            relay.close()
 
 
     def test_mcp_results_leave_out_the_input_unless_get_task_asks_for_it(self):

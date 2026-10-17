@@ -63,6 +63,24 @@ class McpHandlerTests(unittest.TestCase):
         self.assertIn("correlation", session_description)
         self.assertNotIn("continue", session_description)
 
+    def test_delegate_description_says_an_invalid_wait_creates_no_task(self):
+        handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+        tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+        wait = tools["delegate"]["inputSchema"]["properties"]["waitMs"]["description"]
+        for text in ("A2A_RELAY_MAX_WAIT_MS", "clamp", "waitMs", "waitClamped", "waitExpired", "no task"):
+            self.assertIn(text, wait)
+        self.assertNotIn("still created", wait)
+
+    def test_wait_task_description_says_how_to_loop_on_a_short_tool_call_budget(self):
+        handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+        tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+        description = tools["wait_task"]["description"]
+        for text in ("waitExpired", "waitedMs", "same taskId", "120 s", "110000"):
+            self.assertIn(text, description)
+        max_wait = tools["wait_task"]["inputSchema"]["properties"]["maxWaitMs"]["description"]
+        for text in ("A2A_RELAY_MAX_WAIT_MS", "clamp", "waitMs", "waitClamped"):
+            self.assertIn(text, max_wait)
+
     def test_maps_mcp_tools_onto_the_http_task_lifecycle(self):
         def responder(method, path, body):
             if path.endswith("/v1/agents"):
@@ -169,6 +187,75 @@ class McpHandlerTests(unittest.TestCase):
         finally:
             upstream.close()
 
+    def test_wait_task_clamps_a_wait_above_the_relay_limit_and_says_which_wait_it_used(self):
+        def responder(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+            if "waitMs=900000" in path:
+                return 400, {"error": "invalid_wait", "message": "waitMs must be an integer from 1 to 600000"}
+            return 200, {"id": "task-1", "status": "completed", "output": "done"}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "wait_task", "arguments": {"taskId": "task-1", "maxWaitMs": 900000}}})
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["waitMs"], 600000)
+            self.assertIs(task["waitClamped"], True)
+            self.assertEqual([call[1] for call in upstream.calls],
+                             ["/v1/tasks/task-1?waitMs=900000", "/healthz",
+                              "/v1/tasks/task-1?waitMs=600000"])
+
+            # A wait inside the limit is sent as given, once, and the result is not annotated.
+            upstream.calls.clear()
+            result = handle({"method": "tools/call", "params": {
+                "name": "wait_task", "arguments": {"taskId": "task-1", "maxWaitMs": 600000}}})
+            self.assertNotIn("waitClamped", result["structuredContent"])
+            self.assertNotIn("waitMs", result["structuredContent"])
+            self.assertEqual([call[1] for call in upstream.calls], ["/v1/tasks/task-1?waitMs=600000"])
+        finally:
+            upstream.close()
+
+    def test_wait_task_returns_the_relay_error_when_it_cannot_clamp_the_wait(self):
+        rejected = {"error": "invalid_wait", "message": "invalid_wait"}
+
+        def old_relay(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True}
+            return 400, rejected
+
+        def odd_relay(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 900000}}
+            return 400, rejected
+
+        for responder in (old_relay, odd_relay):
+            upstream = FakeUpstream(responder)
+            handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+            try:
+                result = handle({"method": "tools/call", "params": {
+                    "name": "wait_task", "arguments": {"taskId": "task-1", "maxWaitMs": 600000}}})
+                self.assertTrue(result["isError"])
+                self.assertEqual(result["structuredContent"],
+                                 {"error": "invalid_wait", "message": "invalid_wait", "status": 400})
+                self.assertEqual([call[1] for call in upstream.calls],
+                                 ["/v1/tasks/task-1?waitMs=600000", "/healthz"])
+            finally:
+                upstream.close()
+
+        upstream = FakeUpstream(lambda method, path, body: (404, {"error": "unknown_task"}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "wait_task", "arguments": {"taskId": "missing", "maxWaitMs": 900000}}})
+            self.assertEqual(result["structuredContent"]["error"], "unknown_task")
+            self.assertEqual(len(upstream.calls), 1)
+        finally:
+            upstream.close()
+
     def test_delegate_passes_cwd_and_can_wait_for_the_result(self):
         def responder(method, path, body):
             if method == "POST":
@@ -182,10 +269,138 @@ class McpHandlerTests(unittest.TestCase):
                 "name": "delegate",
                 "arguments": {"agentId": "fake", "input": "work", "cwd": "/tmp", "waitMs": 3000}}})
             self.assertEqual(result["structuredContent"]["status"], "completed")
-            self.assertEqual(upstream.calls[0][2], {"agentId": "fake", "input": "work", "cwd": "/tmp"})
+            # The wait goes with the submission, so the relay can refuse it before it creates the task.
+            self.assertEqual(upstream.calls[0][2],
+                             {"agentId": "fake", "input": "work", "cwd": "/tmp", "waitMs": 3000})
             self.assertIn("waitMs=3000", upstream.calls[1][1])
+            self.assertNotIn("waitClamped", result["structuredContent"])
         finally:
             upstream.close()
+
+    def test_delegate_clamps_a_wait_above_the_relay_limit_and_says_which_wait_it_used(self):
+        def responder(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+            if method == "POST":
+                if body["waitMs"] > 600000:
+                    return 400, {"error": "invalid_wait",
+                                 "message": "waitMs must be an integer from 1 to 600000"}
+                return 202, {"id": "task-3", "status": "queued"}
+            return 200, {"id": "task-3", "status": "completed", "output": "ok"}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "delegate",
+                "arguments": {"agentId": "fake", "input": "work", "requestId": "req-1", "waitMs": 900000}}})
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertEqual((task["id"], task["status"]), ("task-3", "completed"))
+            self.assertEqual(task["waitMs"], 600000)
+            self.assertIs(task["waitClamped"], True)
+            self.assertEqual([(call[0], call[1]) for call in upstream.calls],
+                             [("POST", "/v1/tasks"), ("GET", "/healthz"), ("POST", "/v1/tasks"),
+                              ("GET", "/v1/tasks/task-3?waitMs=600000")])
+            first, second = upstream.calls[0][2], upstream.calls[2][2]
+            self.assertEqual((first["waitMs"], first["requestId"]), (900000, "req-1"))
+            self.assertEqual((second["waitMs"], second["requestId"]), (600000, "req-1"))
+        finally:
+            upstream.close()
+
+    def test_delegate_returns_the_relay_error_when_it_cannot_clamp_the_wait(self):
+        def relay_without_limits(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True}
+            return 400, {"error": "invalid_wait", "message": "waitMs must be an integer from 1 to 600000"}
+
+        upstream = FakeUpstream(relay_without_limits)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "waitMs": 900000}}})
+            self.assertTrue(result["isError"])
+            self.assertEqual(result["structuredContent"]["error"], "invalid_wait")
+            self.assertEqual([call[1] for call in upstream.calls], ["/v1/tasks", "/healthz"])
+        finally:
+            upstream.close()
+
+    def test_delegate_still_waits_when_the_relay_predates_the_waitMs_field(self):
+        def old_relay(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+            if method == "POST":
+                if "waitMs" in body:
+                    return 400, {"error": "unknown_field", "message": "Unknown request field: waitMs"}
+                return 202, {"id": "task-4", "status": "queued"}
+            return 200, {"id": "task-4", "status": "completed", "output": "ok"}
+
+        upstream = FakeUpstream(old_relay)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "waitMs": 3000}}})
+            self.assertNotIn("isError", result)
+            self.assertEqual(result["structuredContent"]["status"], "completed")
+            self.assertNotIn("waitClamped", result["structuredContent"])
+            self.assertEqual([call[1] for call in upstream.calls],
+                             ["/v1/tasks", "/healthz", "/v1/tasks", "/v1/tasks/task-4?waitMs=3000"])
+            self.assertNotIn("waitMs", upstream.calls[2][2])
+        finally:
+            upstream.close()
+
+    def test_delegate_clamps_the_wait_when_an_old_relay_has_a_lower_wait_limit(self):
+        def old_relay(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+            if method == "POST":
+                if "waitMs" in body:
+                    return 400, {"error": "unknown_field", "message": "Unknown request field: waitMs"}
+                return 202, {"id": "task-5", "status": "queued"}
+            if int(path.rsplit("waitMs=", 1)[1]) > 600000:
+                return 400, {"error": "invalid_wait", "message": "waitMs must be an integer from 1 to 600000"}
+            return 200, {"id": "task-5", "status": "completed", "output": "ok"}
+
+        upstream = FakeUpstream(old_relay)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "waitMs": 900000}}})
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertEqual((task["id"], task["status"]), ("task-5", "completed"))
+            self.assertEqual(task["waitMs"], 600000)
+            self.assertIs(task["waitClamped"], True)
+            self.assertEqual([call[1] for call in upstream.calls],
+                             ["/v1/tasks", "/healthz", "/v1/tasks", "/v1/tasks/task-5?waitMs=600000"])
+            self.assertNotIn("waitMs", upstream.calls[2][2])
+        finally:
+            upstream.close()
+
+    def test_delegate_keeps_the_wait_when_an_old_relay_reports_no_wait_limit(self):
+        for health in ((500, {"error": "boom"}), (200, {"ok": True})):
+            def old_relay(method, path, body, health=health):
+                if path == "/healthz":
+                    return health
+                if method == "POST":
+                    if "waitMs" in body:
+                        return 400, {"error": "unknown_field", "message": "Unknown request field: waitMs"}
+                    return 202, {"id": "task-6", "status": "queued"}
+                return 200, {"id": "task-6", "status": "completed", "output": "ok"}
+
+            upstream = FakeUpstream(old_relay)
+            handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+            try:
+                result = handle({"method": "tools/call", "params": {
+                    "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "waitMs": 900000}}})
+                self.assertNotIn("isError", result)
+                self.assertEqual(result["structuredContent"]["status"], "completed")
+                self.assertNotIn("waitClamped", result["structuredContent"])
+                self.assertNotIn("waitMs", result["structuredContent"])
+                self.assertEqual([call[1] for call in upstream.calls],
+                                 ["/v1/tasks", "/healthz", "/v1/tasks", "/v1/tasks/task-6?waitMs=900000"])
+            finally:
+                upstream.close()
 
     def test_retries_a_loopback_request_after_starting_the_relay(self):
         calls = []

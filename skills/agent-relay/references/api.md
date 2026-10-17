@@ -62,6 +62,7 @@ Body:
 | `requestId` | no | ≤128 chars; idempotency key scoped per agent. |
 | `timeoutMs` | no | Positive integer. Overrides the agent/global timeout; rejected if above `A2A_RELAY_MAX_TIMEOUT_MS`. |
 | `cwd` | no | Absolute or relative path. Must be inside the agent's `allowedRoots` (or equal to its `cwd`), else `400 cwd_not_allowed`. |
+| `waitMs` | no | The wait you mean to use next on `GET /v1/tasks/:id?waitMs=`. The relay checks it before it creates the task: a value that is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS` returns `400 invalid_wait` (message names the range) and creates nothing. The submission does not wait; it still returns `202`. It is not stored on the task. |
 | `parentTaskId` | no | Task delegating this one (the MCP `delegate` tool sends `AGENT_RELAY_PARENT_TASK_ID`). Applies the delegation policy: `delegateTo`, cycles, `AGENT_RELAY_MAX_DELEGATION_DEPTH`, `AGENT_RELAY_MAX_DELEGATED_TASKS`. |
 
 Unknown fields are rejected with `400 unknown_field`. Returns `202` with the task:
@@ -86,7 +87,11 @@ set, a terminal task is dropped (and its `requestId` released) once that period 
 so its ID then returns `404 unknown_task`.
 
 Add `?waitMs=<ms>` to long-poll: the server holds the request until the task is terminal or
-the wait elapses (maximum `A2A_RELAY_MAX_WAIT_MS`). An invalid value returns `400 invalid_wait`.
+the wait elapses (maximum `A2A_RELAY_MAX_WAIT_MS`). A value that is not an integer from 1 to
+that maximum returns `400 invalid_wait`, and its `message` names the range. When the wait
+elapses and the task is still `queued` or `running`, the `200` response also carries
+`waitExpired: true`, `waitedMs` (the wait that elapsed), and a `hint`: call again with the
+same task ID. A terminal task has none of these fields, and they are never stored on the task.
 
 Add `?includeInput=true` to get the submitted prompt back as `input`; the default is `false`.
 Any other value returns `400 invalid_include_input`. The task always carries `inputChars`.
@@ -150,8 +155,8 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `list_agents` | `{}` | Same payload as `GET /v1/agents`, including `revision`. |
-| `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` | Submitted task; with `waitMs`, the terminal task. |
-| `wait_task` | `{ taskId, maxWaitMs? }` | Terminal task, or the current task if the wait elapses. |
+| `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` | Submitted task; with `waitMs`, the terminal task, or the current task with `waitExpired: true` if the wait elapses first. A `waitMs` above the relay limit is refused with `invalid_wait` before the task is created, so nothing runs without an ID. The tool then retries once with the limit (read from `/healthz` `limits.maxWaitMs`, never longer than asked) and adds `waitMs` and `waitClamped: true` to the result. Even with a `requestId` the retry makes one task, because the refused attempt created none. |
+| `wait_task` | `{ taskId, maxWaitMs? }` | Terminal task, or the current task with `waitExpired: true`, `waitedMs` and `hint` if the wait elapses. A `maxWaitMs` above the relay limit is clamped to it, and the result adds `waitMs` and `waitClamped: true`. |
 | `get_task` | `{ taskId, includeInput? }` | Current task. With `includeInput: true` it also carries `input`. |
 | `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
 | `cancel_task` | `{ taskId }` | Cancelled task. |
