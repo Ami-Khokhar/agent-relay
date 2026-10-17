@@ -207,9 +207,13 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 - `delegate { agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` → task.
   With `waitMs`, `delegate` long-polls and returns the terminal task.
 - `wait_task { taskId, maxWaitMs? }` → holds the call until terminal or the wait elapses.
-- `get_task { taskId }` → current task state and result.
+- `get_task { taskId, includeInput? }` → current task state and result.
 - `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
 - `cancel_task { taskId }` → cancel a queued or running task.
+
+Task objects leave out `input` and carry `inputChars` (its length) instead, because you
+already hold the prompt you sent. Pass `includeInput: true` to `get_task` (or
+`?includeInput=true` on `GET /v1/tasks/:id`) only when you need the prompt back.
 
 **Prefer `wait_task` over a `get_task` polling loop** — one call instead of many, and it
 does not stop polling too early.

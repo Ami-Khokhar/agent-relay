@@ -143,6 +143,32 @@ class McpHandlerTests(unittest.TestCase):
         finally:
             upstream.close()
 
+    def test_get_task_asks_the_relay_for_the_input_only_when_include_input_is_true(self):
+        upstream = FakeUpstream(lambda method, path, body: (200, {"id": "task-1", "status": "completed"}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            def get_task(**arguments):
+                return handle({"method": "tools/call", "params": {
+                    "name": "get_task", "arguments": {"taskId": "task-1", **arguments}}})
+
+            get_task()
+            get_task(includeInput=True)
+            get_task(includeInput=False)
+            self.assertEqual([call[1] for call in upstream.calls],
+                             ["/v1/tasks/task-1", "/v1/tasks/task-1?includeInput=true", "/v1/tasks/task-1"])
+            with self.assertRaises(mcp_server.RpcError) as bad:
+                get_task(includeInput="yes")
+            self.assertEqual(bad.exception.code, -32602)
+            self.assertEqual(len(upstream.calls), 3)
+            tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+            option = tools["get_task"]["inputSchema"]["properties"]["includeInput"]
+            self.assertEqual(option["type"], "boolean")
+            self.assertTrue(option["description"])
+            for name in ("delegate", "wait_task", "get_task", "list_tasks"):
+                self.assertIn("inputChars", tools[name]["description"])
+        finally:
+            upstream.close()
+
     def test_delegate_passes_cwd_and_can_wait_for_the_result(self):
         def responder(method, path, body):
             if method == "POST":

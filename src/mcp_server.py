@@ -67,7 +67,7 @@ TOOLS = [
     },
     {
         "name": "delegate",
-        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. When called from an agent the relay itself started, the relay enforces its delegation policy (allowed targets, no cycles, depth and task budgets) and may refuse the task. Returns the task object (the existing task when requestId matches an earlier submission); pass its `id` field to wait_task, get_task, or cancel_task.",
+        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. When called from an agent the relay itself started, the relay enforces its delegation policy (allowed targets, no cycles, depth and task budgets) and may refuse the task. Returns the task object (the existing task when requestId matches an earlier submission); pass its `id` field to wait_task, get_task, or cancel_task. Task objects leave out `input` and carry `inputChars` (its length) instead; get_task with includeInput returns it.",
         "inputSchema": {
             "type": "object", "required": ["agentId", "input"], "additionalProperties": False,
             "properties": {
@@ -91,7 +91,7 @@ TOOLS = [
     },
     {
         "name": "wait_task",
-        "description": "Long-poll until a relay task is terminal or maxWaitMs elapses",
+        "description": "Long-poll until a relay task is terminal or maxWaitMs elapses. The task object has `inputChars` and no `input`; use get_task with includeInput to read the input.",
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
             "properties": {
@@ -105,17 +105,21 @@ TOOLS = [
     },
     {
         "name": "get_task",
-        "description": "Get the current state and result of a relay task",
+        "description": "Get the current state and result of a relay task. The task object has `inputChars` (the length of the input) and leaves out `input` unless includeInput is true.",
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
-            "properties": {"taskId": {"type": "string", "minLength": 1, "maxLength": 128,
-                                      "description": "Task ID returned by delegate."}},
+            "properties": {
+                "taskId": {"type": "string", "minLength": 1, "maxLength": 128,
+                           "description": "Task ID returned by delegate."},
+                "includeInput": {"type": "boolean",
+                                 "description": "Set true to include the task's `input` in the result. Default false: you already hold the prompt you sent, so the relay does not echo it."},
+            },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
         "name": "list_tasks",
-        "description": "List stored relay tasks, optionally filtered by session or status",
+        "description": "List stored relay tasks, optionally filtered by session or status. Task objects have `inputChars` and no `input`; use get_task with includeInput to read one.",
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {
@@ -386,9 +390,14 @@ def create_http_handler(base_url=None, timeout=None):
                     base_url, f"/v1/tasks/{quote(args['taskId'], safe='')}?waitMs={max_wait}",
                     timeout=max(timeout, max_wait / 1000.0 + 5))
             elif name == "get_task":
-                args = _arguments_for(rpc, ["taskId"])
+                args = _arguments_for(rpc, ["taskId", "includeInput"])
                 _non_empty(args, "taskId", 128)
-                value = _relay_request(base_url, "/v1/tasks/" + quote(args["taskId"], safe=""), timeout=timeout)
+                if "includeInput" in args and not isinstance(args["includeInput"], bool):
+                    _invalid("includeInput must be a boolean")
+                path = "/v1/tasks/" + quote(args["taskId"], safe="")
+                if args.get("includeInput"):
+                    path += "?includeInput=true"
+                value = _relay_request(base_url, path, timeout=timeout)
             elif name == "list_tasks":
                 args = _arguments_for(rpc, ["sessionId", "status", "limit"])
                 params = {}

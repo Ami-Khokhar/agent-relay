@@ -61,10 +61,13 @@ Body:
 Unknown fields are rejected with `400 unknown_field`. Returns `202` with the task:
 
 ```json
-{ "id": "uuid", "sessionId": "uuid", "agentId": "claude", "input": "...",
+{ "id": "uuid", "sessionId": "uuid", "agentId": "claude", "inputChars": 42,
   "status": "queued", "createdAt": "ISO-8601", "timeoutMs": 900000,
   "cwd": "/path/to/project", "requestId": "..." }
 ```
+
+Task objects never echo `input`: they carry `inputChars` (its length in characters). Only
+`GET /v1/tasks/:id?includeInput=true` returns it.
 
 Idempotent replay with the same `requestId` and identical fields returns `200` with the
 original task. Different fields with the same `requestId` return `409`.
@@ -79,6 +82,9 @@ so its ID then returns `404 unknown_task`.
 Add `?waitMs=<ms>` to long-poll: the server holds the request until the task is terminal or
 the wait elapses (maximum `A2A_RELAY_MAX_WAIT_MS`). An invalid value returns `400 invalid_wait`.
 
+Add `?includeInput=true` to get the submitted prompt back as `input`; the default is `false`.
+Any other value returns `400 invalid_include_input`. The task always carries `inputChars`.
+
 ### `GET /v1/tasks`
 
 Lists stored tasks, most recent first. Query parameters:
@@ -89,7 +95,7 @@ Lists stored tasks, most recent first. Query parameters:
 | `status` | One of the status values; anything else is `400 invalid_status`. |
 | `limit` | Positive integer, capped at `A2A_RELAY_MAX_TASKS` (default 100). |
 
-Returns `{ "tasks": [ ... ] }`.
+Returns `{ "tasks": [ ... ] }`. Each task carries `inputChars` and never `input`; list takes no `includeInput`.
 
 ### `DELETE /v1/tasks/:id`
 
@@ -114,7 +120,7 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
-| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_wait`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
+| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
 | 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route. |
 | 403 | `forbidden`, `origin_not_allowed`, `delegation_not_allowed` | Admin route called from a non-loopback address; request from a browser origin not in `AGENT_RELAY_ALLOWED_ORIGINS`; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
 | 404 | `unknown_agent`, `unknown_task`, `not_found` | Missing agent/task/route. |
@@ -140,7 +146,7 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | `list_agents` | `{}` | Same payload as `GET /v1/agents`. |
 | `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, waitMs? }` | Submitted task; with `waitMs`, the terminal task. |
 | `wait_task` | `{ taskId, maxWaitMs? }` | Terminal task, or the current task if the wait elapses. |
-| `get_task` | `{ taskId }` | Current task. |
+| `get_task` | `{ taskId, includeInput? }` | Current task. With `includeInput: true` it also carries `input`. |
 | `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
 | `cancel_task` | `{ taskId }` | Cancelled task. |
 
@@ -160,7 +166,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `id` | always | Task UUID. |
 | `sessionId` | always | Correlation only; not a native harness session. |
 | `agentId` | always | Registry id. |
-| `input` | always | The submitted prompt. |
+| `inputChars` | always | Length of the submitted prompt in characters. |
+| `input` | only `GET /v1/tasks/:id?includeInput=true` | The submitted prompt. Left out of every other task object. |
 | `status` | always | See status values. |
 | `createdAt` | always | ISO-8601. |
 | `timeoutMs` | always | Effective timeout. |
