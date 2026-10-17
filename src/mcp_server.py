@@ -61,7 +61,7 @@ def _token():
 TOOLS = [
     {
         "name": "list_agents",
-        "description": "List the agents registered with the relay, with their adapter, capabilities, and timeout. Call this first to get valid agentId values.",
+        "description": "List the agents registered with the relay, with their adapter, capabilities, and timeout. Call this first to get valid agentId values. The result also has `revision`: the commit (`commit`, `short`) and commit date (`date`) the relay runs, each \"unknown\" when the relay cannot read its checkout. A `date` weeks old means the install is stale; `revision` is absent on a relay that predates this field.",
         "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },

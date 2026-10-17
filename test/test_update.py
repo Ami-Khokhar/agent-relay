@@ -8,14 +8,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from urllib.error import URLError
 from urllib import request as urlrequest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from relay_helpers import (ROOT, PYTHON, Relay, send_json, start_http_server,
-                           stop_http_server)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+from relay_helpers import (ROOT, PYTHON, SERVER, McpClient, Relay, send_json,
+                           start_http_server, stop_http_server)
+import server
 
 UPDATE = os.path.join(ROOT, "scripts", "update.sh")
+INSTALL_SERVICE = os.path.join(ROOT, "scripts", "install-service.sh")
+UNKNOWN_REVISION = {"commit": "unknown", "short": "unknown", "date": "unknown"}
+REVISION_DATE = "2026-09-23T10:00:00+05:30"
 
 
 def run_update(env_target, *args):
@@ -332,8 +338,9 @@ class UpdateScriptTests(unittest.TestCase):
 
 
 class UpdateTimerTests(unittest.TestCase):
-    """install-service.sh --with-update-timer generates a launchd plist on
-    Darwin (stubbed uname) and --uninstall removes both files."""
+    """install-service.sh generates the update timer's launchd plist on Darwin
+    (stubbed uname) unless --no-update-timer is given, and --uninstall removes
+    both files."""
 
     @staticmethod
     def _fake_checkout(checkout):
@@ -366,6 +373,7 @@ class UpdateTimerTests(unittest.TestCase):
                 ["bash", install_service, "--with-update-timer"], env=env,
                 cwd=ROOT, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("unknown argument", result.stderr)
             service_plist = os.path.join(
                 tmp, "Library", "LaunchAgents", "com.agent-relay.plist")
             update_plist = os.path.join(
@@ -402,6 +410,139 @@ class UpdateTimerTests(unittest.TestCase):
                     "com.agent-relay.update.plist"), encoding="utf-8") as handle:
                 self.assertIn("<key>StartInterval</key><integer>60</integer>",
                               handle.read())
+
+    def _install(self, env, *args):
+        return subprocess.run(["bash", INSTALL_SERVICE, *args], env=env, cwd=ROOT,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_plain_install_also_installs_the_update_timer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            env = self._env(tmp, checkout)
+            self._fake_checkout(checkout)
+            agents = os.path.join(tmp, "Library", "LaunchAgents")
+
+            result = self._install(env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.exists(os.path.join(agents, "com.agent-relay.plist")))
+            self.assertTrue(os.path.exists(os.path.join(agents, "com.agent-relay.update.plist")))
+            self.assertIn("update timer installed", result.stdout)
+
+            result = self._install(env, "--uninstall")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(os.listdir(agents), [])
+
+    def test_no_update_timer_installs_only_the_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            env = self._env(tmp, checkout)
+            self._fake_checkout(checkout)
+            agents = os.path.join(tmp, "Library", "LaunchAgents")
+
+            result = self._install(env, "--no-update-timer")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("unknown argument", result.stderr)
+            self.assertEqual(os.listdir(agents), ["com.agent-relay.plist"])
+            self.assertIn("update timer not installed", result.stdout)
+
+    def test_update_timer_is_skipped_with_a_warning_outside_a_git_checkout(self):
+        """update.sh cannot update a directory that is not a git clone, so a
+        timer for it would only fail every interval."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(tmp, "copy")
+            env = self._env(tmp, checkout)
+            self._fake_checkout(checkout)
+            agents = os.path.join(tmp, "Library", "LaunchAgents")
+
+            result = self._install(env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(os.listdir(agents), ["com.agent-relay.plist"])
+            self.assertIn("not a git checkout", result.stderr)
+
+
+class DeployedRevisionTests(unittest.TestCase):
+    """The relay reports the commit of the checkout it runs from, so a stale
+    install is visible without reading git."""
+
+    @staticmethod
+    def _checkout(tmp):
+        """A git checkout holding a copy of server.py, with a fixed commit date."""
+        repo = init_repo(os.path.join(tmp, "checkout"), commits=0)
+        os.makedirs(os.path.join(repo, "src"))
+        shutil.copy(SERVER, os.path.join(repo, "src", "server.py"))
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+               "GIT_COMMITTER_DATE": REVISION_DATE}
+        for args in (("add", "."), ("commit", "-qm", "dated")):
+            subprocess.run(["git", *args], cwd=repo, env=env, check=True,
+                           capture_output=True, text=True)
+        return repo
+
+    def test_reads_the_commit_and_its_date_from_a_git_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._checkout(tmp)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            revision = server.deployed_revision(repo)
+            self.assertEqual(revision["commit"], head)
+            self.assertEqual(len(head), 40)
+            self.assertGreaterEqual(len(revision["short"]), 7)
+            self.assertTrue(head.startswith(revision["short"]))
+            self.assertEqual(revision["date"], REVISION_DATE)
+
+    def test_reports_unknown_outside_a_git_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(server.deployed_revision(tmp), UNKNOWN_REVISION)
+            # A folder inside someone else's repository is not itself a checkout.
+            repo = self._checkout(tmp)
+            self.assertEqual(server.deployed_revision(os.path.join(repo, "src")),
+                             UNKNOWN_REVISION)
+
+    def test_reports_unknown_when_git_is_missing_hangs_or_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._checkout(tmp)
+            for failure in (FileNotFoundError("git"), subprocess.TimeoutExpired("git", 5)):
+                with mock.patch.object(server.subprocess, "run", side_effect=failure):
+                    self.assertEqual(server.deployed_revision(repo), UNKNOWN_REVISION)
+            # A repository with no commit makes git exit non-zero.
+            empty = init_repo(os.path.join(tmp, "empty"), commits=0)
+            self.assertEqual(server.deployed_revision(empty), UNKNOWN_REVISION)
+
+    def test_a_running_relay_and_its_mcp_list_agents_report_the_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._checkout(tmp)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]},
+                          server=os.path.join(repo, "src", "server.py"))
+            client = McpClient(relay.base)
+            try:
+                health = relay.request("GET", "/healthz", token=None)[1]
+                self.assertEqual(health["revision"]["commit"], head)
+                self.assertEqual(health["revision"]["date"], REVISION_DATE)
+                listing = relay.request("GET", "/v1/agents")[1]
+                self.assertEqual(listing["revision"], health["revision"])
+                listed = client.call_tool("list_agents", {})["structuredContent"]
+                self.assertEqual(listed["revision"], health["revision"])
+            finally:
+                client.close()
+                relay.close()
+
+    def test_a_relay_outside_a_git_checkout_still_starts_and_reports_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            shutil.copy(SERVER, os.path.join(tmp, "src", "server.py"))
+            relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]},
+                          server=os.path.join(tmp, "src", "server.py"))
+            try:
+                health = relay.request("GET", "/healthz", token=None)[1]
+                self.assertEqual(health["revision"], UNKNOWN_REVISION)
+                self.assertEqual(relay.request("GET", "/v1/agents")[1]["revision"],
+                                 UNKNOWN_REVISION)
+            finally:
+                relay.close()
 
 
 class HealthzCountsTests(unittest.TestCase):

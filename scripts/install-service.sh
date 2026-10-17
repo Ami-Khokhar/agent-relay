@@ -5,10 +5,16 @@
 # Linux: ~/.config/systemd/user/agent-relay.service (systemd --user)
 #
 # Usage:
-#   scripts/install-service.sh            install and start
+#   scripts/install-service.sh            install and start the service, and a
+#                                   scheduled update that runs scripts/update.sh
+#                                   every 6 hours so the checkout cannot fall
+#                                   behind unnoticed
+#   scripts/install-service.sh --no-update-timer
+#                                   install the service only; update the
+#                                   checkout yourself with scripts/update.sh
 #   scripts/install-service.sh --with-update-timer
-#                                   also install a scheduled update that runs
-#                                   scripts/update.sh every 6 hours
+#                                   accepted for old callers; the timer is now
+#                                   the default
 #   scripts/install-service.sh --uninstall   (removes the service and the
 #                                   update timer if one is installed)
 #
@@ -29,11 +35,12 @@ PORT="${A2A_RELAY_PORT:-${AGENT_RELAY_PORT:-43124}}"
 LABEL="com.agent-relay"
 LOG_DIR="$HOME/.local/state/agent-relay"
 
-WITH_UPDATE_TIMER=0
+WITH_UPDATE_TIMER=1
 UNINSTALL=0
 for arg in "$@"; do
   case "$arg" in
-    --with-update-timer) WITH_UPDATE_TIMER=1 ;;
+    --with-update-timer) ;;
+    --no-update-timer) WITH_UPDATE_TIMER=0 ;;
     --uninstall) UNINSTALL=1 ;;
     *) echo "warning: unknown argument: $arg" >&2 ;;
   esac
@@ -144,8 +151,15 @@ fi
 
 echo "verify: curl -sS http://127.0.0.1:$PORT/healthz"
 
-# Optional scheduled update: keep the checkout current and restart the service
-# when the code changed. See scripts/update.sh.
+# Scheduled update (on unless --no-update-timer): keep the checkout current and restart
+# the service when the code changed. See scripts/update.sh. It updates only a git clone,
+# so a timer for any other directory would fail on every run.
+if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -d "$TARGET_DIR/.git" ]; then
+  echo "warning: $TARGET_DIR is not a git checkout, so scripts/update.sh cannot update it; no update timer installed" >&2
+  WITH_UPDATE_TIMER=0
+elif [ "$WITH_UPDATE_TIMER" = "0" ]; then
+  echo "update timer not installed (--no-update-timer): this checkout changes only when you run scripts/update.sh"
+fi
 if [ "$WITH_UPDATE_TIMER" = "1" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
