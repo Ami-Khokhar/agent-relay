@@ -61,7 +61,7 @@ def _token():
 TOOLS = [
     {
         "name": "list_agents",
-        "description": "List the agents registered with the relay, with their adapter, capabilities, and timeout. Call this first to get valid agentId values. The result also has `revision`: the commit (`commit`, `short`) and commit date (`date`) the relay runs, each \"unknown\" when the relay cannot read its checkout. A `date` weeks old means the install is stale; `revision` is absent on a relay that predates this field.",
+        "description": "List the agents registered with the relay, with their adapter, capabilities, timeout, the per-task options each one allows (option names and allowed values), and whether it supports readOnly tasks. Call this first to get valid agentId values. The result also has `revision`: the commit (`commit`, `short`) and commit date (`date`) the relay runs, each \"unknown\" when the relay cannot read its checkout. A `date` weeks old means the install is stale; `revision` is absent on a relay that predates this field.",
         "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
@@ -83,6 +83,10 @@ TOOLS = [
                               "description": "Maximum run time for the task, in milliseconds. When it expires the relay stops waiting, marks the task timed_out, and terminates a command/stdio adapter; an http adapter's work may continue. Omit to use the agent's default timeout."},
                 "cwd": {"type": "string", "minLength": 1,
                         "description": "Working directory for the target agent (absolute path recommended). Must be inside the agent's allowedRoots or equal to its default cwd, else the relay rejects it with cwd_not_allowed; it must also be an existing directory, otherwise the relay rejects it with invalid_cwd. Omit to use the agent's default cwd."},
+                "options": {"type": "object", "additionalProperties": {"type": "string"},
+                            "description": "Named options for the target agent, for example {\"effort\": \"high\"}. Each agent allows only the option names and values that list_agents shows for it; the relay refuses any other name or value (unknown_option, invalid_option_value) and adds only the arguments the owner mapped to the chosen values. Omit to use the agent's defaults."},
+                "readOnly": {"type": "boolean",
+                             "description": "Set true to require that the agent cannot change files: the relay adds the agent's read-only arguments and, where the owner enabled it on macOS, runs it in a sandbox that blocks writes under the task's cwd, the agent's allowedRoots and the cwd's git metadata, reading the relay token, and calling the relay (so that agent cannot delegate). It does not block reads or other network access. An agent that does not list readOnly: supported in list_agents refuses the task (read_only_unsupported) and nothing runs. If the cwd is in a git repository whose metadata git cannot locate, the task fails (read_only_git_unknown) instead of running with less protection. An input that starts with \"-\" is refused (invalid_input) when the agent takes its input as a command-line argument and the owner declared no input separator for it, because it could be read as an option that overrides the read-only arguments; start the input with another character. Omit or false for a normal run."},
                 "waitMs": {"type": "integer", "minimum": 1,
                            "description": "Maximum time, in milliseconds, that this call waits for the task to finish. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. The relay checks the wait before it creates the task, so a refused wait leaves no task and a retry with the same requestId cannot duplicate it. If the task is still running when the wait ends, the call returns its current state with waitExpired: true; then call wait_task again with the same taskId. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
@@ -194,6 +198,11 @@ def _relay_wait_limit(base_url, rejected, wait_ms):
     if rejected.status != 400 or (rejected.data or {}).get("error") != "invalid_wait":
         return None
     return _health_wait_limit(base_url, wait_ms)
+
+
+def _is_string_map(value):
+    return isinstance(value, dict) and all(
+        isinstance(name, str) and name and isinstance(item, str) for name, item in value.items())
 
 
 def _arguments_for(rpc, allowed):
@@ -379,7 +388,7 @@ def create_http_handler(base_url=None, timeout=None):
                 value = _relay_request(base_url, "/v1/agents", timeout=timeout)
             elif name == "delegate":
                 args = _arguments_for(rpc, ["agentId", "input", "sessionId", "requestId",
-                                            "timeoutMs", "cwd", "waitMs"])
+                                            "timeoutMs", "cwd", "options", "readOnly", "waitMs"])
                 _non_empty(args, "agentId", 128)
                 _non_empty(args, "input")
                 if "sessionId" in args:
@@ -390,10 +399,14 @@ def create_http_handler(base_url=None, timeout=None):
                     _invalid("timeoutMs must be a positive integer")
                 if "cwd" in args:
                     _non_empty(args, "cwd")
+                if "options" in args and not _is_string_map(args["options"]):
+                    _invalid("options must be an object of option names to value strings")
+                if "readOnly" in args and not isinstance(args["readOnly"], bool):
+                    _invalid("readOnly must be true or false")
                 if "waitMs" in args and not _is_positive_int(args["waitMs"]):
                     _invalid("waitMs must be a positive integer")
                 payload = {"agentId": args["agentId"], "input": args["input"]}
-                for key in ("sessionId", "requestId", "timeoutMs", "cwd"):
+                for key in ("sessionId", "requestId", "timeoutMs", "cwd", "options", "readOnly"):
                     if key in args:
                         payload[key] = args[key]
                 # Set by the relay for agents it spawned: the relay then applies its

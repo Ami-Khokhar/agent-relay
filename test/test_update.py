@@ -599,8 +599,36 @@ class DeployedRevisionTests(unittest.TestCase):
                 handle.write("#!/bin/sh\necho 0123456789abcdef0123456789abcdef01234567\n"
                              "echo 0123456\necho 2026-09-23T10:00:00+05:30\nexit 1\n")
             os.chmod(stub, 0o755)
-            with mock.patch.dict(os.environ, {"PATH": f"{stubs}:{os.environ['PATH']}"}):
+            # The relay never looks git up on PATH, so the stub is reached through the owner's override.
+            with mock.patch.object(server, "TRUSTED_GIT", stub):
                 self.assertEqual(server.deployed_revision(repo), UNKNOWN_REVISION)
+
+    def test_runs_the_trusted_git_and_never_one_planted_on_path_or_in_the_home_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._checkout(tmp)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            planted, home = os.path.join(tmp, "planted"), os.path.join(tmp, "home")
+            os.makedirs(planted)
+            os.makedirs(home)
+            marker = os.path.join(tmp, "ran")
+            with open(os.path.join(planted, "git"), "w", encoding="utf-8") as handle:
+                handle.write(f'#!/bin/sh\necho ran > "{marker}"\nexit 1\n')
+            os.chmod(os.path.join(planted, "git"), 0o755)
+            with open(os.path.join(home, ".gitconfig"), "w", encoding="utf-8") as handle:
+                handle.write("[core\n\tfsmonitor = /nonexistent\n")  # git dies on it when it reads it
+            with mock.patch.dict(os.environ, {"PATH": f"{planted}:{os.environ['PATH']}", "HOME": home}):
+                revision = server.deployed_revision(repo)
+            self.assertFalse(os.path.exists(marker), "a git found through PATH ran at startup")
+            self.assertEqual(revision["commit"], head)
+
+    def test_reports_unknown_when_the_relay_has_no_trusted_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._checkout(tmp)
+            with mock.patch.object(server, "TRUSTED_GIT", None), \
+                    mock.patch.object(server.subprocess, "run") as run:
+                self.assertEqual(server.deployed_revision(repo), UNKNOWN_REVISION)
+            run.assert_not_called()
 
     def test_a_running_relay_and_its_mcp_list_agents_report_the_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
