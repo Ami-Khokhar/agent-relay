@@ -6,6 +6,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKILL = os.path.join(ROOT, "skills", "agent-relay", "SKILL.md")
+USE_CASES = os.path.join(ROOT, "skills", "agent-relay", "references", "use-cases.md")
 
 
 def _frontmatter_lines():
@@ -50,6 +51,20 @@ class SkillFrontmatterTests(unittest.TestCase):
         text = "\n".join(_frontmatter_lines()).lower()
         for keyword in ("pi", "codex", "opencode", "claude code", "delegate", "orchestrate"):
             self.assertIn(keyword, text)
+
+    def test_skill_tells_short_budget_clients_to_loop_on_waitExpired(self):
+        with open(SKILL, encoding="utf-8") as handle:
+            text = handle.read()
+        for needle in ("waitExpired", "120 s", "110000"):
+            self.assertIn(needle, text)
+
+    def test_use_cases_teach_a_short_wait_and_a_loop_on_waitExpired(self):
+        with open(USE_CASES, encoding="utf-8") as handle:
+            text = handle.read()
+        for needle in ("waitExpired", "110000"):
+            self.assertIn(needle, text)
+        self.assertNotIn("waitMs=600000", text)
+        self.assertNotIn("until terminal", text)
 
 
 if __name__ == "__main__":

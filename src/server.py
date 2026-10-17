@@ -34,7 +34,8 @@ INHERITED_ENV = (
 )
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd", "parentTaskId"}
+TASK_FIELDS = {"agentId", "input", "sessionId", "requestId", "timeoutMs", "cwd", "parentTaskId",
+               "waitMs"}
 STATUSES = {"queued", "running", "completed", "failed", "timed_out", "cancelled"}
 # On POSIX each adapter runs in its own process group so cancellation reaches descendants.
 PROCESS_GROUPS = os.name == "posix"
@@ -942,6 +943,14 @@ def _list_tasks(session_id=None, status=None, limit=100):
     return [visible(task) for task in tasks[:limit]]
 
 
+def _is_valid_wait(value):
+    return _is_positive_int(value) and value <= MAX_WAIT_MS
+
+
+def _invalid_wait():
+    return {"error": "invalid_wait", "message": f"waitMs must be an integer from 1 to {MAX_WAIT_MS}"}
+
+
 def _wait_for_terminal(task_id, wait_ms):
     deadline = time.monotonic() + wait_ms / 1000.0
     with TASK_CONDITION:
@@ -1095,6 +1104,10 @@ class Handler(BaseHTTPRequestHandler):
         parent_id = request.get("parentTaskId")
         if parent_id is not None and not _valid(parent_id):
             return self._json(400, {"error": "invalid_parent_task_id"})
+        # waitMs only names the wait the caller means to use next. Refuse a bad one here, before the
+        # task exists: a caller that gets this error then holds no task ID for a task that runs on.
+        if "waitMs" in request and not _is_valid_wait(request["waitMs"]):
+            return self._json(400, _invalid_wait())
         task_cwd, cwd_error = _resolve_task_cwd(agent, request.get("cwd"))
         if cwd_error:
             message = (f"cwd is not inside an allowed root for agent {agent['id']}"
@@ -1170,19 +1183,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "invalid_include_input",
                                     "message": "includeInput must be true or false"})
         wait_raw = query.get("waitMs", [None])[0]
+        wait_ms = None
         if wait_raw is None:
             task = TASKS.get(task_id)
         else:
             try:
                 wait_ms = int(wait_raw)
             except ValueError:
-                return self._json(400, {"error": "invalid_wait"})
-            if wait_ms <= 0 or wait_ms > MAX_WAIT_MS:
-                return self._json(400, {"error": "invalid_wait"})
+                wait_ms = 0
+            if not _is_valid_wait(wait_ms):
+                return self._json(400, _invalid_wait())
             task = _wait_for_terminal(task_id, wait_ms)
-        if not task:
+        if task is None:
             return self._json(404, {"error": "unknown_task"})
-        return self._json(200, visible(task, include_input == "true"))
+        result = visible(task, include_input == "true")
+        if wait_ms is not None and result["status"] in ("queued", "running"):
+            # Say that the wait ended, so a caller need not compare status strings. Judge the
+            # copy, not the live task: the task may finish between the wait and this check.
+            result.update(waitExpired=True, waitedMs=wait_ms,
+                          hint="The wait expired before the task finished. Call wait_task again "
+                               "with the same taskId, or repeat this request.")
+        return self._json(200, result)
 
     def _list(self, query):
         session_id = query.get("sessionId", [None])[0]

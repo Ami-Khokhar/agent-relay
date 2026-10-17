@@ -84,21 +84,21 @@ TOOLS = [
                 "cwd": {"type": "string", "minLength": 1,
                         "description": "Working directory for the target agent (absolute path recommended). Must be inside the agent's allowedRoots or equal to its default cwd, else the relay rejects it with cwd_not_allowed; it must also be an existing directory, otherwise the relay rejects it with invalid_cwd. Omit to use the agent's default cwd."},
                 "waitMs": {"type": "integer", "minimum": 1,
-                           "description": "Maximum time, in milliseconds, that this call waits for the task to finish; the relay rejects values above A2A_RELAY_MAX_WAIT_MS (default 600000) with invalid_wait (the task is still created). If the task is still running, the call returns its current status; then call wait_task again with the same taskId."},
+                           "description": "Maximum time, in milliseconds, that this call waits for the task to finish. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. The relay checks the wait before it creates the task, so a refused wait leaves no task and a retry with the same requestId cannot duplicate it. If the task is still running when the wait ends, the call returns its current state with waitExpired: true; then call wait_task again with the same taskId. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
     },
     {
         "name": "wait_task",
-        "description": "Long-poll until a relay task is terminal or maxWaitMs elapses. The task object has `inputChars` and no `input`; use get_task with includeInput to read the input.",
+        "description": "Long-poll until a relay task is terminal or maxWaitMs elapses. If the task is still not terminal when the wait ends, the result carries waitExpired: true, waitedMs (the wait that elapsed), and a hint: call wait_task again with the same taskId. A terminal result has no waitExpired. A client with a short tool-call budget should use maxWaitMs of about 110000 or less and loop while waitExpired is true: Claude Code moves an MCP call that runs longer than 120 s to the background, and its completion notice then shows a task that is still running. The task object has `inputChars` and no `input`; use get_task with includeInput to read the input.",
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
             "properties": {
                 "taskId": {"type": "string", "minLength": 1, "maxLength": 128,
                            "description": "Task ID returned by delegate."},
                 "maxWaitMs": {"type": "integer", "minimum": 1,
-                              "description": "Maximum time to wait, in milliseconds, before returning the current status; the relay rejects values above A2A_RELAY_MAX_WAIT_MS (default 600000) with invalid_wait."},
+                              "description": "Maximum time to wait, in milliseconds (default 60000), before returning the current status. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -167,6 +167,33 @@ def _invalid(message):
 
 def _is_positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _refuses_wait_field(rejected):
+    """True when `rejected` is a relay from before POST /v1/tasks took waitMs refusing that field."""
+    data = rejected.data or {}
+    return (rejected.status == 400 and data.get("error") == "unknown_field"
+            and "waitMs" in str(data.get("message")))
+
+
+def _health_wait_limit(base_url, wait_ms):
+    """The relay's maxWaitMs from /healthz when it is a positive int below `wait_ms`, else None."""
+    try:
+        limit = (_relay_request(base_url, "/healthz").get("limits") or {}).get("maxWaitMs")
+    except RelayError:
+        return None
+    return limit if _is_positive_int(limit) and limit < wait_ms else None
+
+
+def _relay_wait_limit(base_url, rejected, wait_ms):
+    """The relay's maxWaitMs, when `rejected` is its invalid_wait refusal of a wait above it.
+
+    Returns None when the refusal is anything else, or when the relay reports no limit below
+    `wait_ms`: the caller then reports the original error. Waiting longer than asked is wrong.
+    """
+    if rejected.status != 400 or (rejected.data or {}).get("error") != "invalid_wait":
+        return None
+    return _health_wait_limit(base_url, wait_ms)
 
 
 def _arguments_for(rpc, allowed):
@@ -374,21 +401,54 @@ def create_http_handler(base_url=None, timeout=None):
                 parent_task = _env("AGENT_RELAY_PARENT_TASK_ID")
                 if parent_task:
                     payload["parentTaskId"] = parent_task
-                value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
+                # Send the wait with the submission: the relay refuses a wait it cannot honour
+                # before it creates the task, so a refusal leaves no task running without an ID.
                 wait_ms = args.get("waitMs")
+                if wait_ms:
+                    payload["waitMs"] = wait_ms
+                clamped = False
+                try:
+                    value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
+                except RelayError as exc:
+                    if not wait_ms:
+                        raise
+                    if _refuses_wait_field(exc):
+                        del payload["waitMs"]  # a relay from before this field: no pre-check, still waits
+                        # Its long poll still refuses a wait above its limit, so clamp to /healthz's.
+                        limit = _health_wait_limit(base_url, wait_ms)
+                        if limit is not None:
+                            wait_ms, clamped = limit, True
+                    else:
+                        limit = _relay_wait_limit(base_url, exc, wait_ms)
+                        if limit is None:
+                            raise
+                        wait_ms, clamped = limit, True
+                        payload["waitMs"] = limit
+                    # Nothing was created, so the retry cannot duplicate the task, even with a requestId.
+                    value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
                 if wait_ms and value.get("status") in ("queued", "running"):
                     value = _relay_request(
                         base_url, f"/v1/tasks/{quote(value['id'], safe='')}?waitMs={wait_ms}",
                         timeout=max(timeout, wait_ms / 1000.0 + 5))
+                if clamped:
+                    value.update(waitMs=wait_ms, waitClamped=True)
             elif name == "wait_task":
                 args = _arguments_for(rpc, ["taskId", "maxWaitMs"])
                 _non_empty(args, "taskId", 128)
                 max_wait = args.get("maxWaitMs", 60_000)
                 if not _is_positive_int(max_wait):
                     _invalid("maxWaitMs must be a positive integer")
-                value = _relay_request(
-                    base_url, f"/v1/tasks/{quote(args['taskId'], safe='')}?waitMs={max_wait}",
-                    timeout=max(timeout, max_wait / 1000.0 + 5))
+                task_path = "/v1/tasks/" + quote(args["taskId"], safe="")
+                try:
+                    value = _relay_request(base_url, f"{task_path}?waitMs={max_wait}",
+                                           timeout=max(timeout, max_wait / 1000.0 + 5))
+                except RelayError as exc:
+                    limit = _relay_wait_limit(base_url, exc, max_wait)
+                    if limit is None:
+                        raise
+                    value = _relay_request(base_url, f"{task_path}?waitMs={limit}",
+                                           timeout=max(timeout, limit / 1000.0 + 5))
+                    value.update(waitMs=limit, waitClamped=True)
             elif name == "get_task":
                 args = _arguments_for(rpc, ["taskId", "includeInput"])
                 _non_empty(args, "taskId", 128)
