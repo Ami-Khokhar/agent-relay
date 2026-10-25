@@ -16,7 +16,7 @@ The HTTP API listens on `http://127.0.0.1:43124` by default. Every `/v1/` reques
 python3 src/mcp_server.py
 ```
 
-Configure that command as a local stdio MCP server in the client. It provides `list_agents`, `delegate`, `wait_task`, `get_task`, `list_tasks`, and `cancel_task`. `A2A_RELAY_URL` overrides the HTTP address it calls. When the relay is unreachable and the URL is loopback, the MCP process starts the HTTP service detached on first use and logs it to `~/.local/state/agent-relay/relay.log`; disable that with `A2A_RELAY_AUTOSTART=0`.
+Configure that command as a local stdio MCP server in the client. It provides `list_agents`, `delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`, `list_workflows`, `cancel_workflow`, `resume_workflow`, and `get_pressure`. `A2A_RELAY_URL` overrides the HTTP address it calls. When the relay is unreachable and the URL is loopback, the MCP process starts the HTTP service detached on first use and logs it to `~/.local/state/agent-relay/relay.log`; disable that with `A2A_RELAY_AUTOSTART=0`.
 
 Register the MCP server once with copy-paste commands (use absolute paths; `bash skills/agent-relay/scripts/setup.sh` prints these for your checkout):
 
@@ -266,6 +266,61 @@ Submission returns `202` with a run ID and a step list; `GET /v1/workflows/:id?w
 
 Runs are journaled to `<state dir>/workflows/<id>.jsonl` (`AGENT_RELAY_STATE_DIR`, default `~/.local/state/agent-relay`), so a step that completed keeps its output across a relay restart. `POST /v1/workflows/:id/resume` continues such a run, re-running only the steps that never finished, and `GET /v1/workflows/:id` for a run that is no longer active returns `404` with a message pointing at resume. A step whose child task was evicted or expired before the run could read it fails with `task_evicted_from_the_relay_store`, so set `AGENT_RELAY_TASK_RETENTION_MS` with care if you rely on long runs: the default keeps finished tasks until the store fills or the relay restarts.
 
+## Device pressure
+
+A long multi-agent run is the most expensive thing the relay starts, so it can read the host's
+pressure before and during a run.
+
+```bash
+AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
+curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/pressure
+curl -sS -H "$AUTH" -X POST http://127.0.0.1:43124/v1/pressure/kill
+```
+
+```json
+{ "verdict": "ok", "reasons": [],
+  "memory": { "pressureLevel": "normal", "freePercent": 47 },
+  "swap": { "usedBytes": 955451965, "totalBytes": 2147483648, "usedPercent": 44 },
+  "thermal": { "speedLimitPercent": null },
+  "temperatureC": null,
+  "temperatureReason": "macOS exposes no unprivileged CPU temperature; powermetrics needs root",
+  "sampledAt": "2026-10-25T11:23:38.461Z",
+  "guard": { "enabled": true, "stopsAt": "critical" } }
+```
+
+The verdict is `critical` when the kernel reports critical memory pressure, less than 4% of
+memory is free, swap is 90% used or more, or the CPU is throttled below 40% of its speed; `warn`
+uses the softer version of the same readings (kernel warning, 12% free, 70% swap, 75%
+throttled); otherwise `ok`. `reasons` names the reading that decided it, and each signal is
+`null` when the host cannot report it. The numbers are read from `vm.memory_pressure`,
+`kern.memorystatus_level`, `vm.swapusage` and `pmset -g therm`, so a verdict always names a
+number rather than an opaque flag.
+
+Both probes run outside the sandbox as the relay's user, so the relay runs them by absolute path
+and never through `PATH`: `/usr/sbin/sysctl` and `/usr/bin/pmset`, or the first trusted path that
+exists. A task may write anywhere outside the protected directories, and a `sysctl` it planted on
+`PATH` must not become the program the relay runs every few seconds. `AGENT_RELAY_SYSCTL` and
+`AGENT_RELAY_PMSET` in the relay's own environment name another absolute executable, which is how
+the tests drive each reading without a busy machine.
+
+- **Before a run.** `POST /v1/workflows` returns `503 device_pressure` while the verdict is
+  `critical`, naming the reason and carrying the reading, so nothing starts on a machine that cannot
+  take it. A `warn` verdict still runs work.
+- **During a run.** With `AGENT_RELAY_PRESSURE_GUARD` on (the default) the relay samples every
+  `AGENT_RELAY_PRESSURE_INTERVAL_MS` (default 5000) but only while at least one run is active, so an
+  idle relay never shells out. If the verdict turns `critical` it stops every active run.
+- **The kill button.** `POST /v1/pressure/kill` is the same stop on demand, whether or not the
+  verdict is critical, and reports the reading it saw.
+
+A stopped run is `cancelled` with `device_pressure:` at the start of its `error`, and
+`POST /v1/workflows/:id/resume` continues it from the last step that finished: only the step that
+was running is repeated. The checkpoint is the step, so a killed adapter's own partial work is lost
+— the relay cannot checkpoint inside another agent's process.
+
+`temperatureC` is null on Apple Silicon: `powermetrics` needs root and macOS exposes no
+unprivileged sensor. `pmset -g therm` reports a throttle only after macOS records one, so a null
+`speedLimitPercent` means no throttle was recorded, not that the reading failed.
+
 ## Data access and retention
 
 - **What is stored.** Each task keeps its full `input` (the prompt), `output`, `error`, `cwd`, `sessionId`, and `requestId` in the relay's memory. Nothing about a task is written to disk and the relay does not log task content. The one exception is a workflow run: it journals the submitted document and the output of every step that completed to `<state dir>/workflows/<id>.jsonl` (`AGENT_RELAY_STATE_DIR`, default `~/.local/state/agent-relay`), so a resumed run can skip the steps that finished. That file holds prompts and results, so treat it as task content and remove it when you no longer need to resume the run.
@@ -300,7 +355,7 @@ HTTP is the core transport because callers can use it locally or across machines
 
 Tasks are held in memory and disappear on restart, so a workflow run's journal is the only thing that outlives a restart and it exists solely so a run can be resumed. At most four tasks run at once by default (`A2A_RELAY_MAX_ACTIVE`); the rest queue. Results are bounded, and completed tasks may be evicted when the task store fills. For a durable single-host deployment, add SQLite task storage. Command adapters inherit only basic process variables by default. If an adapter needs a credential already in the relay's environment, list its name in that agent's `inheritEnv` array rather than putting the secret value in the registry file. A task's timeout is one deadline that covers process startup, writing the request to a stdio adapter, execution, and reading an HTTP adapter's response. Collecting a spawned adapter's output is bounded by a short grace after it exits, so a timed-out task can be reported a few seconds after its deadline. On `SIGTERM` or `SIGINT` the relay cancels running tasks and waits briefly for adapter processes to terminate before exiting.
 
-Resource limits can be changed with `AGENT_RELAY_TASK_RETENTION_MS` (`0`, the default, keeps finished tasks until eviction or restart), `A2A_RELAY_MAX_BODY_BYTES`, `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`, `A2A_RELAY_MAX_OUTPUT_BYTES`, `A2A_RELAY_MAX_TASKS`, `A2A_RELAY_MAX_ACTIVE`, `A2A_RELAY_MAX_WAIT_MS`, `A2A_RELAY_MAX_STEPS` (workflow steps per run, default 64), `A2A_RELAY_MAX_WORKFLOWS` (stored runs, default 200), `A2A_RELAY_MAX_FOREACH` (items per fan-out, default 32), `A2A_RELAY_STATE_DIR` (a path, default `~/.local/state/agent-relay`, holding the workflow journals), `A2A_RELAY_TIMEOUT_MS` (default timeout, 15 minutes), `AGENT_RELAY_MAX_DELEGATION_DEPTH`, `AGENT_RELAY_MAX_DELEGATED_TASKS`, and `A2A_RELAY_MAX_TIMEOUT_MS` (optional hard cap; unset means no cap). Each must be a positive integer except `A2A_RELAY_MAX_TIMEOUT_MS`, `AGENT_RELAY_TASK_RETENTION_MS`, and `AGENT_RELAY_MAX_DELEGATION_DEPTH`, which accept `0` (no cap; keep until eviction; no delegation), and `A2A_RELAY_STATE_DIR`, which is a path. Command input defaults to 64 KiB because it is passed as one argument and operating systems cap the combined argument and environment size. The output limit applies to the combined stdout and stderr captured from a command and to the body read from an HTTP adapter. The listener also honors `A2A_RELAY_PORT` (default `43124`) and `A2A_RELAY_HOST`; the MCP process honors `A2A_RELAY_URL`, `A2A_RELAY_HTTP_TIMEOUT_MS`, and `A2A_RELAY_AUTOSTART`. Every variable also accepts an `AGENT_RELAY_*` spelling (for example `AGENT_RELAY_TIMEOUT_MS`); the `A2A_*` names remain as aliases.
+Resource limits can be changed with `AGENT_RELAY_TASK_RETENTION_MS` (`0`, the default, keeps finished tasks until eviction or restart), `A2A_RELAY_MAX_BODY_BYTES`, `A2A_RELAY_MAX_COMMAND_INPUT_BYTES`, `A2A_RELAY_MAX_OUTPUT_BYTES`, `A2A_RELAY_MAX_TASKS`, `A2A_RELAY_MAX_ACTIVE`, `A2A_RELAY_MAX_WAIT_MS`, `A2A_RELAY_MAX_STEPS` (workflow steps per run, default 64), `A2A_RELAY_MAX_WORKFLOWS` (stored runs, default 200), `A2A_RELAY_PRESSURE_INTERVAL_MS` (how often an active run's host pressure is re-read, default 5000), `AGENT_RELAY_PRESSURE_GUARD` (`1`, the default; `0` disables the pressure stop), `A2A_RELAY_MAX_FOREACH` (items per fan-out, default 32), `A2A_RELAY_STATE_DIR` (a path, default `~/.local/state/agent-relay`, holding the workflow journals), `A2A_RELAY_TIMEOUT_MS` (default timeout, 15 minutes), `AGENT_RELAY_MAX_DELEGATION_DEPTH`, `AGENT_RELAY_MAX_DELEGATED_TASKS`, and `A2A_RELAY_MAX_TIMEOUT_MS` (optional hard cap; unset means no cap). Each must be a positive integer except `A2A_RELAY_MAX_TIMEOUT_MS`, `AGENT_RELAY_TASK_RETENTION_MS`, and `AGENT_RELAY_MAX_DELEGATION_DEPTH`, which accept `0` (no cap; keep until eviction; no delegation), and `A2A_RELAY_STATE_DIR`, which is a path, and `AGENT_RELAY_PRESSURE_GUARD`, which is `0` or `1`. Command input defaults to 64 KiB because it is passed as one argument and operating systems cap the combined argument and environment size. The output limit applies to the combined stdout and stderr captured from a command and to the body read from an HTTP adapter. The listener also honors `A2A_RELAY_PORT` (default `43124`) and `A2A_RELAY_HOST`; the MCP process honors `A2A_RELAY_URL`, `A2A_RELAY_HTTP_TIMEOUT_MS`, and `A2A_RELAY_AUTOSTART`. Every variable also accepts an `AGENT_RELAY_*` spelling (for example `AGENT_RELAY_TIMEOUT_MS`); the `A2A_*` names remain as aliases.
 
 Updating: `bash scripts/update.sh` fast-forwards the checkout at `~/.local/share/agent-relay` to `main` and restarts the service only when the code changed, then verifies `/healthz`. Tasks and sessions live in memory, so the first restart is skipped while tasks are in flight; the deferral is recorded and the next run escalates — restarting unless the relay visibly reports busy tasks, so an unreadable relay (for example one running pre-update code) is activated at most one cycle late, and `--force` restarts immediately. `--no-restart` records the same deferral without attempting a restart. `bash scripts/install-service.sh` also installs a scheduled update that runs `update.sh` every 6 hours (`AGENT_RELAY_UPDATE_INTERVAL_SECS` overrides the period), so an installed relay cannot fall behind `main` unnoticed. It does so only when the install directory is a git clone, because `update.sh` cannot update anything else; otherwise it prints a warning and installs the service alone. Pass `--no-update-timer` to opt out and run `update.sh` yourself; it also removes an update timer that an earlier install left behind and leaves the relay service alone. `--with-update-timer` is still accepted and does nothing, because the timer is now the default. An install made before this default has no timer until you rerun the installer. `install-service.sh --uninstall` removes both. MCP clients and the skill need no reconfiguration: the tool list refreshes on each client's next session start.
 

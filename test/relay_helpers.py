@@ -47,8 +47,11 @@ class Relay:
         with open(self.config, "w", encoding="utf-8") as handle:
             json.dump({"agents": agent if isinstance(agent, list) else [agent]}, handle)
         self.port = free_port()
+        # The pressure guard samples the real host while a run is active, which would let the
+        # developer's memory state cancel a test's run. test/test_pressure.py turns it back on,
+        # and names the two probes it wants.
         child_env = {**os.environ, "A2A_RELAY_PORT": str(self.port), "A2A_AGENTS_FILE": self.config,
-                     "AGENT_RELAY_TOKEN": TOKEN}
+                     "AGENT_RELAY_TOKEN": TOKEN, "AGENT_RELAY_PRESSURE_GUARD": "0"}
         child_env.update(env or {})
         self.proc = subprocess.Popen(
             [PYTHON, server], cwd=ROOT, env=child_env,

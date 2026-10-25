@@ -344,8 +344,13 @@ class WorkflowEngine:
 
     # ------------------------------------------------------------------ public API
 
-    def submit(self, spec):
-        """Validate and start a workflow. Returns ``(http_status, body)``."""
+    def submit(self, spec, refusal=None):
+        """Validate and start a workflow. Returns ``(http_status, body)``.
+
+        ``refusal`` is asked, once, whether the host can take a new run, and its non-None answer
+        becomes the response. It is consulted after the idempotent lookup, so a replay of a run
+        that already exists still gets that run back instead of a refusal that would lose its id.
+        """
         agents = self._agents()
         normalized, problem = validate_spec(
             spec, agents, self._max_steps, self._max_foreach, self._max_body,
@@ -364,6 +369,8 @@ class WorkflowEngine:
                 return 400, {"error": error, "message": message}
             step["cwd"] = resolved
         request_id = normalized.pop("requestId", None)
+        # Asked before the lock is taken, so a probe never blocks the scheduler on a slow host.
+        refused = refusal() if refusal is not None else None
 
         with self._lock:
             if request_id is not None:
@@ -372,6 +379,8 @@ class WorkflowEngine:
                     if prior["_requested_spec"] != normalized:
                         return 409, {"error": "idempotency_conflict"}
                     return 200, self._public(prior, detail=False)
+            if refused:
+                return 503, refused
             if not self._make_room():
                 return 503, {"error": "workflow_capacity_reached"}
             workflow = self._new_workflow(normalized, request_id)
@@ -439,6 +448,30 @@ class WorkflowEngine:
                 self._cancel_children(workflow)
                 self._finish(workflow, "cancelled")
         return self._public(workflow, detail=True)
+
+    def active_ids(self):
+        """The ids of runs that have not reached a terminal state."""
+        with self._lock:
+            return [workflow_id for workflow_id, workflow in self._workflows.items()
+                    if workflow["status"] not in WORKFLOW_TERMINAL]
+
+    def kill_all(self, reason):
+        """Stop every active run, keeping each journal so it can be resumed. Returns the ids.
+
+        This is the pressure guard's stop: a step that finished stays finished, so a resume
+        after the machine recovers repeats only the step that was running.
+        """
+        killed = []
+        with self._lock:
+            for workflow_id, workflow in list(self._workflows.items()):
+                if workflow["status"] in WORKFLOW_TERMINAL:
+                    continue
+                workflow["_cancel"] = True
+                workflow["error"] = reason
+                self._cancel_children(workflow)
+                self._finish(workflow, "cancelled")
+                killed.append(workflow_id)
+        return killed
 
     def resume(self, workflow_id):
         """Continue a journaled run, keeping the steps that already completed."""

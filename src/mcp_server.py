@@ -294,6 +294,12 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
     },
+    {
+        "name": "get_pressure",
+        "description": "Report how hard this machine is working: the kernel's memory pressure level and free percentage, swap in use, and any CPU thermal throttle. Call it before starting a long or multi-agent workflow: the relay refuses a new workflow while the verdict is `critical`, and its guard stops running workflows if the machine becomes critical mid-run. The verdict is `ok`, `warn` or `critical`, and `reasons` names the reading that decided it. A stopped run says `device_pressure:` at the start of its `error` and can be continued with resume_workflow once the machine recovers. `temperatureC` is null on Apple Silicon, because macOS exposes no unprivileged CPU temperature.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
 ]
 
 
@@ -711,6 +717,9 @@ def create_http_handler(base_url=None, timeout=None):
                 wait_ms = args.get("waitMs")
                 if wait_ms and value.get("status") in ("queued", "running"):
                     value = _wait_workflow(base_url, args["workflowId"], wait_ms, timeout)
+            elif name == "get_pressure":
+                _arguments_for(rpc, [])
+                value = _relay_request(base_url, "/v1/pressure", timeout=timeout)
             else:
                 raise RpcError(-32602, f"Unknown tool: {name or ''}")
         except RpcError:
