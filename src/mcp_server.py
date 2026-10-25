@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """agent-relay MCP stdio interface.
 
-A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the tools list_agents,
-delegate, wait_task, get_task, list_tasks, and cancel_task. Set A2A_RELAY_URL to point at a
+A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the six task tools and the six
+workflow tools; tools/list is the authoritative list. Set A2A_RELAY_URL to point at a
 non-default relay. When the relay is not reachable and the URL is loopback, the interface
 starts the HTTP service detached on first use.
 """
@@ -82,6 +82,7 @@ WORKFLOW_SPEC = {
                 "required": ["id", "agentId", "input"],
                 "properties": {
                     "id": {"type": "string", "minLength": 1, "maxLength": 128,
+                           "pattern": "^[A-Za-z0-9_.~-]{1,128}$",
                            "description": "Unique in the document. Other steps name it in needs "
                                           "and read its result as {{id.output}}."},
                     "agentId": {"type": "string", "minLength": 1, "maxLength": 128,
@@ -235,7 +236,7 @@ TOOLS = [
             "properties": {
                 "spec": WORKFLOW_SPEC,
                 "waitMs": {"type": "integer", "minimum": 1,
-                           "description": "Maximum time, in milliseconds, that this call waits for the run to reach a terminal state. If the run is still going when the wait ends, the result carries waitExpired: true; then call get_workflow again with the same workflowId. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+                           "description": "Maximum time, in milliseconds, that this call waits for the run to reach a terminal state. If the run is still going when the wait ends, the result carries waitExpired: true; then call get_workflow again with the same workflowId. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
@@ -249,7 +250,7 @@ TOOLS = [
                 "workflowId": {"type": "string", "minLength": 1, "maxLength": 128,
                                "description": "Run ID returned by run_workflow."},
                 "maxWaitMs": {"type": "integer", "minimum": 1,
-                              "description": "Maximum time, in milliseconds, to wait for the run to become terminal before returning its current state. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+                              "description": "Maximum time, in milliseconds, to wait for the run to become terminal before returning its current state. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -289,7 +290,7 @@ TOOLS = [
                 "workflowId": {"type": "string", "minLength": 1, "maxLength": 128,
                                "description": "Run ID returned by run_workflow."},
                 "waitMs": {"type": "integer", "minimum": 1,
-                           "description": "Maximum time, in milliseconds, to wait for the resumed run to become terminal. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+                           "description": "Maximum time, in milliseconds, to wait for the resumed run to become terminal. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},

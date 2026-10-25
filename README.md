@@ -317,6 +317,9 @@ A stopped run is `cancelled` with `device_pressure:` at the start of its `error`
 was running is repeated. The checkpoint is the step, so a killed adapter's own partial work is lost
 — the relay cannot checkpoint inside another agent's process.
 
+The probes are macOS-only. On another host every signal is null, the verdict is `ok`, and the
+guard never stops a run, so `ok` there means "not measured" rather than "healthy".
+
 `temperatureC` is null on Apple Silicon: `powermetrics` needs root and macOS exposes no
 unprivileged sensor. `pmset -g therm` reports a throttle only after macOS records one, so a null
 `speedLimitPercent` means no throttle was recorded, not that the reading failed.

@@ -347,9 +347,10 @@ class WorkflowEngine:
     def submit(self, spec, refusal=None):
         """Validate and start a workflow. Returns ``(http_status, body)``.
 
-        ``refusal`` is asked, once, whether the host can take a new run, and its non-None answer
-        becomes the response. It is consulted after the idempotent lookup, so a replay of a run
-        that already exists still gets that run back instead of a refusal that would lose its id.
+        ``refusal`` is asked once per submission whether the host can take a new run. Its non-None
+        answer is applied only when the submission would create a run, so a replay of a run that
+        already exists still gets that run back instead of a refusal that would lose its id; a
+        replay costs one reading.
         """
         agents = self._agents()
         normalized, problem = validate_spec(
@@ -369,7 +370,8 @@ class WorkflowEngine:
                 return 400, {"error": error, "message": message}
             step["cwd"] = resolved
         request_id = normalized.pop("requestId", None)
-        # Asked before the lock is taken, so a probe never blocks the scheduler on a slow host.
+        # Asked before the lock is taken so a slow probe never blocks the scheduler; the answer is
+        # applied below only on the path that creates a run.
         refused = refusal() if refusal is not None else None
 
         with self._lock:

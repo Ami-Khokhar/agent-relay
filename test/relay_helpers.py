@@ -18,6 +18,23 @@ from urllib import request as urlrequest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYTHON = sys.executable
 SERVER = os.path.join(ROOT, "src", "server.py")
+
+# What a calm host reports, so no test reads the developer's real machine. The pressure stubs are
+# used on every relay this helper starts: the submission preflight reads the host whether or not
+# the guard thread runs, so a critical real machine would fail every workflow test.
+PROBE_STUBS = {
+    "sysctl": """#!/bin/sh
+case "$2" in
+  vm.memory_pressure) echo 0 ;;
+  kern.memorystatus_level) echo 60 ;;
+  vm.swapusage) echo "total = 2048.00M  used = 100.00M  free = 1948.00M  (encrypted)" ;;
+  *) exit 1 ;;
+esac
+""",
+    "pmset": """#!/bin/sh
+echo "Note: No thermal warning level has been recorded"
+""",
+}
 MCP_SERVER = os.path.join(ROOT, "src", "mcp_server.py")
 FAKE_ADAPTER = os.path.join(ROOT, "test", "fixtures", "fake_stdio_adapter.py")
 TOKEN = "relay-test-token"
@@ -47,12 +64,24 @@ class Relay:
         with open(self.config, "w", encoding="utf-8") as handle:
             json.dump({"agents": agent if isinstance(agent, list) else [agent]}, handle)
         self.port = free_port()
-        # The pressure guard samples the real host while a run is active, which would let the
-        # developer's memory state cancel a test's run. test/test_pressure.py turns it back on,
-        # and names the two probes it wants.
+        # No test reads the developer's real host. The guard thread is off, and the probes answer
+        # from stubs, because the submission preflight reads pressure whether or not the guard
+        # runs: a critical real machine would otherwise fail every workflow test.
+        probes = {}
+        for name, body in PROBE_STUBS.items():
+            path = os.path.join(self.dir, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            os.chmod(path, 0o755)
+            probes["AGENT_RELAY_" + name.upper()] = path
         child_env = {**os.environ, "A2A_RELAY_PORT": str(self.port), "A2A_AGENTS_FILE": self.config,
-                     "AGENT_RELAY_TOKEN": TOKEN, "AGENT_RELAY_PRESSURE_GUARD": "0"}
-        child_env.update(env or {})
+                     "AGENT_RELAY_TOKEN": TOKEN, "AGENT_RELAY_PRESSURE_GUARD": "0", **probes}
+        for name, value in (env or {}).items():
+            # A None value means unset, so a test can prove what the relay does without it.
+            if value is None:
+                child_env.pop(name, None)
+            else:
+                child_env[name] = value
         self.proc = subprocess.Popen(
             [PYTHON, server], cwd=ROOT, env=child_env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,

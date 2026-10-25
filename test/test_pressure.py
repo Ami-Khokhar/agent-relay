@@ -312,13 +312,23 @@ class PressureTests(unittest.TestCase):
                            "the guard never sampled a running workflow")
         relay.request("DELETE", f"/v1/workflows/{submitted['id']}")
 
+    def test_the_shared_helper_answers_from_stubs_not_the_real_host(self):
+        # Every relay the suite starts reads a calm stub host, so a critical developer machine
+        # cannot fail an unrelated test through the submission preflight.
+        relay = Relay(echo())
+        self.relays.append(relay)
+        _, reading = relay.request("GET", "/v1/pressure")
+        self.assertEqual(reading["verdict"], "ok")
+        self.assertEqual(reading["memory"], {"pressureLevel": "normal", "freePercent": 60})
+
     def test_the_guard_reports_the_alias_setting(self):
-        # AGENT_RELAY_PRESSURE_GUARD is unset here, so the documented A2A alias decides.
+        # The helper's default is unset, so the documented A2A alias alone decides.
         relay = Relay(echo(), env={
+            "AGENT_RELAY_PRESSURE_GUARD": None,
+            "A2A_RELAY_PRESSURE_GUARD": "0",
             "AGENT_RELAY_SYSCTL": os.path.join(self.stubs, "sysctl"),
             "AGENT_RELAY_PMSET": os.path.join(self.stubs, "pmset"),
             "AGENT_RELAY_STATE_DIR": self.state,
-            "A2A_RELAY_PRESSURE_GUARD": "0",
         })
         self.relays.append(relay)
         _, reading = relay.request("GET", "/v1/pressure")

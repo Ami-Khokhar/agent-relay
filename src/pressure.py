@@ -14,6 +14,10 @@ without root on Apple Silicon: ``powermetrics`` refuses a non-root caller and ma
 no SMC sensor node, so ``temperatureC`` is null with the reason attached rather than guessed.
 A missing thermal reading from ``pmset`` means the OS has recorded no throttle, which is the
 ordinary state on a cool machine.
+
+The probes are macOS-only. On another host every signal is null, the verdict is ``ok``, and the
+guard never stops a run: the reading is absent rather than guessed, and a caller that needs a
+verdict must not read ``ok`` as a measurement.
 """
 from __future__ import annotations
 
@@ -105,12 +109,18 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _guard_enabled():
-    """The relay's effective guard setting, under either spelling of the variable."""
-    value = os.environ.get("AGENT_RELAY_PRESSURE_GUARD")
-    if value is None:
-        value = os.environ.get("A2A_RELAY_PRESSURE_GUARD", "1")
-    return value.lower() not in ("0", "false", "no", "off")
+def guard_enabled():
+    """Whether the relay stops a run on its own, read from the relay's own environment.
+
+    The one implementation of the rule: ``server`` starts the guard thread from this answer and
+    the reading reports it, so the two cannot disagree. Either spelling counts, an empty value
+    falls through to the alias, and no value at all means on.
+    """
+    for name in ("AGENT_RELAY_PRESSURE_GUARD", "A2A_RELAY_PRESSURE_GUARD"):
+        value = os.environ.get(name)
+        if value:
+            return value.lower() not in ("0", "false", "no", "off")
+    return True
 
 
 def snapshot():
@@ -154,7 +164,7 @@ def snapshot():
         "temperatureC": None,
         "temperatureReason": TEMPERATURE_REASON,
         "sampledAt": _now_iso(),
-        "guard": {"enabled": _guard_enabled(), "stopsAt": "critical"},
+        "guard": {"enabled": guard_enabled(), "stopsAt": "critical"},
     }
 
 
