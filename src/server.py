@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlsplit
 
-from workflows import WorkflowEngine
+from workflows import WORKFLOW_STATUSES, WorkflowEngine
 
 ADAPTER_PROTOCOL = "relay.adapter/v1"
 INHERITED_ENV = (
@@ -110,6 +110,10 @@ MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
 # runs (the oldest finished one is evicted, as tasks are).
 MAX_STEPS = _positive_int(64, "AGENT_RELAY_MAX_STEPS", "A2A_RELAY_MAX_STEPS")
 MAX_WORKFLOWS = _positive_int(200, "AGENT_RELAY_MAX_WORKFLOWS", "A2A_RELAY_MAX_WORKFLOWS")
+MAX_FOREACH = _positive_int(32, "AGENT_RELAY_MAX_FOREACH", "A2A_RELAY_MAX_FOREACH")
+# Workflow journals are state, not configuration: they live beside relay.log, not beside the token.
+STATE_DIR = Path(_env("AGENT_RELAY_STATE_DIR", "A2A_RELAY_STATE_DIR")
+                 or Path.home() / ".local" / "state" / "agent-relay")
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
@@ -1264,6 +1268,7 @@ def _limits():
         "maxActive": MAX_ACTIVE,
         "maxSteps": MAX_STEPS,
         "maxWorkflows": MAX_WORKFLOWS,
+        "maxForEach": MAX_FOREACH,
         "maxDelegationDepth": MAX_DELEGATION_DEPTH,
         "maxDelegatedTasks": MAX_DELEGATED_TASKS,
     }
@@ -1524,6 +1529,8 @@ WORKFLOW_ENGINE = WorkflowEngine(
     resolve_cwd=_resolve_task_cwd,
     max_steps=MAX_STEPS,
     max_workflows=MAX_WORKFLOWS,
+    max_foreach=MAX_FOREACH,
+    state_dir=STATE_DIR,
     max_body=MAX_BODY,
     max_command_input=MAX_COMMAND_INPUT,
     max_timeout_ms=MAX_TIMEOUT_MS,
@@ -1610,15 +1617,25 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/v1/workflows":
                 if method == "POST":
                     return self._submit_workflow()
+                if method == "GET":
+                    return self._list_workflows(query)
                 return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/admin/reload":
                 if method == "POST":
                     return self._reload()
                 return self._json(405, {"error": "method_not_allowed"})
+            match = re.fullmatch(r"/v1/workflows/([^/]+)/resume", path)
+            if match:
+                if method == "POST":
+                    return self._resume_workflow(match.group(1))
+                return self._json(405, {"error": "method_not_allowed"})
             match = re.fullmatch(r"/v1/workflows/([^/]+)", path)
             if match:
+                workflow_id = match.group(1)
                 if method == "GET":
-                    return self._get_workflow(match.group(1))
+                    return self._get_workflow(workflow_id, query)
+                if method == "DELETE":
+                    return self._delete_workflow(workflow_id)
                 return self._json(405, {"error": "method_not_allowed"})
             match = re.fullmatch(r"/v1/tasks/([^/]+)", path)
             if match:
@@ -1731,11 +1748,74 @@ class Handler(BaseHTTPRequestHandler):
         status, body = WORKFLOW_ENGINE.submit(spec)
         self._json(status, body)
 
-    def _get_workflow(self, workflow_id):
+    def _list_workflows(self, query):
+        session_id = query.get("sessionId", [None])[0]
+        status = query.get("status", [None])[0]
+        if session_id is not None and not _valid(session_id):
+            return self._json(400, {"error": "invalid_session_id"})
+        if status is not None and status not in WORKFLOW_STATUSES:
+            return self._json(400, {"error": "invalid_status"})
+        limit = 100
+        limit_raw = query.get("limit", [None])[0]
+        if limit_raw is not None:
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                return self._json(400, {"error": "invalid_limit"})
+            if limit <= 0:
+                return self._json(400, {"error": "invalid_limit"})
+        limit = min(limit, MAX_TASKS)
+        return self._json(200, {"workflows": WORKFLOW_ENGINE.list(session_id, status, limit)})
+
+    def _get_workflow(self, workflow_id, query):
+        wait_raw = query.get("waitMs", [None])[0]
+        if wait_raw is None:
+            return self._workflow_response(workflow_id)
+        try:
+            wait_ms = int(wait_raw)
+        except ValueError:
+            return self._json(400, _invalid_wait())
+        if not _is_valid_wait(wait_ms):
+            return self._json(400, _invalid_wait())
+        if WORKFLOW_ENGINE.wait(workflow_id, wait_ms) is None:
+            return self._workflow_not_found(workflow_id)
         view = WORKFLOW_ENGINE.public(workflow_id, detail=True)
         if view is None:
-            return self._json(404, {"error": "unknown_workflow"})
+            return self._workflow_not_found(workflow_id)
+        if view["status"] in ("queued", "running"):
+            # Say that the wait ended, so a caller need not compare status strings.
+            view.update(waitExpired=True, waitedMs=wait_ms,
+                        hint="The wait expired before the run finished. Call get_workflow again "
+                             "with the same workflowId, or repeat this request.")
         return self._json(200, view)
+
+    def _workflow_response(self, workflow_id):
+        view = WORKFLOW_ENGINE.public(workflow_id, detail=True)
+        if view is None:
+            return self._workflow_not_found(workflow_id)
+        return self._json(200, view)
+
+    def _workflow_not_found(self, workflow_id):
+        if WORKFLOW_ENGINE.journaled(workflow_id):
+            return self._json(404, {
+                "error": "unknown_workflow",
+                "message": f"The run is not active; POST /v1/workflows/{workflow_id}/resume"
+                           f" to continue it from its journal"})
+        return self._json(404, {"error": "unknown_workflow"})
+
+    def _delete_workflow(self, workflow_id):
+        view = WORKFLOW_ENGINE.cancel(workflow_id)
+        if view is None:
+            return self._workflow_not_found(workflow_id)
+        self._json(200, view)
+        _drain()
+
+    def _resume_workflow(self, workflow_id):
+        # Resume takes no document, but the body is still read so a keep-alive connection
+        # stays in sync for the next request on it.
+        self._read_json_body(document=False)
+        status, body = WORKFLOW_ENGINE.resume(workflow_id)
+        self._json(status, body)
 
     def _reload(self):
         if not is_loopback(self.client_address[0]):
