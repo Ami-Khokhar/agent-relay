@@ -461,7 +461,9 @@ class WorkflowEngine:
                     step["output"] = done["output"]
                     step["attempts"] = done["attempts"]
             self._workflows[workflow_id] = workflow
-            request_id = (prior or {}).get("_request_id")
+            # The one field _new_workflow sets and _make_room releases; reading the old
+            # name left every resumed run unregistered.
+            request_id = (prior or {}).get("_requested_request_id")
             if request_id is not None:
                 workflow["_requested_request_id"] = request_id
                 self._request_ids[request_id] = workflow

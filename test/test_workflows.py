@@ -318,6 +318,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["first"]["taskIds"], [])
         self.assertEqual(finished["second"]["output"], "recovered")
 
+    def test_a_resumed_run_keeps_its_request_id(self):
+        mark = self.path("resume-request-mark")
+        relay = self.start({"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+                            "env": {"WF_MARK": mark}})
+        spec = {"name": "resume-id", "requestId": "resume-1",
+                "steps": [{"id": "only", "agentId": "flaky", "input": "go"}]}
+        status, submitted = relay.request("POST", "/v1/workflows", spec)
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, submitted["id"])["status"], "failed")
+
+        status, _ = relay.request("POST", f"/v1/workflows/{submitted['id']}/resume")
+        self.assertEqual(status, 202)
+        # Replaying the original submission must find the resumed run, not the dead one.
+        status, again = relay.request("POST", "/v1/workflows", spec)
+        self.assertEqual(status, 200)
+        self.assertEqual(again["id"], submitted["id"])
+        self.assertIn(again["status"], ("queued", "running", "completed"))
+
     def test_resume_reports_an_unknown_run(self):
         relay = self.start(echo())
         status, body = relay.request("POST", "/v1/workflows/wf-00000000000000000000000000000000/resume")
