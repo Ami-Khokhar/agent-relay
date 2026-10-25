@@ -361,7 +361,7 @@ def create_http_handler(base_url=None, timeout=None):
             return {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "agent-relay", "version": "0.2.0"},
+                "serverInfo": {"name": "agent-relay", "version": "0.3.0"},
                 "instructions": (
                     "agent-relay sends tasks to other coding agents (pi, Codex, OpenCode, "
                     "Claude Code) and returns their results. When the user asks to delegate, "
