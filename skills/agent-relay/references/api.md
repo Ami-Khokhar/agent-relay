@@ -127,6 +127,36 @@ running task also carries `cancellation`: `process_signal` (the adapter's proces
 signalled) or `request_only` (HTTP: the request was not aborted). The task keeps its active
 slot until the process exits or the request returns. Terminal tasks are returned unchanged.
 
+### `POST /v1/workflows`
+
+The body **is** the workflow document, not a wrapper, and `content-type: application/json`
+is required (`415 unsupported_media_type` otherwise).
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `steps` | yes | 1 to `A2A_RELAY_MAX_STEPS` (default 64) step objects. |
+| `name` | no | ≤128 chars; defaults to `workflow`. |
+| `sessionId` | no | ≤128 chars. Defaults to the run ID and is passed to every child task. |
+| `requestId` | no | ≤128 chars; idempotency key for the submission itself. |
+
+A step takes `id` (unique in the document), `agentId`, `input`, `needs`, `timeoutMs` and `cwd`.
+The `input` may contain `{{stepId.output}}` or bare `{{stepId}}` for a step in `needs`,
+directly or through another step; a reference to anything else fails that step with
+`unresolved template reference` when it starts.
+
+Returns `202` with the run. Replaying the same `requestId` with the same document returns
+`200`; with a different document, `409 idempotency_conflict`. Validation failures use `400`
+with `invalid_steps`, `invalid_step_id`, `duplicate_step`, `unknown_step`,
+`cyclic_dependency`, `invalid_needs`, `invalid_template`, `invalid_timeout`, `invalid_cwd`,
+`cwd_not_allowed`, and the shared `unknown_field`, `unknown_agent`, `input_required`,
+`invalid_session_id`, `invalid_request_id`.
+
+### `GET /v1/workflows/:id`
+
+Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
+`finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `status`,
+`attempts`, `taskIds`, `output` and `error`. An unknown run returns `404 unknown_workflow`.
+
 ### `POST /v1/admin/reload`
 
 Reloads the registry from disk without dropping in-memory tasks. Requires the token and is
@@ -137,7 +167,10 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 
 ## Status values
 
-`queued`, `running`, `completed`, `failed`, `timed_out`, `cancelled`.
+Tasks: `queued`, `running`, `completed`, `failed`, `timed_out`, `cancelled`.
+
+Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Steps: `pending`,
+`running`, `completed`, `failed`, `skipped`, `cancelled`.
 
 ## Error responses
 
@@ -146,11 +179,11 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 | 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_input`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
 | 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route. |
 | 403 | `forbidden`, `origin_not_allowed`, `delegation_not_allowed` | Admin route called from a non-loopback address; request from a browser origin not in `AGENT_RELAY_ALLOWED_ORIGINS`; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
-| 404 | `unknown_agent`, `unknown_task`, `not_found` | Missing agent/task/route. |
+| 404 | `unknown_agent`, `unknown_task`, `unknown_workflow`, `not_found` | Missing agent/task/run/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
 | 409 | `idempotency_conflict`, `delegation_cycle`, `delegation_depth_exceeded` | `requestId` reused with different fields; target already in the delegation chain; chain too deep. |
 | 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
-| 415 | `unsupported_media_type` | `POST /v1/tasks` without `content-type: application/json`. |
+| 415 | `unsupported_media_type` | `POST /v1/tasks` or `POST /v1/workflows` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
 | 503 | `task_capacity_reached` | Store full of non-terminal tasks. |

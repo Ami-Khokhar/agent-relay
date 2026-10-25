@@ -345,6 +345,13 @@ Idempotency: send a unique `requestId`; reusing it with the same fields returns 
 original task (`200`), while reusing it with different fields returns `409`. Use it when a
 submission response may have been lost. Without a `requestId`, do not auto-retry.
 
+## Workflows
+
+A workflow document names steps wired with `needs`; each step runs as an ordinary task, so the
+queue, timeouts, `allowedRoots` and idempotency apply unchanged. `{{stepId.output}}` threads one
+step's result into the next prompt. `POST /v1/workflows` starts a run and
+`GET /v1/workflows/:id` reports it.
+
 ## Designing for the user's use case
 
 1. **Identify the target agent(s)** the user means, and confirm their CLIs exist (`which`).

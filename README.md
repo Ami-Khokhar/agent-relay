@@ -229,6 +229,25 @@ Add `"options": {"<name>": "<value>"}` to choose among the options the agent dec
 
 Task objects (the submit, get, wait, list and cancel responses, and the MCP tools behind them) leave out `input` and carry `inputChars`, its length in characters, so a poll does not echo the prompt the caller already holds. `GET /v1/tasks/TASK_ID?includeInput=true` (MCP `get_task` with `includeInput: true`) returns it. This keeps replies small and is not access control: any token holder can still read every stored input. The request a `stdio` or `http` adapter receives still carries `input`.
 
+## Run a workflow
+
+A workflow is one JSON document: named steps, each bound to a registered agent, wired together with `needs`. A step is an ordinary task, so the queue, the active cap, timeouts, `cwd` and `allowedRoots`, idempotency and cancellation behave exactly as they do for a single submission.
+
+```bash
+AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
+curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/workflows \
+  -H 'content-type: application/json' \
+  -d '{"name":"review-loop","steps":[
+        {"id":"write","agentId":"claude","input":"Fix the failing test"},
+        {"id":"review","agentId":"codex","needs":["write"],
+         "input":"Review this change and report findings:\n\n{{write.output}}"}]}'
+curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/workflows/WORKFLOW_ID'
+```
+
+Step fields: `id`, `agentId`, `input`, `needs`, `timeoutMs`, `cwd`. `input` may contain `{{stepId.output}}` (or bare `{{stepId}}`) for a step named in `needs`, directly or through another step.
+
+A run is `queued`, `running`, `completed`, `failed` or `cancelled`; a step is `pending`, `running`, `completed`, `failed`, `skipped` or `cancelled`. A step whose dependency did not succeed is `skipped`, and the run fails with `error` naming the first bad step. `requestId` gives a submission the same idempotency it has for tasks, and `A2A_RELAY_MAX_STEPS` (default 64) caps the document.
+
 ## Data access and retention
 
 - **What is stored.** Each task keeps its full `input` (the prompt), `output`, `error`, `cwd`, `sessionId`, and `requestId` in the relay's memory. Nothing is written to disk and the relay does not log task content.

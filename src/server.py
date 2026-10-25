@@ -27,6 +27,8 @@ from pathlib import Path
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlsplit
 
+from workflows import WorkflowEngine
+
 ADAPTER_PROTOCOL = "relay.adapter/v1"
 INHERITED_ENV = (
     "PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "LC_ALL",
@@ -104,6 +106,8 @@ MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
 MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
 MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
                                   "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
+# A workflow document declares at most this many steps.
+MAX_STEPS = _positive_int(64, "AGENT_RELAY_MAX_STEPS", "A2A_RELAY_MAX_STEPS")
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
@@ -1256,6 +1260,7 @@ def _limits():
         "maxTasks": MAX_TASKS,
         "taskRetentionMs": TASK_RETENTION_MS or None,
         "maxActive": MAX_ACTIVE,
+        "maxSteps": MAX_STEPS,
         "maxDelegationDepth": MAX_DELEGATION_DEPTH,
         "maxDelegatedTasks": MAX_DELEGATED_TASKS,
     }
@@ -1500,6 +1505,28 @@ def cancel_task(task):
 
 
 
+def lookup_task(task_id):
+    with LOCK:
+        return TASKS.get(task_id)
+
+
+WORKFLOW_ENGINE = WorkflowEngine(
+    lock=LOCK,
+    condition=TASK_CONDITION,
+    create_task=_create_task,
+    get_task=lookup_task,
+    cancel_task=cancel_task,
+    drain=_drain,
+    agents=lambda: AGENTS,
+    resolve_cwd=_resolve_task_cwd,
+    max_steps=MAX_STEPS,
+    max_body=MAX_BODY,
+    max_command_input=MAX_COMMAND_INPUT,
+    max_timeout_ms=MAX_TIMEOUT_MS,
+    now=now_iso,
+)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "agent-relay"
@@ -1576,9 +1603,18 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self._list(query)
                 return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/workflows":
+                if method == "POST":
+                    return self._submit_workflow()
+                return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/admin/reload":
                 if method == "POST":
                     return self._reload()
+                return self._json(405, {"error": "method_not_allowed"})
+            match = re.fullmatch(r"/v1/workflows/([^/]+)", path)
+            if match:
+                if method == "GET":
+                    return self._get_workflow(match.group(1))
                 return self._json(405, {"error": "method_not_allowed"})
             match = re.fullmatch(r"/v1/tasks/([^/]+)", path)
             if match:
@@ -1682,6 +1718,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "invalid_limit"})
         limit = min(limit, MAX_TASKS)
         return self._json(200, {"tasks": _list_tasks(session_id, status, limit)})
+
+    def _submit_workflow(self):
+        error, spec = self._read_json_body()
+        if error:
+            return self._json(error, spec)
+        # The engine drains from its own scheduling thread once it has launched a step.
+        status, body = WORKFLOW_ENGINE.submit(spec)
+        self._json(status, body)
+
+    def _get_workflow(self, workflow_id):
+        view = WORKFLOW_ENGINE.public(workflow_id, detail=True)
+        if view is None:
+            return self._json(404, {"error": "unknown_workflow"})
+        return self._json(200, view)
 
     def _reload(self):
         if not is_loopback(self.client_address[0]):
