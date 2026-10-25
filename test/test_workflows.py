@@ -91,8 +91,7 @@ class WorkflowTests(unittest.TestCase):
             {"id": "left", "agentId": "echo", "input": "L"},
             {"id": "right", "agentId": "echo", "input": "R"},
         ]})
-        self.assertEqual((submitted["steps"][0]["status"],
-                          submitted["steps"][1]["status"]), ("pending", "pending"))
+        self.assertEqual(submitted["status"], "queued")
         workflow = wait(relay, submitted["id"])
         self.assertEqual(workflow["status"], "completed")
         _, tasks = relay.request("GET", f"/v1/tasks?sessionId={workflow['sessionId']}")
@@ -141,10 +140,33 @@ class WorkflowTests(unittest.TestCase):
         status, body = relay.request("GET", "/v1/workflows/wf-deadbeef000000000000000000000000")
         self.assertEqual((status, body["error"]), (404, "unknown_workflow"))
 
+    def test_evicts_the_oldest_finished_run_and_releases_its_request_id(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_WORKFLOWS": "1"})
+        first = run(relay, {"requestId": "keep-1",
+                            "steps": [{"id": "a", "agentId": "echo", "input": "one"}]})
+        second = run(relay, {"steps": [{"id": "a", "agentId": "echo", "input": "two"}]})
+        status, body = relay.request("GET", f"/v1/workflows/{first['id']}")
+        self.assertEqual((status, body["error"]), (404, "unknown_workflow"))
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{second['id']}")[0], 200)
+        # The evicted run's requestId is free again, so a retry starts new work.
+        status, again = relay.request("POST", "/v1/workflows", {
+            "requestId": "keep-1", "steps": [{"id": "a", "agentId": "echo", "input": "three"}]})
+        self.assertEqual(status, 202)
+        self.assertNotEqual(again["id"], first["id"])
+
     def test_advertises_the_step_limit_on_healthz(self):
         relay = self.start(echo())
         _, health = relay.request("GET", "/healthz")
         self.assertEqual(health["limits"]["maxSteps"], 64)
+
+    def test_refuses_more_steps_than_the_limit(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_STEPS": "2"})
+        self.assertEqual(relay.request("GET", "/healthz")[1]["limits"]["maxSteps"], 2)
+        status, body = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "a", "agentId": "echo", "input": "1"},
+            {"id": "b", "agentId": "echo", "input": "2"},
+            {"id": "c", "agentId": "echo", "input": "3"}]})
+        self.assertEqual((status, body["error"]), (400, "invalid_steps"))
 
     def test_rejects_a_step_whose_cwd_is_outside_the_allowed_roots(self):
         relay = self.start({"id": "rooted", "command": PYTHON, "args": ["-c", ECHO],

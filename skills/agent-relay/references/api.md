@@ -18,6 +18,7 @@ headers). Error responses close the connection. `GET /healthz` needs no token.
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
               "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4,
+              "maxSteps": 64, "maxWorkflows": 200,
               "taskRetentionMs": null, "maxDelegationDepth": 2, "maxDelegatedTasks": 20 },
   "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
                 "date": "2026-10-02T19:10:52Z" } }
@@ -146,10 +147,15 @@ directly or through another step; a reference to anything else fails that step w
 
 Returns `202` with the run. Replaying the same `requestId` with the same document returns
 `200`; with a different document, `409 idempotency_conflict`. Validation failures use `400`
-with `invalid_steps`, `invalid_step_id`, `duplicate_step`, `unknown_step`,
+with `invalid_steps`, `invalid_step_id`, `invalid_name`, `duplicate_step`, `unknown_step`,
 `cyclic_dependency`, `invalid_needs`, `invalid_template`, `invalid_timeout`, `invalid_cwd`,
-`cwd_not_allowed`, and the shared `unknown_field`, `unknown_agent`, `input_required`,
-`invalid_session_id`, `invalid_request_id`.
+`command_input_too_large`, `cwd_not_allowed`, and the shared `unknown_field`, `unknown_agent`,
+`input_required`, `invalid_session_id`, `invalid_request_id`. Every document error is a `400`,
+including `command_input_too_large`, which a task submission reports as `413`.
+
+A submission is also refused with `503 workflow_capacity_reached` when
+`A2A_RELAY_MAX_WORKFLOWS` runs are stored and none has finished; the oldest finished run is
+evicted to make room, as a task store evicts the oldest terminal task.
 
 ### `GET /v1/workflows/:id`
 

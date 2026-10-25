@@ -418,7 +418,8 @@ relay rejects malformed envelopes, non-string `output`/`error`, and failures wit
   loopback only) or `kill -HUP <pid>`.
 - Limits (positive integers unless noted; `0` is allowed where shown): `A2A_RELAY_MAX_BODY_BYTES` (1 MiB),
   `A2A_RELAY_MAX_COMMAND_INPUT_BYTES` (64 KiB, command adapter only),
-  `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (1000),
+  `A2A_RELAY_MAX_OUTPUT_BYTES` (256 KiB), `A2A_RELAY_MAX_TASKS` (default 1000), `A2A_RELAY_MAX_STEPS` (workflow steps, default 64),
+  `A2A_RELAY_MAX_WORKFLOWS` (stored runs, default 200),
   `A2A_RELAY_MAX_ACTIVE` (4), `A2A_RELAY_MAX_WAIT_MS` (600000),
   `A2A_RELAY_TIMEOUT_MS` (900000, default only), `A2A_RELAY_MAX_TIMEOUT_MS` (0 = no cap),
   `AGENT_RELAY_TASK_RETENTION_MS` (0 = keep finished tasks until eviction or restart),

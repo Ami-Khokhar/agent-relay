@@ -18,22 +18,18 @@ from __future__ import annotations
 
 import re
 import threading
-import time
 import uuid
 
 STEP_ID_RE = re.compile(r"^[A-Za-z0-9_.~-]{1,128}$")
 RUN_ID_RE = re.compile(r"^wf-[0-9a-f]{32}$")
 TEMPLATE_RE = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
 
-WORKFLOW_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 WORKFLOW_TERMINAL = frozenset(("completed", "failed", "cancelled"))
 STEP_TERMINAL = frozenset(("completed", "failed", "skipped", "cancelled"))
 TASK_TERMINAL = frozenset(("completed", "failed", "timed_out", "cancelled"))
 
 WORKFLOW_FIELDS = frozenset(("name", "sessionId", "requestId", "steps"))
 STEP_FIELDS = frozenset(("id", "agentId", "input", "needs", "timeoutMs", "cwd"))
-
-MAX_REPEAT_ROUNDS = 10
 
 
 def _text(value, limit):
@@ -216,7 +212,7 @@ class WorkflowEngine:
     """Schedules workflow steps onto the relay's task queue and records their results."""
 
     def __init__(self, *, lock, condition, create_task, get_task, cancel_task, drain,
-                 agents, resolve_cwd, max_steps, max_body,
+                 agents, resolve_cwd, max_steps, max_workflows, max_body,
                  max_command_input, max_timeout_ms, now):
         self._lock = lock
         self._condition = condition
@@ -227,6 +223,7 @@ class WorkflowEngine:
         self._agents = agents
         self._resolve_cwd = resolve_cwd
         self._max_steps = max_steps
+        self._max_workflows = max_workflows
         self._max_body = max_body
         self._max_command_input = max_command_input
         self._max_timeout_ms = max_timeout_ms
@@ -264,12 +261,28 @@ class WorkflowEngine:
                     if prior["_requested_spec"] != normalized:
                         return 409, {"error": "idempotency_conflict"}
                     return 200, self._public(prior, detail=False)
+            if not self._make_room():
+                return 503, {"error": "workflow_capacity_reached"}
             workflow = self._new_workflow(normalized, request_id)
             self._workflows[workflow["id"]] = workflow
             if request_id is not None:
                 self._request_ids[request_id] = workflow
+            body = self._public(workflow, detail=False)
             self._start(workflow)
-        return 202, self._public(workflow, detail=False)
+        return 202, body
+
+    def _make_room(self):
+        """Evict the oldest terminal run so the store stays bounded. Call with the lock held."""
+        if len(self._workflows) < self._max_workflows:
+            return True
+        finished = [run for run in self._workflows.values()
+                    if run["status"] in WORKFLOW_TERMINAL]
+        if not finished:
+            return False
+        oldest = min(finished, key=lambda run: run["finishedAt"] or run["createdAt"])
+        del self._workflows[oldest["id"]]
+        self._request_ids.pop(oldest["_requested_request_id"], None)
+        return True
 
     def get(self, workflow_id):
         if not RUN_ID_RE.fullmatch(workflow_id or ""):
@@ -278,8 +291,11 @@ class WorkflowEngine:
             return self._workflows.get(workflow_id)
 
     def public(self, workflow_id, detail=True):
-        workflow = self.get(workflow_id)
-        return self._public(workflow, detail=detail) if workflow else None
+        if not RUN_ID_RE.fullmatch(workflow_id or ""):
+            return None
+        with self._lock:
+            workflow = self._workflows.get(workflow_id)
+            return self._public(workflow, detail=detail) if workflow else None
 
     def _new_workflow(self, spec, request_id, workflow_id=None):
         workflow_id = workflow_id or "wf-" + uuid.uuid4().hex
@@ -296,9 +312,8 @@ class WorkflowEngine:
             "spec": spec,
             "steps": [self._new_step(step) for step in spec["steps"]],
             "_ancestors": spec["ancestors"],
-            "_request_id": request_id,
             "_requested_spec": spec,
-            "_cancel": False,
+            "_requested_request_id": request_id,
         }
 
     @staticmethod
@@ -349,11 +364,6 @@ class WorkflowEngine:
             if not workflow["startedAt"]:
                 workflow["startedAt"] = self._now()
             workflow["status"] = "running"
-
-            if workflow["_cancel"]:
-                self._cancel_children(workflow)
-                self._finish(workflow, "cancelled")
-                return True
 
             by_id = {step["id"]: step for step in workflow["steps"]}
             passes = 0
@@ -465,12 +475,6 @@ class WorkflowEngine:
         step["error"] = None
         step["status"] = "completed"
         return True
-    def _abort_children(self, task_ids):
-        for task_id in task_ids:
-            task = self._get_task(task_id)
-            if task is not None and task["status"] not in TASK_TERMINAL:
-                self._cancel_task(task)
-
     def _finish(self, workflow, status):
         workflow["status"] = status
         workflow["finishedAt"] = self._now()
@@ -505,7 +509,7 @@ class WorkflowEngine:
             "id": step["id"],
             "agentId": step["agentId"],
             "needs": step["needs"],
-            "status": step["status"],
+            "status": "pending" if step["status"] == "ready" else step["status"],
             "attempts": step["attempts"],
         }
         if step["error"]:

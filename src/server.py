@@ -106,8 +106,10 @@ MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
 MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
 MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
                                   "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
-# A workflow document declares at most this many steps.
+# A workflow document declares at most this many steps, and the relay stores at most this many
+# runs (the oldest finished one is evicted, as tasks are).
 MAX_STEPS = _positive_int(64, "AGENT_RELAY_MAX_STEPS", "A2A_RELAY_MAX_STEPS")
+MAX_WORKFLOWS = _positive_int(200, "AGENT_RELAY_MAX_WORKFLOWS", "A2A_RELAY_MAX_WORKFLOWS")
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
@@ -1261,6 +1263,7 @@ def _limits():
         "taskRetentionMs": TASK_RETENTION_MS or None,
         "maxActive": MAX_ACTIVE,
         "maxSteps": MAX_STEPS,
+        "maxWorkflows": MAX_WORKFLOWS,
         "maxDelegationDepth": MAX_DELEGATION_DEPTH,
         "maxDelegatedTasks": MAX_DELEGATED_TASKS,
     }
@@ -1520,6 +1523,7 @@ WORKFLOW_ENGINE = WorkflowEngine(
     agents=lambda: AGENTS,
     resolve_cwd=_resolve_task_cwd,
     max_steps=MAX_STEPS,
+    max_workflows=MAX_WORKFLOWS,
     max_body=MAX_BODY,
     max_command_input=MAX_COMMAND_INPUT,
     max_timeout_ms=MAX_TIMEOUT_MS,
