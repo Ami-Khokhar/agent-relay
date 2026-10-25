@@ -11,25 +11,41 @@ steps that follow::
         {"id": "review", "agentId": "codex",  "needs": ["write"], "input": "{{write.output}}"}
     ]}
 
-Input strings are templates: ``{{stepId.output}}`` (or bare ``{{stepId}}``) resolves
-against a step this one needs, directly or through another step.
+Input strings are templates. ``{{stepId.output}}`` resolves against a completed
+dependency, ``{{item}}`` and ``{{index}}`` against a ``foreach`` expansion. Steps may fan
+out with ``foreach``, re-run on a task failure with ``retries``, and loop until their
+output matches a regular expression with ``repeat``.
+
+Every run is journaled to ``<state dir>/workflows/<id>.jsonl``. Completed steps therefore
+survive a relay restart, and ``resume`` continues a run without repeating finished work.
 """
 from __future__ import annotations
 
+import json
 import re
 import threading
+import time
 import uuid
+from pathlib import Path
 
 STEP_ID_RE = re.compile(r"^[A-Za-z0-9_.~-]{1,128}$")
 RUN_ID_RE = re.compile(r"^wf-[0-9a-f]{32}$")
 TEMPLATE_RE = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
+FOREACH_REFS = ("item", "index", "foreach.item", "foreach.index")
 
+WORKFLOW_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 WORKFLOW_TERMINAL = frozenset(("completed", "failed", "cancelled"))
 STEP_TERMINAL = frozenset(("completed", "failed", "skipped", "cancelled"))
 TASK_TERMINAL = frozenset(("completed", "failed", "timed_out", "cancelled"))
 
 WORKFLOW_FIELDS = frozenset(("name", "sessionId", "requestId", "steps"))
-STEP_FIELDS = frozenset(("id", "agentId", "input", "needs", "timeoutMs", "cwd"))
+STEP_FIELDS = frozenset(("id", "agentId", "input", "needs", "foreach", "timeoutMs", "cwd",
+                         "options", "readOnly", "retries", "repeat"))
+REPEAT_FIELDS = frozenset(("max", "untilOutputMatches"))
+
+MAX_REPEAT_ROUNDS = 10
+MAX_RETRIES = 5
+MAX_ITEM_CHARS = 1024
 
 
 def _text(value, limit):
@@ -70,7 +86,24 @@ def _ancestors(steps):
     return {step_id: list(walk(step_id)) for step_id in deps}
 
 
-def validate_spec(spec, agents, max_steps, max_body, max_command_input,
+def _check_reference(reference, has_foreach, ancestors, known_ids):
+    """Return a problem description for a template reference, or None when it is sound."""
+    if reference in FOREACH_REFS:
+        if has_foreach:
+            return None
+        if reference not in known_ids:  # a step may itself be called "item"
+            return f"{{{{{reference}}}}} is only valid on a step that has foreach"
+    # A step id may contain dots, so only a trailing ".output" is a suffix.
+    step_id = reference[:-len(".output")] if reference.endswith(".output") else reference
+    if step_id not in known_ids:
+        return f"{{{{{reference}}}}} does not name a step in this workflow"
+    if step_id not in ancestors:
+        return (f"{{{{{reference}}}}} must name a step listed in needs, directly or "
+                f"through another step")
+    return None
+
+
+def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_input,
                   max_timeout_ms):
     """Check a workflow document.
 
@@ -143,6 +176,20 @@ def validate_spec(spec, agents, max_steps, max_body, max_command_input,
         if step_id in needs:
             return bad("cyclic_dependency", f"Step {step_id} cannot depend on itself")
 
+        foreach = raw.get("foreach")
+        if foreach is not None:
+            if not isinstance(foreach, list) or not foreach:
+                return bad("invalid_foreach",
+                           f"Step {step_id}.foreach must be a non-empty array")
+            if len(foreach) > max_foreach:
+                return bad("invalid_foreach",
+                           f"Step {step_id}.foreach exceeds the limit of {max_foreach} items")
+            if not all(isinstance(item, str) and item and len(item) <= MAX_ITEM_CHARS
+                       for item in foreach):
+                return bad("invalid_foreach",
+                           f"Step {step_id}.foreach items must be non-empty strings of at most "
+                           f"{MAX_ITEM_CHARS} characters")
+
         timeout = raw.get("timeoutMs")
         if timeout is not None:
             too_big = max_timeout_ms and isinstance(timeout, int) and timeout > max_timeout_ms
@@ -156,13 +203,69 @@ def validate_spec(spec, agents, max_steps, max_body, max_command_input,
         if cwd is not None and (not isinstance(cwd, str) or not cwd):
             return bad("invalid_cwd", f"Step {step_id}.cwd must be a non-empty string")
 
+        # The relay is the authority on whether this agent can honour these; the shape is checked
+        # here so an obvious mistake is a 400 rather than a step that fails when it is launched.
+        options = raw.get("options")
+        if options is not None and (not isinstance(options, dict) or not all(
+                isinstance(name, str) and name and isinstance(value, str)
+                for name, value in options.items())):
+            return bad("invalid_options",
+                       f"Step {step_id}.options must be an object of option names to value "
+                       f"strings; list_agents shows what each agent allows")
+        read_only = raw.get("readOnly", False)
+        if not isinstance(read_only, bool):
+            return bad("invalid_read_only",
+                       f"Step {step_id}.readOnly must be true or false")
+
+        retries = raw.get("retries", 0)
+        if (isinstance(retries, bool) or not isinstance(retries, int)
+                or not 0 <= retries <= MAX_RETRIES):
+            return bad("invalid_retries",
+                       f"Step {step_id}.retries must be an integer between 0 and {MAX_RETRIES}")
+
+        repeat = raw.get("repeat")
+        repeat_value = None
+        if repeat is not None:
+            if not isinstance(repeat, dict):
+                return bad("invalid_repeat", f"Step {step_id}.repeat must be an object")
+            unknown = sorted(set(repeat) - REPEAT_FIELDS)
+            if unknown:
+                return bad("unknown_field", f"Unknown repeat field: {unknown[0]}")
+            rounds = repeat.get("max")
+            if (isinstance(rounds, bool) or not isinstance(rounds, int)
+                    or not 1 <= rounds <= MAX_REPEAT_ROUNDS):
+                return bad("invalid_repeat",
+                           f"Step {step_id}.repeat.max must be an integer between 1 and "
+                           f"{MAX_REPEAT_ROUNDS}")
+            pattern = repeat.get("untilOutputMatches")
+            if not isinstance(pattern, str) or not pattern:
+                return bad("invalid_repeat",
+                           f"Step {step_id}.repeat.untilOutputMatches must be a non-empty "
+                           f"regular expression")
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                return bad("invalid_repeat",
+                           f"Step {step_id}.repeat.untilOutputMatches is not a valid regular "
+                           f"expression: {exc}")
+            if foreach is not None:
+                return bad("invalid_repeat",
+                           f"Step {step_id} cannot combine repeat with foreach; repeat a single "
+                           f"task, fan out with foreach")
+            repeat_value = {"max": rounds, "untilOutputMatches": pattern}
+
         steps.append({
             "id": step_id,
             "agentId": agent_id,
             "input": text,
             "needs": list(needs),
+            "foreach": list(foreach) if foreach is not None else None,
             "timeoutMs": timeout,
             "cwd": cwd,
+            "options": dict(options) if options is not None else None,
+            "readOnly": read_only,
+            "retries": retries,
+            "repeat": repeat_value,
         })
 
     known_ids = {step["id"] for step in steps}
@@ -184,6 +287,11 @@ def validate_spec(spec, agents, max_steps, max_body, max_command_input,
             hint = "use {{ stepId.output }} or {{ item }}"
             return bad("invalid_template",
                        f"Step {step['id']} input has a malformed placeholder; {hint}")
+        for match in TEMPLATE_RE.finditer(text):
+            problem = _check_reference(match.group(1), step["foreach"] is not None,
+                                       ancestors[step["id"]], known_ids)
+            if problem:
+                return bad("unknown_reference", f"Step {step['id']}: {problem}")
 
     normalized = {
         "steps": steps,
@@ -212,7 +320,8 @@ class WorkflowEngine:
     """Schedules workflow steps onto the relay's task queue and records their results."""
 
     def __init__(self, *, lock, condition, create_task, get_task, cancel_task, drain,
-                 agents, resolve_cwd, max_steps, max_workflows, max_body,
+                 agents, resolve_cwd, state_dir, max_steps, max_workflows, max_foreach,
+                 max_body,
                  max_command_input, max_timeout_ms, now):
         self._lock = lock
         self._condition = condition
@@ -222,8 +331,10 @@ class WorkflowEngine:
         self._drain = drain
         self._agents = agents
         self._resolve_cwd = resolve_cwd
+        self._state_dir = Path(state_dir)
         self._max_steps = max_steps
         self._max_workflows = max_workflows
+        self._max_foreach = max_foreach
         self._max_body = max_body
         self._max_command_input = max_command_input
         self._max_timeout_ms = max_timeout_ms
@@ -237,7 +348,7 @@ class WorkflowEngine:
         """Validate and start a workflow. Returns ``(http_status, body)``."""
         agents = self._agents()
         normalized, problem = validate_spec(
-            spec, agents, self._max_steps, self._max_body,
+            spec, agents, self._max_steps, self._max_foreach, self._max_body,
             self._max_command_input, self._max_timeout_ms)
         if problem:
             code, message = problem
@@ -267,6 +378,8 @@ class WorkflowEngine:
             self._workflows[workflow["id"]] = workflow
             if request_id is not None:
                 self._request_ids[request_id] = workflow
+            self._journal(workflow, {"type": "created", "at": self._now(),
+                                     "spec": normalized})
             body = self._public(workflow, detail=False)
             self._start(workflow)
         return 202, body
@@ -290,12 +403,89 @@ class WorkflowEngine:
         with self._lock:
             return self._workflows.get(workflow_id)
 
+    def journaled(self, workflow_id):
+        """True when a run with this id has a journal on disk, active run or not."""
+        if not RUN_ID_RE.fullmatch(workflow_id or ""):
+            return False
+        return self._journal_path(workflow_id).exists()
+
     def public(self, workflow_id, detail=True):
         if not RUN_ID_RE.fullmatch(workflow_id or ""):
             return None
         with self._lock:
             workflow = self._workflows.get(workflow_id)
             return self._public(workflow, detail=detail) if workflow else None
+
+    def list(self, session_id=None, status=None, limit=100):
+        with self._lock:
+            workflows = list(self._workflows.values())
+        if session_id is not None:
+            workflows = [wf for wf in workflows if wf["sessionId"] == session_id]
+        if status is not None:
+            workflows = [wf for wf in workflows if wf["status"] == status]
+        workflows.sort(key=lambda wf: wf["createdAt"], reverse=True)
+        return [self._public(wf, detail=False) for wf in workflows[:limit]]
+
+    def cancel(self, workflow_id):
+        """Stop a workflow and its running children. Returns the workflow, or None."""
+        workflow = self.get(workflow_id)
+        if workflow is None:
+            return None
+        with self._lock:
+            if workflow["status"] not in WORKFLOW_TERMINAL:
+                # Finish here rather than on the next tick: the caller is waiting for
+                # this response and must not see a run that still reads "queued".
+                workflow["_cancel"] = True
+                self._cancel_children(workflow)
+                self._finish(workflow, "cancelled")
+        return self._public(workflow, detail=True)
+
+    def resume(self, workflow_id):
+        """Continue a journaled run, keeping the steps that already completed."""
+        if not RUN_ID_RE.fullmatch(workflow_id or ""):
+            return 404, {"error": "unknown_workflow"}
+        saved = self._read_journal(workflow_id)
+        if saved is None:
+            return 404, {"error": "unknown_workflow",
+                         "message": "No journaled workflow with that id"}
+        with self._lock:
+            prior = self._workflows.get(workflow_id)
+            if prior is not None and prior["status"] not in WORKFLOW_TERMINAL:
+                return 409, {"error": "workflow_active",
+                             "message": "The workflow is still running; cancel it before resuming"}
+            workflow = self._new_workflow(saved["spec"], None, workflow_id=workflow_id)
+            for step in workflow["steps"]:
+                done = saved["outputs"].get(step["id"])
+                if done is not None:
+                    step["status"] = "completed"
+                    step["output"] = done["output"]
+                    step["attempts"] = done["attempts"]
+            self._workflows[workflow_id] = workflow
+            # The one field _new_workflow sets and _make_room releases; reading the old
+            # name left every resumed run unregistered.
+            request_id = (prior or {}).get("_requested_request_id")
+            if request_id is not None:
+                workflow["_requested_request_id"] = request_id
+                self._request_ids[request_id] = workflow
+            self._journal(workflow, {"type": "resumed", "at": self._now()})
+            body = self._public(workflow, detail=False)
+            self._start(workflow)
+        return 202, body
+
+    def wait(self, workflow_id, wait_ms):
+        """Long-poll until the workflow is terminal or the wait elapses."""
+        deadline = time.monotonic() + wait_ms / 1000.0
+        with self._condition:
+            while True:
+                workflow = self._workflows.get(workflow_id)
+                if workflow is None or workflow["status"] in WORKFLOW_TERMINAL:
+                    return workflow
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return workflow
+                self._condition.wait(remaining)
+
+    # -------------------------------------------------------------- run internals
 
     def _new_workflow(self, spec, request_id, workflow_id=None):
         workflow_id = workflow_id or "wf-" + uuid.uuid4().hex
@@ -314,6 +504,7 @@ class WorkflowEngine:
             "_ancestors": spec["ancestors"],
             "_requested_spec": spec,
             "_requested_request_id": request_id,
+            "_cancel": False,
         }
 
     @staticmethod
@@ -324,6 +515,7 @@ class WorkflowEngine:
             "needs": step["needs"],
             "status": "pending",
             "attempts": 0,
+            "retries": 0,
             "taskIds": [],
             "output": None,
             "error": None,
@@ -348,6 +540,8 @@ class WorkflowEngine:
                     workflow["status"] = "failed"
                     workflow["error"] = f"workflow engine error: {exc}"
                     workflow["finishedAt"] = self._now()
+                    self._journal(workflow, {"type": "finished", "at": self._now(),
+                                             "status": "failed"})
                     self._condition.notify_all()
                 return
             with self._condition:
@@ -364,6 +558,11 @@ class WorkflowEngine:
             if not workflow["startedAt"]:
                 workflow["startedAt"] = self._now()
             workflow["status"] = "running"
+
+            if workflow["_cancel"]:
+                self._cancel_children(workflow)
+                self._finish(workflow, "cancelled")
+                return True
 
             by_id = {step["id"]: step for step in workflow["steps"]}
             passes = 0
@@ -415,7 +614,7 @@ class WorkflowEngine:
             return True
         return False
 
-    def _context(self, workflow, step):
+    def _context(self, workflow, step, item, index):
         outputs = {other["id"]: other["output"] for other in workflow["steps"]
                    if other["status"] == "completed"}
         context = {}
@@ -423,64 +622,172 @@ class WorkflowEngine:
             value = outputs.get(dep) or ""
             context[dep] = value
             context[f"{dep}.output"] = value
+        if step["_spec"]["foreach"] is not None:
+            context["item"] = item
+            context["index"] = str(index)
+            context["foreach.item"] = item
+            context["foreach.index"] = str(index)
         return context
+
     def _launch(self, workflow, step):
-        """Render the step's input and submit its task."""
+        """Render and submit every task this attempt needs."""
         spec = step["_spec"]
-        try:
-            text = _render(spec["input"], self._context(workflow, step))
-        except KeyError as exc:
-            step["status"] = "failed"
-            step["error"] = f"unresolved template reference: {exc.args[0]}"
-            return True
-        request = {"agentId": spec["agentId"], "input": text,
-                   "sessionId": workflow["sessionId"]}
-        if spec["timeoutMs"] is not None:
-            request["timeoutMs"] = spec["timeoutMs"]
-        if spec["cwd"] is not None:
-            request["cwd"] = spec["cwd"]
-        status, body = self._create_task(request)
-        if status not in (200, 202):
-            step["status"] = "failed"
-            # Keep the relay's code: a document the agent cannot honour must be fixable
-            # without guessing which rule refused it.
-            code = body.get("error")
-            message = body.get("message") or code or "task_rejected"
-            step["error"] = f"{code}: {message}" if code and code not in message else message
-            return True
-        step["attempts"] += 1
-        step["_current"] = [body["id"]]
-        step["taskIds"].append(body["id"])
+        items = spec["foreach"] if spec["foreach"] is not None else [None]
+        submitted = []
+        attempt = step["attempts"] + 1
+        for index, item in enumerate(items):
+            try:
+                text = _render(spec["input"],
+                               self._context(workflow, step, item, index))
+            except KeyError as exc:
+                self._abort_children(submitted)
+                step["status"] = "failed"
+                step["error"] = f"unresolved template reference: {exc.args[0]}"
+                return True
+            request = {"agentId": spec["agentId"], "input": text,
+                       "sessionId": workflow["sessionId"]}
+            if spec["timeoutMs"] is not None:
+                request["timeoutMs"] = spec["timeoutMs"]
+            if spec["cwd"] is not None:
+                request["cwd"] = spec["cwd"]
+            if spec["options"] is not None:
+                request["options"] = spec["options"]
+            if spec["readOnly"]:
+                request["readOnly"] = True
+            status, body = self._create_task(request)
+            if status not in (200, 202):
+                self._abort_children(submitted)
+                step["status"] = "failed"
+                # Keep the relay's code: a document the agent cannot honour must be fixable
+                # without guessing which rule refused it.
+                code = body.get("error")
+                message = body.get("message") or code or "task_rejected"
+                step["error"] = f"{code}: {message}" if code and code not in message else message
+                return True
+            submitted.append(body["id"])
+        step["attempts"] = attempt
+        step["_current"] = submitted
+        step["taskIds"].extend(submitted)
         step["status"] = "running"
         return True
+
     def _reap(self, workflow, step):
-        """Fold the finished task back into the step's state machine."""
-        task = self._get_task(step["_current"][0]) if step["_current"] else None
-        if task is None:
+        """Fold finished tasks back into the step's state machine."""
+        tasks = [self._get_task(task_id) for task_id in step["_current"]]
+        if not tasks or any(task is None for task in tasks):
             step["status"] = "failed"
             step["error"] = "task_evicted_from_the_relay_store"
             return True
-        if task["status"] not in TASK_TERMINAL:
+        if not all(task["status"] in TASK_TERMINAL for task in tasks):
             return False
-        if task["status"] in ("failed", "timed_out"):
+        spec = step["_spec"]
+
+        failures = [task for task in tasks if task["status"] in ("failed", "timed_out")]
+        if failures:
+            if spec["retries"] and step["retries"] < spec["retries"]:
+                step["retries"] += 1
+                step["_current"] = []
+                step["status"] = "ready"
+                return True
             step["status"] = "failed"
-            step["error"] = task.get("error") or task["status"]
-            step["output"] = task.get("output") or None
+            step["error"] = failures[0].get("error") or failures[0]["status"]
+            step["output"] = failures[0].get("output") or None
             return True
-        if task["status"] == "cancelled":
+
+        cancelled = [task for task in tasks if task["status"] == "cancelled"]
+        if cancelled:
             step["status"] = "cancelled"
             step["error"] = "task_cancelled"
             return True
-        step["output"] = task.get("output") or ""
+
+        outputs = [task.get("output") or "" for task in tasks]
+        step["output"] = json.dumps(outputs) if spec["foreach"] is not None else outputs[0]
         step["error"] = None
+
+        if spec["repeat"] is not None:
+            pattern = spec["repeat"]["untilOutputMatches"]
+            if re.search(pattern, step["output"]) is None:
+                if step["attempts"] < spec["repeat"]["max"]:
+                    step["_current"] = []
+                    step["status"] = "ready"
+                    return True
+                step["status"] = "failed"
+                step["error"] = "repeat_limit_reached"
+                return True
+
         step["status"] = "completed"
+        self._journal(workflow, {"type": "step", "at": self._now(), "step": step["id"],
+                                 "status": "completed", "output": step["output"],
+                                 "attempts": step["attempts"]})
         return True
+
+    def _cancel_children(self, workflow):
+        for step in workflow["steps"]:
+            if step["status"] in STEP_TERMINAL:
+                continue
+            self._abort_children(step["_current"])
+            step["status"] = "cancelled"
+            step["error"] = "workflow_cancelled"
+            step["_current"] = []
+
+    def _abort_children(self, task_ids):
+        for task_id in task_ids:
+            task = self._get_task(task_id)
+            if task is not None and task["status"] not in TASK_TERMINAL:
+                self._cancel_task(task)
+
     def _finish(self, workflow, status):
         workflow["status"] = status
         workflow["finishedAt"] = self._now()
+        record = {"type": "finished", "at": self._now(), "status": status}
+        if workflow["error"]:
+            record["error"] = workflow["error"]
+        self._journal(workflow, record)
         self._condition.notify_all()
 
     # ------------------------------------------------------------------- journaling
+
+    def _journal_path(self, workflow_id):
+        return self._state_dir / "workflows" / f"{workflow_id}.jsonl"
+
+    def _journal(self, workflow, record):
+        """Append one record. Journaling is best effort: it must never fail a run."""
+        if workflow.get("_journal_off"):
+            return
+        try:
+            path = self._journal_path(workflow["id"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001 - an unwritable state dir only costs resume
+            workflow["_journal_off"] = True
+
+    def _read_journal(self, workflow_id):
+        try:
+            lines = self._journal_path(workflow_id).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        spec = None
+        outputs = {}
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            kind = record.get("type")
+            if kind == "created":
+                spec = record.get("spec")
+            elif kind == "step" and record.get("status") == "completed":
+                # Last write wins: a resumed run may journal the same step again.
+                outputs[record.get("step")] = {
+                    "output": record.get("output") or "",
+                    "attempts": record.get("attempts") or 1,
+                }
+        if not isinstance(spec, dict) or "ancestors" not in spec:
+            return None
+        return {"spec": spec, "outputs": outputs}
+
+    # ------------------------------------------------------------------- presentation
 
     def _public(self, workflow, detail):
         if workflow is None:

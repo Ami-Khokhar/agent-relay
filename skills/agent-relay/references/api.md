@@ -18,7 +18,7 @@ headers). Error responses close the connection. `GET /healthz` needs no token.
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
               "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4,
-              "maxSteps": 64, "maxWorkflows": 200,
+              "maxSteps": 64, "maxWorkflows": 200, "maxForEach": 32,
               "taskRetentionMs": null, "maxDelegationDepth": 2, "maxDelegatedTasks": 20 },
   "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
                 "date": "2026-10-02T19:10:52Z" } }
@@ -140,28 +140,74 @@ is required (`415 unsupported_media_type` otherwise).
 | `sessionId` | no | ≤128 chars. Defaults to the run ID and is passed to every child task. |
 | `requestId` | no | ≤128 chars; idempotency key for the submission itself. |
 
-A step takes `id` (unique in the document), `agentId`, `input`, `needs`, `timeoutMs` and `cwd`.
-The `input` may contain `{{stepId.output}}` or bare `{{stepId}}` for a step in `needs`,
-directly or through another step; a reference to anything else fails that step with
-`unresolved template reference` when it starts.
+Step fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `id` | yes | Unique in the document; `[A-Za-z0-9_.~-]`, ≤128 chars. |
+| `agentId` | yes | Must match a registry id. |
+| `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. |
+| `needs` | no | Step ids that must complete first. Acyclic; forward references allowed. |
+| `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
+| `retries` | no | `0` to `5`; extra attempts after a task fails or times out. |
+| `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
+| `timeoutMs` | no | Positive integer, same cap as a task. |
+| `cwd` | no | Same `allowedRoots` check as a task. |
+| `options` | no | `{"<name>": "<value>"}`, exactly as for a task submission. The agent decides which names and values it allows. |
+| `readOnly` | no | Boolean, exactly as for a task submission. |
+
+References are resolved at submit time. `{{stepId.output}}` (or bare `{{stepId}}`) must
+name a step in that step's transitive `needs`, so a run cannot read a sibling that has not
+run yet. `{{item}}` / `{{index}}` and `{{foreach.item}}` / `{{foreach.index}}` require
+`foreach` on that step. Anything else is `400 unknown_reference`; an unterminated
+placeholder is `400 invalid_template`.
 
 Returns `202` with the run. Replaying the same `requestId` with the same document returns
-`200`; with a different document, `409 idempotency_conflict`. Validation failures use `400`
-with `invalid_steps`, `invalid_step_id`, `invalid_name`, `duplicate_step`, `unknown_step`,
-`cyclic_dependency`, `invalid_needs`, `invalid_template`, `invalid_timeout`, `invalid_cwd`,
-`command_input_too_large`, `cwd_not_allowed`, and the shared `unknown_field`, `unknown_agent`,
-`input_required`, `invalid_session_id`, `invalid_request_id`. Every document error is a `400`,
-including `command_input_too_large`, which a task submission reports as `413`.
+`200`; with a different document, `409 idempotency_conflict`.
 
-A submission is also refused with `503 workflow_capacity_reached` when
-`A2A_RELAY_MAX_WORKFLOWS` runs are stored and none has finished; the oldest finished run is
-evicted to make room, as a task store evicts the oldest terminal task.
+Validation failures use `400` with: `invalid_steps`, `invalid_step_id`, `duplicate_step`,
+`unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_foreach`, `invalid_retries`,
+`invalid_repeat`, `invalid_template`, `unknown_reference`, `invalid_options`,
+`invalid_read_only`, `command_input_too_large`, and the shared `unknown_field`,
+`unknown_agent`, `input_required`, `invalid_name`, `invalid_session_id`,
+`invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`.
+
+A step whose `options` or `readOnly` the agent cannot honour fails when the relay launches
+it, with the relay's own code at the start of `steps[].error` (`unknown_option: ...`,
+`invalid_option_value: ...`, `read_only_unsupported: ...`), and no task for it runs. The
+shape of those two fields is checked at submit time; what the agent allows is checked when
+the step starts, exactly as a registry change would be for a queued task.
 
 ### `GET /v1/workflows/:id`
 
 Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
 `finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `status`,
-`attempts`, `taskIds`, `output` and `error`. An unknown run returns `404 unknown_workflow`.
+`attempts`, `taskIds`, `output`, and `error`.
+
+`?waitMs=<ms>` long-polls until the run is terminal or the wait elapses; a wait that ends
+first adds `waitExpired: true`, `waitedMs` and `hint`, exactly as a task wait does. A
+`waitMs` outside `1..maxWaitMs` returns `400 invalid_wait`.
+
+A run that has left memory but still has a journal returns `404 unknown_workflow` with a
+`message` pointing at `POST /v1/workflows/:id/resume`.
+
+### `GET /v1/workflows`
+
+Same query parameters as `GET /v1/tasks` (`sessionId`, `status`, `limit`), restricted to
+workflow statuses. Entries omit `spec`, and steps omit `output` and `taskIds`. Returns
+`{ "workflows": [ ... ] }`, most recent first.
+
+### `DELETE /v1/workflows/:id`
+
+Cancels the run, cancels every task it started, and returns the run as `cancelled`.
+An already terminal run is returned unchanged.
+
+### `POST /v1/workflows/:id/resume`
+
+Reads `<state dir>/workflows/<id>.jsonl`, restores the steps that completed with their
+outputs and attempt counts, and schedules the rest. Returns `202` with the restarted run.
+`409 workflow_active` when the run is still going, `404 unknown_workflow` when nothing is
+journaled under that id. The request takes no body and needs no `content-type`.
 
 ### `POST /v1/admin/reload`
 
@@ -175,24 +221,24 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 
 Tasks: `queued`, `running`, `completed`, `failed`, `timed_out`, `cancelled`.
 
-Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Steps: `pending`,
-`running`, `completed`, `failed`, `skipped`, `cancelled`.
+Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow steps:
+`pending`, `running`, `completed`, `failed`, `skipped`, `cancelled`.
 
 ## Error responses
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
-| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_input`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
+| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_input`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error`, and the workflow validation codes listed under `POST /v1/workflows` | Malformed request or registry. |
 | 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route. |
 | 403 | `forbidden`, `origin_not_allowed`, `delegation_not_allowed` | Admin route called from a non-loopback address; request from a browser origin not in `AGENT_RELAY_ALLOWED_ORIGINS`; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
 | 404 | `unknown_agent`, `unknown_task`, `unknown_workflow`, `not_found` | Missing agent/task/run/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
-| 409 | `idempotency_conflict`, `delegation_cycle`, `delegation_depth_exceeded` | `requestId` reused with different fields; target already in the delegation chain; chain too deep. |
+| 409 | `idempotency_conflict`, `workflow_active`, `delegation_cycle`, `delegation_depth_exceeded` | `requestId` reused with different fields; resume requested while the run is still going; target already in the delegation chain; chain too deep. |
 | 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
 | 415 | `unsupported_media_type` | `POST /v1/tasks` or `POST /v1/workflows` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
-| 503 | `task_capacity_reached` | Store full of non-terminal tasks. |
+| 503 | `task_capacity_reached`, `workflow_capacity_reached` | Store full of non-terminal tasks, or of runs with none finished. |
 
 ### Task errors
 
@@ -257,3 +303,38 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `error` | failure/timeout | Failure reason. |
 | `outputTruncated` | on truncation | True when output hit the byte limit. |
 | `cancellation` | cancelled while running | `process_signal` (adapter process group signalled) or `request_only` (HTTP request not aborted). |
+
+## Workflow object fields
+
+| Field | When | Notes |
+| --- | --- | --- |
+| `id` | always | `wf-` plus 32 hex characters. |
+| `name` | always | Submitted name, else `workflow`. |
+| `status` | always | Workflow status values. |
+| `sessionId` | always | Shared by every task the run starts. |
+| `createdAt` / `startedAt` / `finishedAt` | as applicable | ISO-8601; `startedAt` and `finishedAt` are null until reached. |
+| `spec` | single run only | The document as submitted, without the internal dependency closure. |
+| `error` | failed/cancelled | Names the first step that did not succeed. |
+| `steps[].id` / `agentId` / `needs` | always | As submitted. |
+| `steps[].status` | always | Step status values. |
+| `steps[].attempts` | always | How many times the step has run, restored from the journal on resume. |
+| `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
+| `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
+| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `task_evicted_from_the_relay_store`, an adapter error, or a rejected submission message. |
+
+## Workflow journals
+
+Each run appends to `<state dir>/workflows/<id>.jsonl`, one JSON object per line:
+
+```jsonl
+{"type":"created","at":"ISO-8601","spec":{...}}
+{"type":"step","at":"ISO-8601","step":"write","status":"completed","output":"...","attempts":1}
+{"type":"resumed","at":"ISO-8601"}
+{"type":"finished","at":"ISO-8601","status":"completed"}
+```
+
+Replay takes the `created` document and the **last** `step` record per step id, so a
+resumed run's later result wins. `resume` works after a restart because nothing else
+survives: tasks live in memory only. The journal records prompts and outputs, so treat it as
+task content. Journaling is best effort — an unwritable state directory disables resume for
+that run but never fails the run.
