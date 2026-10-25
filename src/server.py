@@ -1087,6 +1087,7 @@ def _purge_periodically():
             _purge_expired()
 
 
+
 def _make_room():
     if len(TASKS) < MAX_TASKS:
         return True
@@ -1347,6 +1348,158 @@ def _wait_for_terminal(task_id, wait_ms):
             TASK_CONDITION.wait(remaining)
 
 
+def _create_task(request):
+    """Validate one task request and enqueue it. Returns ``(status, body)``.
+
+    Called by ``POST /v1/tasks``, so every task request is validated in one place.
+    """
+    if not isinstance(request, dict):
+        return 400, {"error": "invalid_request"}
+    unknown = sorted(set(request) - TASK_FIELDS)
+    if unknown:
+        return 400, {"error": "unknown_field",
+                     "message": f"Unknown request field: {unknown[0]}"}
+    agent = AGENTS.get(request.get("agentId"))
+    if agent is None:
+        return 404, {"error": "unknown_agent"}
+    input_text = request.get("input")
+    if not _valid(input_text, MAX_BODY):
+        return 400, {"error": "input_required"}
+    session_id = request.get("sessionId")
+    if session_id is not None and not _valid(session_id):
+        return 400, {"error": "invalid_session_id"}
+    request_id = request.get("requestId")
+    if request_id is not None and not _valid(request_id):
+        return 400, {"error": "invalid_request_id"}
+    timeout_ms = request.get("timeoutMs")
+    if timeout_ms is not None and not _is_positive_int(timeout_ms):
+        return 400, {"error": "invalid_timeout"}
+    parent_id = request.get("parentTaskId")
+    if parent_id is not None and not _valid(parent_id):
+        return 400, {"error": "invalid_parent_task_id"}
+    # waitMs only names the wait the caller means to use next. Refuse a bad one here, before the
+    # task exists: a caller that gets this error then holds no task ID for a task that runs on.
+    if "waitMs" in request and not _is_valid_wait(request["waitMs"]):
+        return 400, _invalid_wait()
+    options, _, option_error = _resolve_options(agent, request.get("options"))
+    if option_error:
+        return 400, {"error": option_error[0], "message": option_error[1]}
+    # Present but not a boolean (even null) is refused: a safety flag must not fall back to writable.
+    read_only = request.get("readOnly", False)
+    if not isinstance(read_only, bool):
+        return 400, {"error": "invalid_read_only",
+                     "message": "readOnly must be true or false"}
+    refusal = _read_only_refusal(agent) if read_only else None
+    if refusal:
+        return 400, {"error": "read_only_unsupported", "message": refusal}
+    task_cwd, cwd_error = _resolve_task_cwd(agent, request.get("cwd"))
+    if cwd_error:
+        message = (f"cwd is not inside an allowed root for agent {agent['id']}"
+                   if cwd_error == "cwd_not_allowed"
+                   else f"cwd is not a directory: {request.get('cwd')}")
+        return 400, {"error": cwd_error, "message": message}
+    # Without a cwd the sandbox would have no tree to protect, so the run would not be read-only.
+    no_cwd = _cwd_required(agent, task_cwd) if read_only else None
+    if no_cwd:
+        return 400, {"error": "cwd_required", "message": no_cwd}
+    bad_input = _input_refusal(agent, input_text) if read_only else None
+    if bad_input:
+        return 400, {"error": "invalid_input", "message": bad_input}
+    if agent["type"] == "command" and len(input_text.encode("utf-8")) > MAX_COMMAND_INPUT:
+        return 413, {"error": "command_input_too_large"}
+    if timeout_ms is not None:
+        task_timeout = timeout_ms
+    elif agent.get("timeoutMs"):
+        task_timeout = agent["timeoutMs"]
+    else:
+        task_timeout = TIMEOUT_MS
+    if MAX_TIMEOUT_MS and task_timeout > MAX_TIMEOUT_MS:
+        return 400, {
+            "error": "invalid_timeout",
+            "message": f"timeoutMs exceeds A2A_RELAY_MAX_TIMEOUT_MS ({MAX_TIMEOUT_MS})"}
+    request_key = None if request_id is None else f"{agent['id']}\0{request_id}"
+    with LOCK:
+        prior = REQUEST_IDS.get(request_key) if request_key else None
+        if prior is not None:
+            if (prior["input"] != input_text
+                    or prior.get("_requested_session_id") != session_id
+                    or prior.get("_requested_timeout_ms") != timeout_ms
+                    or prior.get("_requested_cwd") != request.get("cwd")
+                    or prior.get("options") != options
+                    or bool(prior.get("readOnly")) != read_only
+                    or prior.get("parentTaskId") != parent_id):
+                return 409, {"error": "idempotency_conflict"}
+            return 200, visible(prior)
+        parent = TASKS.get(parent_id) if parent_id is not None else None
+        if parent_id is not None:
+            if parent is None:
+                return 400, {"error": "unknown_parent_task"}
+            refused = _delegation_error(parent, agent)
+            if refused:
+                status, error, message = refused
+                return status, {"error": error, "message": message}
+        if not _make_room():
+            return 503, {"error": "task_capacity_reached"}
+        task = {
+            "id": str(uuid.uuid4()),
+            "sessionId": session_id or str(uuid.uuid4()),
+            "agentId": agent["id"],
+            "input": input_text,
+            "status": "queued",
+            "createdAt": now_iso(),
+            "timeoutMs": task_timeout,
+        }
+        if parent is None:
+            task.update(depth=0, _lineage=[agent["id"]], _delegated=0)
+            task["_root"] = task
+        else:
+            task.update(parentTaskId=parent["id"], depth=parent["depth"] + 1,
+                        _lineage=parent["_lineage"] + [agent["id"]], _root=parent["_root"])
+            parent["_root"]["_delegated"] += 1
+        if task_cwd:
+            task["cwd"] = task_cwd
+        if options:
+            task["options"] = options
+        if read_only:
+            task["readOnly"] = True
+        if request_key:
+            task["requestId"] = request_id
+            task["_request_key"] = request_key
+            task["_requested_session_id"] = session_id
+            task["_requested_timeout_ms"] = timeout_ms
+            task["_requested_cwd"] = request.get("cwd")
+            REQUEST_IDS[request_key] = task
+        TASKS[task["id"]] = task
+        QUEUE.append(task)
+    return 202, visible(task)
+
+
+def cancel_task(task):
+    """Cancel a queued or running task in place and return it. ``None`` stays ``None``.
+
+    A running task keeps its active slot until its worker returns, so the relay never runs
+    more than MAX_ACTIVE adapters at once.
+    """
+    if task is None:
+        return None
+    with LOCK:
+        if task["status"] in ("queued", "running"):
+            if task["status"] == "running":
+                _terminate_task(task)
+                task["cancellation"] = _cancellation_mode(task.get("_adapter"))
+            else:
+                try:
+                    QUEUE.remove(task)
+                except ValueError:
+                    pass
+            task["status"] = "cancelled"
+            task["finishedAt"] = now_iso()
+            task["_finished"] = time.monotonic()
+            TASK_CONDITION.notify_all()
+    return task
+
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "agent-relay"
@@ -1448,141 +1601,40 @@ class Handler(BaseHTTPRequestHandler):
             supplied.strip().encode("utf-8"), TOKEN.encode("utf-8"))
 
     def _submit(self):
-        content_type = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
-        if content_type != "application/json":
-            self.close_connection = True
-            return self._json(415, {"error": "unsupported_media_type",
-                                    "message": "content-type must be application/json"})
+        error, request = self._read_json_body()
+        if error:
+            return self._json(error, request)
+        status, body = _create_task(request)
+        self._json(status, body)
+        if status == 202:
+            _drain()
+
+    def _read_json_body(self, document=True):
+        """Read the request body as a JSON object.
+
+        Returns ``(error_status, error_body)`` on failure and ``(None, body)`` on success, so
+        every caller sends exactly one response. Pass ``document=False`` for a route that
+        takes no document: the body is still read, so a keep-alive connection stays in sync.
+        """
+        if document:
+            content_type = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                self.close_connection = True
+                return 415, {"error": "unsupported_media_type",
+                             "message": "content-type must be application/json"}
         length_header = self.headers.get("content-length")
         length = int(length_header) if length_header and length_header.isdigit() else 0
         if length > MAX_BODY:
             self.close_connection = True
-            return self._json(413, {"error": "request_failed", "message": "body too large"})
+            return 413, {"error": "request_failed", "message": "body too large"}
         raw = self.rfile.read(length) if length else b""
         try:
-            request = json.loads(raw.decode("utf-8") or "{}")
+            body = json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
-            return self._json(400, {"error": "invalid_json"})
-        if not isinstance(request, dict):
-            return self._json(400, {"error": "invalid_request"})
-        unknown = sorted(set(request) - TASK_FIELDS)
-        if unknown:
-            return self._json(400, {"error": "unknown_field",
-                                    "message": f"Unknown request field: {unknown[0]}"})
-        agent = AGENTS.get(request.get("agentId"))
-        if agent is None:
-            return self._json(404, {"error": "unknown_agent"})
-        input_text = request.get("input")
-        if not _valid(input_text, MAX_BODY):
-            return self._json(400, {"error": "input_required"})
-        session_id = request.get("sessionId")
-        if session_id is not None and not _valid(session_id):
-            return self._json(400, {"error": "invalid_session_id"})
-        request_id = request.get("requestId")
-        if request_id is not None and not _valid(request_id):
-            return self._json(400, {"error": "invalid_request_id"})
-        timeout_ms = request.get("timeoutMs")
-        if timeout_ms is not None and not _is_positive_int(timeout_ms):
-            return self._json(400, {"error": "invalid_timeout"})
-        parent_id = request.get("parentTaskId")
-        if parent_id is not None and not _valid(parent_id):
-            return self._json(400, {"error": "invalid_parent_task_id"})
-        # waitMs only names the wait the caller means to use next. Refuse a bad one here, before the
-        # task exists: a caller that gets this error then holds no task ID for a task that runs on.
-        if "waitMs" in request and not _is_valid_wait(request["waitMs"]):
-            return self._json(400, _invalid_wait())
-        options, _, option_error = _resolve_options(agent, request.get("options"))
-        if option_error:
-            return self._json(400, {"error": option_error[0], "message": option_error[1]})
-        # Present but not a boolean (even null) is refused: a safety flag must not fall back to writable.
-        read_only = request.get("readOnly", False)
-        if not isinstance(read_only, bool):
-            return self._json(400, {"error": "invalid_read_only",
-                                    "message": "readOnly must be true or false"})
-        refusal = _read_only_refusal(agent) if read_only else None
-        if refusal:
-            return self._json(400, {"error": "read_only_unsupported", "message": refusal})
-        task_cwd, cwd_error = _resolve_task_cwd(agent, request.get("cwd"))
-        if cwd_error:
-            message = (f"cwd is not inside an allowed root for agent {agent['id']}"
-                       if cwd_error == "cwd_not_allowed"
-                       else f"cwd is not a directory: {request.get('cwd')}")
-            return self._json(400, {"error": cwd_error, "message": message})
-        # Without a cwd the sandbox would have no tree to protect, so the run would not be read-only.
-        no_cwd = _cwd_required(agent, task_cwd) if read_only else None
-        if no_cwd:
-            return self._json(400, {"error": "cwd_required", "message": no_cwd})
-        bad_input = _input_refusal(agent, input_text) if read_only else None
-        if bad_input:
-            return self._json(400, {"error": "invalid_input", "message": bad_input})
-        if agent["type"] == "command" and len(input_text.encode("utf-8")) > MAX_COMMAND_INPUT:
-            return self._json(413, {"error": "command_input_too_large"})
-        if timeout_ms is not None:
-            task_timeout = timeout_ms
-        elif agent.get("timeoutMs"):
-            task_timeout = agent["timeoutMs"]
-        else:
-            task_timeout = TIMEOUT_MS
-        if MAX_TIMEOUT_MS and task_timeout > MAX_TIMEOUT_MS:
-            return self._json(400, {
-                "error": "invalid_timeout",
-                "message": f"timeoutMs exceeds A2A_RELAY_MAX_TIMEOUT_MS ({MAX_TIMEOUT_MS})"})
-        request_key = None if request_id is None else f"{agent['id']}\0{request_id}"
-        with LOCK:
-            prior = REQUEST_IDS.get(request_key) if request_key else None
-            if prior is not None:
-                if (prior["input"] != input_text
-                        or prior.get("_requested_session_id") != session_id
-                        or prior.get("_requested_timeout_ms") != timeout_ms
-                        or prior.get("_requested_cwd") != request.get("cwd")
-                        or prior.get("options") != options
-                        or bool(prior.get("readOnly")) != read_only
-                        or prior.get("parentTaskId") != parent_id):
-                    return self._json(409, {"error": "idempotency_conflict"})
-                return self._json(200, visible(prior))
-            parent = TASKS.get(parent_id) if parent_id is not None else None
-            if parent_id is not None:
-                if parent is None:
-                    return self._json(400, {"error": "unknown_parent_task"})
-                refused = _delegation_error(parent, agent)
-                if refused:
-                    status, error, message = refused
-                    return self._json(status, {"error": error, "message": message})
-            if not _make_room():
-                return self._json(503, {"error": "task_capacity_reached"})
-            task = {
-                "id": str(uuid.uuid4()),
-                "sessionId": session_id or str(uuid.uuid4()),
-                "agentId": agent["id"],
-                "input": input_text,
-                "status": "queued",
-                "createdAt": now_iso(),
-                "timeoutMs": task_timeout,
-            }
-            if parent is None:
-                task.update(depth=0, _lineage=[agent["id"]], _delegated=0)
-                task["_root"] = task
-            else:
-                task.update(parentTaskId=parent["id"], depth=parent["depth"] + 1,
-                            _lineage=parent["_lineage"] + [agent["id"]], _root=parent["_root"])
-                parent["_root"]["_delegated"] += 1
-            if task_cwd:
-                task["cwd"] = task_cwd
-            if options:
-                task["options"] = options
-            if read_only:
-                task["readOnly"] = True
-            if request_key:
-                task["requestId"] = request_id
-                task["_request_key"] = request_key
-                task["_requested_session_id"] = session_id
-                task["_requested_timeout_ms"] = timeout_ms
-                task["_requested_cwd"] = request.get("cwd")
-                REQUEST_IDS[request_key] = task
-            TASKS[task["id"]] = task
-            QUEUE.append(task)
-        self._json(202, visible(task))
-        _drain()
+            return 400, {"error": "invalid_json"}
+        if not isinstance(body, dict):
+            return 400, {"error": "invalid_request"}
+        return None, body
 
     def _get_task(self, task_id, query):
         include_input = query.get("includeInput", ["false"])[0]
@@ -1643,21 +1695,7 @@ class Handler(BaseHTTPRequestHandler):
     def _cancel(self, task):
         if task is None:
             return self._json(404, {"error": "unknown_task"})
-        with LOCK:
-            if task["status"] in ("queued", "running"):
-                if task["status"] == "running":
-                    # The worker keeps the active slot until the adapter has really stopped.
-                    _terminate_task(task)
-                    task["cancellation"] = _cancellation_mode(task.get("_adapter"))
-                else:
-                    try:
-                        QUEUE.remove(task)
-                    except ValueError:
-                        pass
-                task["status"] = "cancelled"
-                task["finishedAt"] = now_iso()
-                task["_finished"] = time.monotonic()
-                TASK_CONDITION.notify_all()
+        cancel_task(task)
         self._json(200, visible(task))
         _drain()
 
