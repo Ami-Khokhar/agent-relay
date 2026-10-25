@@ -209,6 +209,39 @@ outputs and attempt counts, and schedules the rest. Returns `202` with the resta
 `409 workflow_active` when the run is still going, `404 unknown_workflow` when nothing is
 journaled under that id. The request takes no body and needs no `content-type`.
 
+### `GET /v1/pressure`
+
+The host reading, with a verdict a caller can act on:
+
+```json
+{ "verdict": "ok", "reasons": [],
+  "memory": { "pressureLevel": "normal", "freePercent": 47 },
+  "swap": { "usedBytes": 955451965, "totalBytes": 2147483648, "usedPercent": 44 },
+  "thermal": { "speedLimitPercent": null },
+  "temperatureC": null,
+  "temperatureReason": "macOS exposes no unprivileged CPU temperature; powermetrics needs root",
+  "sampledAt": "2026-10-25T11:23:38.461Z",
+  "guard": { "enabled": true, "stopsAt": "critical" } }
+```
+
+`verdict` is `critical` when the kernel reports critical memory pressure (`vm.memory_pressure`),
+less than 4% of memory is free (`kern.memorystatus_level`), swap is at least 90% used
+(`vm.swapusage`), or the CPU is throttled below 40% of its speed (`pmset -g therm`); `warn` uses
+the softer readings (kernel warning, 12% free, 70% swap, 75% throttled); otherwise `ok`.
+`reasons` names the reading that decided it. Every signal is `null` when the host cannot report
+it, so a missing probe never fails the call.
+
+`POST /v1/workflows` returns `503 device_pressure` with this body while the verdict is
+`critical`. `temperatureC` is null on Apple Silicon; `thermal.speedLimitPercent` is null when
+macOS has recorded no throttle.
+
+### `POST /v1/pressure/kill`
+
+Stops every active run now, whether or not the verdict is critical, and keeps each journal so
+`resume` can continue it. Takes no body. Returns
+`{ "killed": ["wf-..."], "reason": "device_pressure: ...", "pressure": { ... } }`. A stopped
+run is `cancelled` with `device_pressure:` at the start of its `error`.
+
 ### `POST /v1/admin/reload`
 
 Reloads the registry from disk without dropping in-memory tasks. Requires the token and is
@@ -238,7 +271,7 @@ Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow ste
 | 415 | `unsupported_media_type` | `POST /v1/tasks` or `POST /v1/workflows` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
-| 503 | `task_capacity_reached`, `workflow_capacity_reached` | Store full of non-terminal tasks, or of runs with none finished. |
+| 503 | `task_capacity_reached`, `workflow_capacity_reached`, `device_pressure` | Store full of non-terminal tasks or of runs with none finished; or a workflow submission while the host verdict is `critical`, with the reading attached. |
 
 ### Task errors
 
@@ -257,7 +290,7 @@ A task whose time runs out while the relay is still locating git metadata ends `
 The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
 - `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo }`
-- `tools/list` → the eleven tools below
+- `tools/list` → the twelve tools below
 - `ping`
 - `tools/call`
 
@@ -274,6 +307,7 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | `list_workflows` | `{ sessionId?, status?, limit? }` | `{ workflows: [...] }`. |
 | `cancel_workflow` | `{ workflowId }` | Cancelled run. |
 | `resume_workflow` | `{ workflowId, waitMs? }` | Restarted run; with `waitMs`, the terminal run. |
+| `get_pressure` | `{}` | The host reading, same payload as `GET /v1/pressure`. |
 
 Each result is returned as `content: [{ type: "text", text: "<json>" }]` plus
 `structuredContent` holding the same object. Relay errors come back as `isError: true`

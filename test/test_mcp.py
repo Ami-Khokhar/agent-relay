@@ -98,7 +98,7 @@ class McpHandlerTests(unittest.TestCase):
             self.assertEqual([tool["name"] for tool in listed["tools"]],
                              ["list_agents", "delegate", "wait_task", "get_task", "list_tasks",
                               "cancel_task", "run_workflow", "get_workflow", "list_workflows",
-                              "cancel_workflow", "resume_workflow"])
+                              "cancel_workflow", "resume_workflow", "get_pressure"])
             agents = handle({"method": "tools/call", "params": {"name": "list_agents", "arguments": {}}})
             self.assertEqual(agents["structuredContent"]["agents"][0]["id"], "fake")
             submitted = handle({"method": "tools/call", "params": {
