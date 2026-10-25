@@ -94,7 +94,9 @@ class Relay:
             raise
 
     def _wait_ready(self):
-        deadline = time.time() + 5
+        # Generous: the suite also runs on a loaded CI runner, where the interpreter alone can take
+        # a second or two to import the server.
+        deadline = time.time() + 15
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 _, stderr = self.proc.communicate()

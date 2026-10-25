@@ -9,7 +9,7 @@ A coding agent can delegate a **new** task to another registered agent, inspect 
 | Method | Best fit | Result of the experiment |
 | --- | --- | --- |
 | HTTP task API | Shared relay on one host or across machines; asynchronous jobs | Chosen as the core. Submission returns a task ID; clients poll or cancel. |
-| MCP over stdio | Coding agents that can discover and call tools | Chosen as a thin interface over the HTTP API. It uses the six task tools and the six workflow tools, from `list_agents` to `get_pressure`. |
+| MCP over stdio | Coding agents that can discover and call tools | Chosen as a thin interface over the HTTP API. It uses the six task tools, the five workflow tools, and `get_pressure`. |
 | A2A over HTTP | Interoperability with clients that require the A2A standard | Keep as a future edge adapter. A prototype showed the Agent Card and JSON-RPC surface require their own versioning and task semantics. |
 | Direct CLI / stdio | One orchestrator and one local child agent | Simplest for a single call, but gives no shared task registry or remote access. |
 | Unix socket | Local transport with no TCP port | Could replace the HTTP listener locally; it does not change the task API or adapter model. |

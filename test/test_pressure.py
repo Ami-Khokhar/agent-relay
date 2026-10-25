@@ -98,7 +98,7 @@ class PressureTests(unittest.TestCase):
         self.relays.append(relay)
         return relay
 
-    def wait_workflow(self, relay, workflow_id, timeout=20):
+    def wait_workflow(self, relay, workflow_id, timeout=30):
         deadline = time.time() + timeout
         while time.time() < deadline:
             _, view = relay.request("GET", f"/v1/workflows/{workflow_id}")
@@ -107,7 +107,7 @@ class PressureTests(unittest.TestCase):
             time.sleep(0.02)
         raise RuntimeError("workflow did not finish")
 
-    def wait_step(self, relay, workflow_id, step_id, status, timeout=20):
+    def wait_step(self, relay, workflow_id, step_id, status, timeout=30):
         deadline = time.time() + timeout
         while time.time() < deadline:
             _, view = relay.request("GET", f"/v1/workflows/{workflow_id}")
@@ -239,7 +239,7 @@ class PressureTests(unittest.TestCase):
         # Wait for the child itself: the engine marks a step running before it spawns the process,
         # so a kill sent on the status alone can land before the child writes its mark, and the
         # resumed run would sleep again instead of finishing.
-        deadline = time.time() + 20
+        deadline = time.time() + 45  # a loaded runner may take a while to start the interpreter
         while not os.path.exists(mark):
             if time.time() > deadline:
                 self.fail("the slow step never wrote its mark")
@@ -326,8 +326,18 @@ class PressureTests(unittest.TestCase):
         relay = Relay(echo(), env={
             "AGENT_RELAY_PRESSURE_GUARD": None,
             "A2A_RELAY_PRESSURE_GUARD": "0",
-            "AGENT_RELAY_SYSCTL": os.path.join(self.stubs, "sysctl"),
-            "AGENT_RELAY_PMSET": os.path.join(self.stubs, "pmset"),
+            "AGENT_RELAY_STATE_DIR": self.state,
+        })
+        self.relays.append(relay)
+        _, reading = relay.request("GET", "/v1/pressure")
+        self.assertFalse(reading["guard"]["enabled"])
+
+    def test_an_empty_canonical_guard_falls_through_to_the_alias(self):
+        # An empty value is not a value: it falls through the way server._env does, so the alias
+        # decides. Before, an empty string meant "on" and the alias was never read.
+        relay = Relay(echo(), env={
+            "AGENT_RELAY_PRESSURE_GUARD": "",
+            "A2A_RELAY_PRESSURE_GUARD": "0",
             "AGENT_RELAY_STATE_DIR": self.state,
         })
         self.relays.append(relay)

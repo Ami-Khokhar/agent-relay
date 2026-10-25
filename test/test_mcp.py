@@ -278,6 +278,7 @@ class McpHandlerTests(unittest.TestCase):
         tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "run_workflow")
         step = tool["inputSchema"]["properties"]["spec"]["properties"]["steps"]["items"]["properties"]
         self.assertEqual(step["id"]["pattern"], workflows.STEP_ID_RE.pattern)
+        self.assertEqual(step["needs"]["items"]["pattern"], workflows.STEP_ID_RE.pattern)
         self.assertEqual(step["foreach"]["items"]["maxLength"], workflows.MAX_ITEM_CHARS)
         self.assertEqual(step["retries"]["maximum"], workflows.MAX_RETRIES)
         self.assertEqual(step["repeat"]["properties"]["max"]["maximum"], workflows.MAX_REPEAT_ROUNDS)

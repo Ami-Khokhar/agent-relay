@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """agent-relay MCP stdio interface.
 
-A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the six task tools and the six
-workflow tools; tools/list is the authoritative list. Set A2A_RELAY_URL to point at a
+A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the six task tools, the five workflow
+tools, and get_pressure; tools/list is the authoritative list. Set A2A_RELAY_URL to point at a
 non-default relay. When the relay is not reachable and the URL is loopback, the interface
 starts the HTTP service detached on first use.
 """
@@ -92,7 +92,9 @@ WORKFLOW_SPEC = {
                               "description": "Full prompt for that agent. May contain "
                                              "{{stepId.output}} for a step this one needs, and "
                                              "{{item}} / {{index}} on a foreach step."},
-                    "needs": {"type": "array", "items": {"type": "string"},
+                    "needs": {"type": "array",
+                              "items": {"type": "string", "minLength": 1, "maxLength": 128,
+                                        "pattern": "^[A-Za-z0-9_.~-]{1,128}$"},
                               "description": "Step ids that must complete first. A step with no "
                                              "needs starts immediately; the graph must be acyclic."},
                     "foreach": {"type": "array", "minItems": 1,
