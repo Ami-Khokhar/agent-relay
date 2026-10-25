@@ -31,6 +31,7 @@ from pathlib import Path
 STEP_ID_RE = re.compile(r"^[A-Za-z0-9_.~-]{1,128}$")
 RUN_ID_RE = re.compile(r"^wf-[0-9a-f]{32}$")
 TEMPLATE_RE = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
+FOREACH_REFS = ("item", "index", "foreach.item", "foreach.index")
 
 WORKFLOW_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 WORKFLOW_TERMINAL = frozenset(("completed", "failed", "cancelled"))
@@ -87,21 +88,13 @@ def _ancestors(steps):
 
 def _check_reference(reference, has_foreach, ancestors, known_ids):
     """Return a problem description for a template reference, or None when it is sound."""
-    parts = reference.split(".")
-    if len(parts) == 1 and parts[0] in ("item", "index"):
-        if not has_foreach:
+    if reference in FOREACH_REFS:
+        if has_foreach:
+            return None
+        if reference not in known_ids:  # a step may itself be called "item"
             return f"{{{{{reference}}}}} is only valid on a step that has foreach"
-        return None
-    if len(parts) == 2 and parts[0] == "foreach" and parts[1] in ("item", "index"):
-        if not has_foreach:
-            return f"{{{{{reference}}}}} is only valid on a step that has foreach"
-        return None
-    if len(parts) == 1:
-        step_id = reference
-    elif len(parts) == 2 and parts[1] == "output":
-        step_id = parts[0]
-    else:
-        return f"{{{{{reference}}}}} is not a known reference"
+    # A step id may contain dots, so only a trailing ".output" is a suffix.
+    step_id = reference[:-len(".output")] if reference.endswith(".output") else reference
     if step_id not in known_ids:
         return f"{{{{{reference}}}}} does not name a step in this workflow"
     if step_id not in ancestors:
@@ -470,7 +463,7 @@ class WorkflowEngine:
             self._workflows[workflow_id] = workflow
             request_id = (prior or {}).get("_request_id")
             if request_id is not None:
-                workflow["_request_id"] = request_id
+                workflow["_requested_request_id"] = request_id
                 self._request_ids[request_id] = workflow
             self._journal(workflow, {"type": "resumed", "at": self._now()})
             body = self._public(workflow, detail=False)
@@ -507,7 +500,6 @@ class WorkflowEngine:
             "spec": spec,
             "steps": [self._new_step(step) for step in spec["steps"]],
             "_ancestors": spec["ancestors"],
-            "_request_id": request_id,
             "_requested_spec": spec,
             "_requested_request_id": request_id,
             "_cancel": False,

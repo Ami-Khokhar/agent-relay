@@ -41,8 +41,7 @@ Use it when the user wants to:
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
 - give an MCP client the tools `list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`, `list_workflows`,
-  `cancel_workflow`, `resume_workflow`.
+  `list_tasks`, `cancel_task`.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
 `PATH` and can run the task: the relay adds task IDs, status, timeouts,
@@ -232,13 +231,6 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 - `get_task { taskId, includeInput? }` → current task state and result.
 - `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
 - `cancel_task { taskId }` → cancel a queued or running task.
-- `run_workflow { spec, waitMs? }` → submit a whole multi-step run; `spec` is the workflow
-  document, and `tools/list` types its steps, so you can author one from the schema.
-- `get_workflow { workflowId, maxWaitMs? }` → the run with every step and its output.
-- `list_workflows { sessionId?, status?, limit? }` → stored runs, most recent first.
-- `cancel_workflow { workflowId }` → cancel the run and every task it started.
-- `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
-  that already completed.
   memory, swap, and any thermal throttle. Call it before a long run.
 
 Task objects leave out `input` and carry `inputChars` (its length) instead, because you
@@ -385,8 +377,8 @@ every task it started. A run that does not finish inside `waitMs` returns the sa
 `waitExpired` shape a task wait does.
 
 Runs journal to `<state dir>/workflows/<id>.jsonl` (`AGENT_RELAY_STATE_DIR`, default
-`~/.local/state/agent-relay`), so `POST /v1/workflows/:id/resume` (MCP `resume_workflow`)
-continues a failed or interrupted run without repeating the steps that already completed.
+`~/.local/state/agent-relay`), so `POST /v1/workflows/:id/resume` continues a failed or interrupted run without
+repeating the steps that already completed.
 The journal holds the prompts and results, so treat it as task content. Full endpoint and
 object reference: [references/api.md](references/api.md).
 

@@ -16,7 +16,7 @@ The HTTP API listens on `http://127.0.0.1:43124` by default. Every `/v1/` reques
 python3 src/mcp_server.py
 ```
 
-Configure that command as a local stdio MCP server in the client. It provides `list_agents`, `delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`, `list_workflows`, `cancel_workflow`, and `resume_workflow`. `A2A_RELAY_URL` overrides the HTTP address it calls. When the relay is unreachable and the URL is loopback, the MCP process starts the HTTP service detached on first use and logs it to `~/.local/state/agent-relay/relay.log`; disable that with `A2A_RELAY_AUTOSTART=0`.
+Configure that command as a local stdio MCP server in the client. It provides `list_agents`, `delegate`, `wait_task`, `get_task`, `list_tasks`, and `cancel_task`. `A2A_RELAY_URL` overrides the HTTP address it calls. When the relay is unreachable and the URL is loopback, the MCP process starts the HTTP service detached on first use and logs it to `~/.local/state/agent-relay/relay.log`; disable that with `A2A_RELAY_AUTOSTART=0`.
 
 Register the MCP server once with copy-paste commands (use absolute paths; `bash skills/agent-relay/scripts/setup.sh` prints these for your checkout):
 

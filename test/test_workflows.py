@@ -114,6 +114,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["polish"]["output"], "polish(alpha)")
         self.assertEqual(finished["polish"]["attempts"], 1)
 
+    def test_a_bare_step_id_renders_the_same_output(self):
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "one", "agentId": "echo", "input": "x"},
+            {"id": "two", "agentId": "echo", "needs": ["one"], "input": "[{{one}}]"},
+        ]})
+        self.assertEqual(steps_of(workflow)["two"]["output"], "[x]")
+
     def test_runs_independent_steps_concurrently_and_shares_one_session_id(self):
         relay = self.start(echo())
         status, submitted = relay.request("POST", "/v1/workflows", {"steps": [
@@ -370,6 +378,7 @@ class WorkflowTests(unittest.TestCase):
              {"steps": [{**base, "repeat": {"max": 2, "untilOutputMatches": "("}}]},
              "invalid_repeat"),
             ("zero_timeout", {"steps": [{**base, "timeoutMs": 0}]}, "invalid_timeout"),
+            ("bad_cwd", {"steps": [{**base, "cwd": ""}]}, "invalid_cwd"),
             ("too_many_retries", {"steps": [{**base, "retries": 99}]}, "invalid_retries"),
             ("bad_options", {"steps": [{**base, "options": ["effort"]}]}, "invalid_options"),
             ("bad_option_value", {"steps": [{**base, "options": {"effort": 1}}]},
@@ -406,6 +415,29 @@ class WorkflowTests(unittest.TestCase):
         status, body = relay.request("GET", "/v1/workflows?status=whatever")
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "invalid_status")
+
+    def test_evicts_the_oldest_finished_run_and_releases_its_request_id(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_WORKFLOWS": "1"})
+        first = run(relay, {"requestId": "keep-1",
+                            "steps": [{"id": "a", "agentId": "echo", "input": "one"}]})
+        second = run(relay, {"steps": [{"id": "a", "agentId": "echo", "input": "two"}]})
+        status, body = relay.request("GET", f"/v1/workflows/{first['id']}")
+        self.assertEqual((status, body["error"]), (404, "unknown_workflow"))
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{second['id']}")[0], 200)
+        # The evicted run's requestId is free again, so a retry starts new work.
+        status, again = relay.request("POST", "/v1/workflows", {
+            "requestId": "keep-1", "steps": [{"id": "a", "agentId": "echo", "input": "three"}]})
+        self.assertEqual(status, 202)
+        self.assertNotEqual(again["id"], first["id"])
+
+    def test_refuses_more_steps_than_the_limit(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_STEPS": "2"})
+        self.assertEqual(relay.request("GET", "/healthz")[1]["limits"]["maxSteps"], 2)
+        status, body = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "a", "agentId": "echo", "input": "1"},
+            {"id": "b", "agentId": "echo", "input": "2"},
+            {"id": "c", "agentId": "echo", "input": "3"}]})
+        self.assertEqual((status, body["error"]), (400, "invalid_steps"))
 
     def test_advertises_workflow_limits_on_healthz(self):
         relay = self.start(echo())
