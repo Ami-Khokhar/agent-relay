@@ -18,6 +18,7 @@ headers). Error responses close the connection. `GET /healthz` needs no token.
   "limits": { "timeoutMs": 900000, "maxTimeoutMs": null, "maxWaitMs": 600000,
               "maxBodyBytes": 1048576, "maxCommandInputBytes": 65536,
               "maxOutputBytes": 262144, "maxTasks": 1000, "maxActive": 4,
+              "maxSteps": 64, "maxForEach": 32,
               "taskRetentionMs": null, "maxDelegationDepth": 2, "maxDelegatedTasks": 20 },
   "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
                 "date": "2026-10-02T19:10:52Z" } }
@@ -127,6 +128,120 @@ running task also carries `cancellation`: `process_signal` (the adapter's proces
 signalled) or `request_only` (HTTP: the request was not aborted). The task keeps its active
 slot until the process exits or the request returns. Terminal tasks are returned unchanged.
 
+### `POST /v1/workflows`
+
+The body **is** the workflow document, not a wrapper, and `content-type: application/json`
+is required (`415 unsupported_media_type` otherwise).
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `steps` | yes | 1 to `A2A_RELAY_MAX_STEPS` (default 64) step objects. |
+| `name` | no | ≤128 chars; defaults to `workflow`. |
+| `sessionId` | no | ≤128 chars. Defaults to the run ID and is passed to every child task. |
+| `requestId` | no | ≤128 chars; idempotency key for the submission itself. |
+
+Step fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `id` | yes | Unique in the document; `[A-Za-z0-9_.~-]`, ≤128 chars. |
+| `agentId` | yes | Must match a registry id. |
+| `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. |
+| `needs` | no | Step ids that must complete first. Acyclic; forward references allowed. |
+| `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
+| `retries` | no | `0` to `5`; extra attempts after a task fails or times out. |
+| `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
+| `timeoutMs` | no | Positive integer, same cap as a task. |
+| `cwd` | no | Same `allowedRoots` check as a task. |
+| `options` | no | `{"<name>": "<value>"}`, exactly as for a task submission. The agent decides which names and values it allows. |
+| `readOnly` | no | Boolean, exactly as for a task submission. |
+
+References are resolved at submit time. `{{stepId.output}}` (or bare `{{stepId}}`) must
+name a step in that step's transitive `needs`, so a run cannot read a sibling that has not
+run yet. `{{item}}` / `{{index}}` and `{{foreach.item}}` / `{{foreach.index}}` require
+`foreach` on that step. Anything else is `400 unknown_reference`; an unterminated
+placeholder is `400 invalid_template`.
+
+Returns `202` with the run. Replaying the same `requestId` with the same document returns
+`200`; with a different document, `409 idempotency_conflict`.
+
+Validation failures use `400` with: `invalid_steps`, `invalid_step_id`, `duplicate_step`,
+`unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_foreach`, `invalid_retries`,
+`invalid_repeat`, `invalid_template`, `unknown_reference`, `invalid_options`,
+`invalid_read_only`, `command_input_too_large`, and the shared `unknown_field`,
+`unknown_agent`, `input_required`, `invalid_name`, `invalid_session_id`,
+`invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`.
+
+A step whose `options` or `readOnly` the agent cannot honour fails when the relay launches
+it, with the relay's own code at the start of `steps[].error` (`unknown_option: ...`,
+`invalid_option_value: ...`, `read_only_unsupported: ...`), and no task for it runs. The
+shape of those two fields is checked at submit time; what the agent allows is checked when
+the step starts, exactly as a registry change would be for a queued task.
+
+### `GET /v1/workflows/:id`
+
+Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
+`finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `status`,
+`attempts`, `taskIds`, `output`, and `error`.
+
+`?waitMs=<ms>` long-polls until the run is terminal or the wait elapses; a wait that ends
+first adds `waitExpired: true`, `waitedMs` and `hint`, exactly as a task wait does. A
+`waitMs` outside `1..maxWaitMs` returns `400 invalid_wait`.
+
+A run that has left memory but still has a journal returns `404 unknown_workflow` with a
+`message` pointing at `POST /v1/workflows/:id/resume`.
+
+### `GET /v1/workflows`
+
+Same query parameters as `GET /v1/tasks` (`sessionId`, `status`, `limit`), restricted to
+workflow statuses. Entries omit `spec`, and steps omit `output` and `taskIds`. Returns
+`{ "workflows": [ ... ] }`, most recent first.
+
+### `DELETE /v1/workflows/:id`
+
+Cancels the run, cancels every task it started, and returns the run as `cancelled`.
+An already terminal run is returned unchanged.
+
+### `POST /v1/workflows/:id/resume`
+
+Reads `<state dir>/workflows/<id>.jsonl`, restores the steps that completed with their
+outputs and attempt counts, and schedules the rest. Returns `202` with the restarted run.
+`409 workflow_active` when the run is still going, `404 unknown_workflow` when nothing is
+journaled under that id. The request takes no body and needs no `content-type`.
+
+### `GET /v1/pressure`
+
+The host reading, with a verdict a caller can act on:
+
+```json
+{ "verdict": "ok", "reasons": [],
+  "memory": { "pressureLevel": "normal", "freePercent": 47 },
+  "swap": { "usedBytes": 955451965, "totalBytes": 2147483648, "usedPercent": 44 },
+  "thermal": { "speedLimitPercent": null },
+  "temperatureC": null,
+  "temperatureReason": "macOS exposes no unprivileged CPU temperature; powermetrics needs root",
+  "sampledAt": "2026-10-25T11:23:38.461Z",
+  "guard": { "enabled": true, "stopsAt": "critical" } }
+```
+
+`verdict` is `critical` when the kernel reports critical memory pressure (`vm.memory_pressure`),
+less than 4% of memory is free (`kern.memorystatus_level`), swap is at least 90% used
+(`vm.swapusage`), or the CPU is throttled below 40% of its speed (`pmset -g therm`); `warn` uses
+the softer readings (kernel warning, 12% free, 70% swap, 75% throttled); otherwise `ok`.
+`reasons` names the reading that decided it. Every signal is `null` when the host cannot report
+it, so a missing probe never fails the call.
+
+`POST /v1/workflows` returns `503 device_pressure` with this body while the verdict is
+`critical`. `temperatureC` is null on Apple Silicon; `thermal.speedLimitPercent` is null when
+macOS has recorded no throttle.
+
+### `POST /v1/pressure/kill`
+
+Stops every active run now, whether or not the verdict is critical, and keeps each journal so
+`resume` can continue it. Takes no body. Returns
+`{ "killed": ["wf-..."], "reason": "device_pressure: ...", "pressure": { ... } }`. A stopped
+run is `cancelled` with `device_pressure:` at the start of its `error`.
+
 ### `POST /v1/admin/reload`
 
 Reloads the registry from disk without dropping in-memory tasks. Requires the token and is
@@ -137,23 +252,26 @@ An invalid registry returns `400 configuration_error` and keeps the running regi
 
 ## Status values
 
-`queued`, `running`, `completed`, `failed`, `timed_out`, `cancelled`.
+Tasks: `queued`, `running`, `completed`, `failed`, `timed_out`, `cancelled`.
+
+Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow steps:
+`pending`, `running`, `completed`, `failed`, `skipped`, `cancelled`.
 
 ## Error responses
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
-| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_input`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error` | Malformed request or registry. |
+| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_input`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error`, and the workflow validation codes listed under `POST /v1/workflows` | Malformed request or registry. |
 | 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route. |
 | 403 | `forbidden`, `origin_not_allowed`, `delegation_not_allowed` | Admin route called from a non-loopback address; request from a browser origin not in `AGENT_RELAY_ALLOWED_ORIGINS`; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
-| 404 | `unknown_agent`, `unknown_task`, `not_found` | Missing agent/task/route. |
+| 404 | `unknown_agent`, `unknown_task`, `unknown_workflow`, `not_found` | Missing agent/task/run/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
-| 409 | `idempotency_conflict`, `delegation_cycle`, `delegation_depth_exceeded` | `requestId` reused with different fields; target already in the delegation chain; chain too deep. |
+| 409 | `idempotency_conflict`, `workflow_active`, `delegation_cycle`, `delegation_depth_exceeded` | `requestId` reused with different fields; resume requested while the run is still going; target already in the delegation chain; chain too deep. |
 | 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
-| 415 | `unsupported_media_type` | `POST /v1/tasks` without `content-type: application/json`. |
+| 415 | `unsupported_media_type` | `POST /v1/tasks` or `POST /v1/workflows` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
-| 503 | `task_capacity_reached` | Store full of non-terminal tasks. |
+| 503 | `task_capacity_reached`, `device_pressure` | Store full of non-terminal tasks; or a workflow submission while the host verdict is `critical`, with the reading attached. |
 
 ### Task errors
 
@@ -172,7 +290,7 @@ A task whose time runs out while the relay is still locating git metadata ends `
 The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
 - `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo }`
-- `tools/list` → the six tools below
+- `tools/list` → the twelve tools below
 - `ping`
 - `tools/call`
 
@@ -184,6 +302,12 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | `get_task` | `{ taskId, includeInput? }` | Current task. With `includeInput: true` it also carries `input`. |
 | `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
 | `cancel_task` | `{ taskId }` | Cancelled task. |
+| `run_workflow` | `{ spec, waitMs? }` | Submitted run; with `waitMs`, the terminal run, or the current run with `waitExpired: true` if the wait elapses first. `spec` is the workflow document itself, typed with the full step schema in `tools/list`. |
+| `get_workflow` | `{ workflowId, maxWaitMs? }` | The run with every step and its output; with `maxWaitMs`, the terminal run, or the current run with `waitExpired: true`. |
+| `list_workflows` | `{ sessionId?, status?, limit? }` | `{ workflows: [...] }`. |
+| `cancel_workflow` | `{ workflowId }` | Cancelled run. |
+| `resume_workflow` | `{ workflowId, waitMs? }` | Restarted run; with `waitMs`, the terminal run. |
+| `get_pressure` | `{}` | The host reading, same payload as `GET /v1/pressure`. |
 
 Each result is returned as `content: [{ type: "text", text: "<json>" }]` plus
 `structuredContent` holding the same object. Relay errors come back as `isError: true`
@@ -218,3 +342,38 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `error` | failure/timeout | Failure reason. |
 | `outputTruncated` | on truncation | True when output hit the byte limit. |
 | `cancellation` | cancelled while running | `process_signal` (adapter process group signalled) or `request_only` (HTTP request not aborted). |
+
+## Workflow object fields
+
+| Field | When | Notes |
+| --- | --- | --- |
+| `id` | always | `wf-` plus 32 hex characters. |
+| `name` | always | Submitted name, else `workflow`. |
+| `status` | always | Workflow status values. |
+| `sessionId` | always | Shared by every task the run starts. |
+| `createdAt` / `startedAt` / `finishedAt` | as applicable | ISO-8601; `startedAt` and `finishedAt` are null until reached. |
+| `spec` | single run only | The document as submitted, without the internal dependency closure. |
+| `error` | failed/cancelled | Names the first step that did not succeed. |
+| `steps[].id` / `agentId` / `needs` | always | As submitted. |
+| `steps[].status` | always | Step status values. |
+| `steps[].attempts` | always | How many times the step has run, restored from the journal on resume. |
+| `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
+| `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
+| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `task_evicted_from_the_relay_store`, an adapter error, or a rejected submission message. |
+
+## Workflow journals
+
+Each run appends to `<state dir>/workflows/<id>.jsonl`, one JSON object per line:
+
+```jsonl
+{"type":"created","at":"ISO-8601","spec":{...}}
+{"type":"step","at":"ISO-8601","step":"write","status":"completed","output":"...","attempts":1}
+{"type":"resumed","at":"ISO-8601"}
+{"type":"finished","at":"ISO-8601","status":"completed"}
+```
+
+Replay takes the `created` document and the **last** `step` record per step id, so a
+resumed run's later result wins. `resume` works after a restart because nothing else
+survives: tasks live in memory only. The journal records prompts and outputs, so treat it as
+task content. Journaling is best effort — an unwritable state directory disables resume for
+that run but never fails the run.

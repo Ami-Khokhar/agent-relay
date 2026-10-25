@@ -547,10 +547,13 @@ class DeployedRevisionTests(unittest.TestCase):
 
     @staticmethod
     def _checkout(tmp):
-        """A git checkout holding a copy of server.py, with a fixed commit date."""
+        """A git checkout holding the relay's modules, with a fixed commit date."""
         repo = init_repo(os.path.join(tmp, "checkout"), commits=0)
         os.makedirs(os.path.join(repo, "src"))
-        shutil.copy(SERVER, os.path.join(repo, "src", "server.py"))
+        source = os.path.dirname(SERVER)
+        for name in sorted(os.listdir(source)):
+            if name.endswith(".py"):
+                shutil.copy(os.path.join(source, name), os.path.join(repo, "src", name))
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
                "GIT_COMMITTER_DATE": REVISION_DATE}
@@ -653,7 +656,10 @@ class DeployedRevisionTests(unittest.TestCase):
     def test_a_relay_outside_a_git_checkout_still_starts_and_reports_unknown(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "src"))
-            shutil.copy(SERVER, os.path.join(tmp, "src", "server.py"))
+            source = os.path.dirname(SERVER)
+            for name in sorted(os.listdir(source)):
+                if name.endswith(".py"):
+                    shutil.copy(os.path.join(source, name), os.path.join(tmp, "src", name))
             relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]},
                           server=os.path.join(tmp, "src", "server.py"))
             try:

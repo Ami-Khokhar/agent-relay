@@ -36,11 +36,13 @@ Use it when the user wants to:
 - have one coding agent delegate a task to a different coding agent or harness;
 - run the same job on several agents and compare results;
 - chain agents (A writes → B reviews → C fixes);
+- declare that chain once, as a workflow the relay runs and can resume after a failure;
 - delegate implementation work to pi, Codex, OpenCode, or Claude Code instead of
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
 - give an MCP client the tools `list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`.
+  `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`, `list_workflows`,
+  `cancel_workflow`, `resume_workflow`, `get_pressure`.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
 `PATH` and can run the task: the relay adds task IDs, status, timeouts,
@@ -230,6 +232,15 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 - `get_task { taskId, includeInput? }` → current task state and result.
 - `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
 - `cancel_task { taskId }` → cancel a queued or running task.
+- `run_workflow { spec, waitMs? }` → submit a whole multi-step run; `spec` is the workflow
+  document, and `tools/list` types its steps, so you can author one from the schema.
+- `get_workflow { workflowId, maxWaitMs? }` → the run with every step and its output.
+- `list_workflows { sessionId?, status?, limit? }` → stored runs, most recent first.
+- `cancel_workflow { workflowId }` → cancel the run and every task it started.
+- `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
+  that already completed.
+- `get_pressure {}` → the host reading: `verdict` (`ok`, `warn`, `critical`), `reasons`,
+  memory, swap, and any thermal throttle. Call it before a long run.
 
 Task objects leave out `input` and carry `inputChars` (its length) instead, because you
 already hold the prompt you sent. Pass `includeInput: true` to `get_task` (or
@@ -344,6 +355,51 @@ native harness session, and each task is a fresh invocation.
 Idempotency: send a unique `requestId`; reusing it with the same fields returns the
 original task (`200`), while reusing it with different fields returns `409`. Use it when a
 submission response may have been lost. Without a `requestId`, do not auto-retry.
+
+## Workflow lifecycle
+
+A workflow document names steps; each step is an ordinary task on one registered agent, and
+`needs` wires them together. The relay starts a step only once every step it needs has
+completed. Statuses: `queued` → `running` → one of `completed`, `failed`, `cancelled`. A
+step moves `pending` → `running` → one of `completed`, `failed`, `skipped`, `cancelled`,
+where `skipped` means a step it depended on did not succeed.
+
+```
+{"name": "review-loop", "steps": [
+  {"id": "write",  "agentId": "claude", "input": "Fix the failing test"},
+  {"id": "review", "agentId": "codex",  "needs": ["write"],
+   "input": "Review this change and report findings:\n\n{{write.output}}"},
+  {"id": "prove",  "agentId": "claude", "needs": ["review"],
+   "input": "Address the review of:\n\n{{write.output}}"}]}
+```
+
+Inputs are templates. `{{stepId.output}}` (or bare `{{stepId}}`) resolves against a step in
+that step's transitive `needs`; `{{item}}` and `{{index}}` resolve against a `foreach`
+expansion. A `foreach` step's own `{{stepId.output}}` reads as a JSON array of its item
+outputs. A reference to a step that is not an ancestor is refused at submit time, so a run
+cannot read a sibling that has not finished.
+
+`foreach` fans one step into N tasks, `retries` absorbs task failures (`0`–`5`), and `repeat`
+with `untilOutputMatches` loops until the output matches a regular expression, failing with
+`repeat_limit_reached` when `max` is spent. `DELETE /v1/workflows/:id` cancels the run and
+every task it started. A run that does not finish inside `waitMs` returns the same
+`waitExpired` shape a task wait does.
+
+Runs journal to `<state dir>/workflows/<id>.jsonl` (`AGENT_RELAY_STATE_DIR`, default
+`~/.local/state/agent-relay`), so `POST /v1/workflows/:id/resume` (MCP `resume_workflow`)
+continues a failed or interrupted run without repeating the steps that already completed.
+The journal holds the prompts and results, so treat it as task content. Full endpoint and
+object reference: [references/api.md](references/api.md).
+
+**Host pressure.** `GET /v1/pressure` (MCP `get_pressure`) reports a `verdict` of `ok`,
+`warn`, or `critical` from the kernel's memory pressure, free memory, swap, and any CPU
+thermal throttle. Check it before a long run: `POST /v1/workflows` refuses with
+`503 device_pressure` while the verdict is `critical`, and the relay's guard stops active
+runs if the machine becomes critical mid-run. `POST /v1/pressure/kill` is the same stop on
+demand. A stopped run says `device_pressure:` at the start of its `error` and
+`resume_workflow` continues it from the last step that finished, so only the step that was
+running is repeated. CPU temperature is not readable without root on Apple Silicon; the
+reading says so instead of guessing.
 
 ## Designing for the user's use case
 

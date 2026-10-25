@@ -19,6 +19,36 @@ background) uses a `maxWaitMs` of about 110000 or less. The relay refuses a wait
 `A2A_RELAY_MAX_WAIT_MS` (default 600000); the MCP `wait_task` and `delegate` cut it to that
 limit.
 
+## Chain a known shape as one workflow
+
+Patterns 2, 3, and 4 below all describe the same shape: several agents, one after another,
+each reading the previous output. When that shape is known before you start, submit it once
+instead of holding the state in your own context, where a context reset loses it:
+
+```json
+{"name": "review-loop", "steps": [
+  {"id": "write",  "agentId": "claude", "input": "Fix the failing test"},
+  {"id": "review", "agentId": "codex",  "needs": ["write"],
+   "input": "Review this change and report findings:\n\n{{write.output}}"},
+  {"id": "prove",  "agentId": "claude", "needs": ["review"],
+   "input": "Address the review of:\n\n{{write.output}}"}]}
+```
+
+- `POST /v1/workflows` (MCP `run_workflow`) starts it; `GET /v1/workflows/:id?waitMs=<ms>`
+  (MCP `get_workflow` with `maxWaitMs`) waits for it. Waits behave like task waits: keep
+  them short and call again while the result carries `waitExpired: true`.
+- Steps with no `needs` start together, steps that share a dependency start together, and
+  everything still queues behind `A2A_RELAY_MAX_ACTIVE`.
+- A step whose dependency did not succeed is `skipped` and the run fails, so a broken
+  review never reaches the fix step.
+- `foreach` turns one step into N tasks (pattern 2), `retries` absorbs a transient failure,
+  and `repeat` with `untilOutputMatches` is the capped loop of pattern 4.
+- The run is journaled, so after a failure or a relay restart `resume_workflow` continues it
+  without repeating steps that already finished.
+
+Reach for the step-by-step patterns below when the next agent to call is decided by what the
+last one returned — the shape is genuinely dynamic, not just long.
+
 ## 1. Single delegation
 
 The user wants agent A to do a job on agent B.
@@ -81,8 +111,9 @@ Two harnesses checking each other:
 
 - B reviews A's change and returns findings.
 - Feed findings back to A as a new task (new `requestId`, same `sessionId`).
-- Repeat until findings are empty or a max round count is hit. Cap the rounds; there is no
-  built-in loop.
+- Repeat until findings are empty or a max round count is hit, and cap the rounds. A
+  `repeat` step does the capping inside the relay when the stop condition is a regular
+  expression over the output; do it in the caller when judging "empty" needs a model.
 
 ## 5. Wrap a harness that has no convenient CLI
 
@@ -97,9 +128,11 @@ If the harness exposes only an API or needs structured output:
 
 Add the MCP server to the client's config and start the HTTP service alongside it (or let
 the MCP process start it on demand). The client then sees `list_agents`, `delegate`,
-`wait_task`, `get_task`, `list_tasks`, `cancel_task`. Because submission is asynchronous,
-use `wait_task` (or `delegate` with `waitMs`) to block until the result is ready. Use a wait
-of about 110000 ms or less, and wait again while the result has `waitExpired: true`.
+`wait_task`, `get_task`, `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`,
+`list_workflows`, `cancel_workflow`, and `resume_workflow`. Because submission is
+asynchronous, use `wait_task` (or `delegate` with `waitMs`, or `get_workflow` with
+`maxWaitMs`) to block until the result is ready. Use a wait of about 110000 ms or less, and
+wait again while the result has `waitExpired: true`.
 
 ## Choosing limits
 

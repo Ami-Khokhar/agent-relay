@@ -27,6 +27,9 @@ from pathlib import Path
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlsplit
 
+import pressure
+from workflows import WORKFLOW_STATUSES, WorkflowEngine
+
 ADAPTER_PROTOCOL = "relay.adapter/v1"
 INHERITED_ENV = (
     "PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "LC_ALL",
@@ -104,6 +107,18 @@ MAX_TASKS = _positive_int(1000, "AGENT_RELAY_MAX_TASKS", "A2A_RELAY_MAX_TASKS")
 MAX_ACTIVE = _positive_int(4, "AGENT_RELAY_MAX_ACTIVE", "A2A_RELAY_MAX_ACTIVE")
 MAX_COMMAND_INPUT = _positive_int(65_536, "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES",
                                   "A2A_RELAY_MAX_COMMAND_INPUT_BYTES")
+# Workflow documents: how many steps a run may declare, and how wide a foreach may fan out.
+MAX_STEPS = _positive_int(64, "AGENT_RELAY_MAX_STEPS", "A2A_RELAY_MAX_STEPS")
+MAX_FOREACH = _positive_int(32, "AGENT_RELAY_MAX_FOREACH", "A2A_RELAY_MAX_FOREACH")
+# Workflow journals are state, not configuration: they live beside relay.log, not beside the token.
+STATE_DIR = Path(_env("AGENT_RELAY_STATE_DIR", "A2A_RELAY_STATE_DIR")
+                 or Path.home() / ".local" / "state" / "agent-relay")
+# Device pressure: stop active runs when the host reaches critical, checking this often. The
+# guard decides nothing on an idle relay, so an unused relay never shells out to probe.
+PRESSURE_GUARD = _env("AGENT_RELAY_PRESSURE_GUARD", "A2A_RELAY_PRESSURE_GUARD",
+                      default="1").lower() not in ("0", "false", "no", "off")
+PRESSURE_INTERVAL_MS = _positive_int(5000, "AGENT_RELAY_PRESSURE_INTERVAL_MS",
+                                     "A2A_RELAY_PRESSURE_INTERVAL_MS")
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
@@ -1087,6 +1102,24 @@ def _purge_periodically():
             _purge_expired()
 
 
+def _pressure_guard():
+    """Stop active runs when the host reaches critical pressure. An idle relay never probes."""
+    while not SHUTTING_DOWN:
+        time.sleep(PRESSURE_INTERVAL_MS / 1000.0)
+        try:
+            if not WORKFLOW_ENGINE.active_ids():
+                continue
+            reading = pressure.snapshot()
+            if reading["verdict"] != "critical":
+                continue
+            killed = WORKFLOW_ENGINE.kill_all(
+                "device_pressure: " + "; ".join(reading["reasons"]))
+            if killed:
+                print(f"device pressure critical: stopped {len(killed)} workflow run(s); "
+                      f"resume them when the machine recovers", flush=True)
+        except Exception as exc:  # noqa: BLE001 - the guard must never take the relay down
+            print(f"pressure guard error: {exc}", file=sys.stderr, flush=True)
+
 
 def _make_room():
     if len(TASKS) < MAX_TASKS:
@@ -1256,6 +1289,8 @@ def _limits():
         "maxTasks": MAX_TASKS,
         "taskRetentionMs": TASK_RETENTION_MS or None,
         "maxActive": MAX_ACTIVE,
+        "maxSteps": MAX_STEPS,
+        "maxForEach": MAX_FOREACH,
         "maxDelegationDepth": MAX_DELEGATION_DEPTH,
         "maxDelegatedTasks": MAX_DELEGATED_TASKS,
     }
@@ -1351,7 +1386,8 @@ def _wait_for_terminal(task_id, wait_ms):
 def _create_task(request):
     """Validate one task request and enqueue it. Returns ``(status, body)``.
 
-    Called by ``POST /v1/tasks``, so every task request is validated in one place.
+    Shared by ``POST /v1/tasks`` and the workflow engine, so both paths apply exactly the
+    same field, agent, option, cwd, timeout, delegation, and idempotency rules.
     """
     if not isinstance(request, dict):
         return 400, {"error": "invalid_request"}
@@ -1478,7 +1514,7 @@ def cancel_task(task):
     """Cancel a queued or running task in place and return it. ``None`` stays ``None``.
 
     A running task keeps its active slot until its worker returns, so the relay never runs
-    more than MAX_ACTIVE adapters at once.
+    more than MAX_ACTIVE adapters at once; the workflow engine relies on that too.
     """
     if task is None:
         return None
@@ -1498,6 +1534,29 @@ def cancel_task(task):
             TASK_CONDITION.notify_all()
     return task
 
+
+def lookup_task(task_id):
+    with LOCK:
+        return TASKS.get(task_id)
+
+
+WORKFLOW_ENGINE = WorkflowEngine(
+    lock=LOCK,
+    condition=TASK_CONDITION,
+    create_task=_create_task,
+    get_task=lookup_task,
+    cancel_task=cancel_task,
+    drain=_drain,
+    agents=lambda: AGENTS,
+    resolve_cwd=_resolve_task_cwd,
+    state_dir=STATE_DIR,
+    max_steps=MAX_STEPS,
+    max_foreach=MAX_FOREACH,
+    max_body=MAX_BODY,
+    max_command_input=MAX_COMMAND_INPUT,
+    max_timeout_ms=MAX_TIMEOUT_MS,
+    now=now_iso,
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1576,9 +1635,36 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self._list(query)
                 return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/pressure":
+                if method == "GET":
+                    return self._json(200, pressure.snapshot())
+                return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/pressure/kill":
+                if method == "POST":
+                    return self._kill_workflows()
+                return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/workflows":
+                if method == "POST":
+                    return self._submit_workflow()
+                if method == "GET":
+                    return self._list_workflows(query)
+                return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/admin/reload":
                 if method == "POST":
                     return self._reload()
+                return self._json(405, {"error": "method_not_allowed"})
+            match = re.fullmatch(r"/v1/workflows/([^/]+)/resume", path)
+            if match:
+                if method == "POST":
+                    return self._resume_workflow(match.group(1))
+                return self._json(405, {"error": "method_not_allowed"})
+            match = re.fullmatch(r"/v1/workflows/([^/]+)", path)
+            if match:
+                workflow_id = match.group(1)
+                if method == "GET":
+                    return self._get_workflow(workflow_id, query)
+                if method == "DELETE":
+                    return self._delete_workflow(workflow_id)
                 return self._json(405, {"error": "method_not_allowed"})
             match = re.fullmatch(r"/v1/tasks/([^/]+)", path)
             if match:
@@ -1683,6 +1769,100 @@ class Handler(BaseHTTPRequestHandler):
         limit = min(limit, MAX_TASKS)
         return self._json(200, {"tasks": _list_tasks(session_id, status, limit)})
 
+    def _submit_workflow(self):
+        error, spec = self._read_json_body()
+        if error:
+            return self._json(error, spec)
+        # Refuse before anything runs: a caller that learns this afterwards holds a run ID for
+        # work already loading a machine that cannot take it.
+        refusal = pressure.should_refuse(pressure.snapshot())
+        if refusal:
+            return self._json(503, refusal)
+        # The engine drains from its own scheduling thread once it has launched a step.
+        status, body = WORKFLOW_ENGINE.submit(spec)
+        self._json(status, body)
+
+    def _kill_workflows(self):
+        """The kill button: stop every active run now, keeping each journal for a resume."""
+        # Consume any body so a keep-alive connection stays in sync; the button takes no input.
+        self._read_json_body(document=False)
+        reading = pressure.snapshot()
+        detail = f" ({'; '.join(reading['reasons'])})" if reading["reasons"] else ""
+        # Say that a human asked, not that the guard fired: the verdict here may be only ok.
+        reason = (f"device_pressure: stopped on request while the verdict was "
+                  f"{reading['verdict']}{detail}")
+        killed = WORKFLOW_ENGINE.kill_all(reason)
+        self._json(200, {"killed": killed, "reason": reason, "pressure": reading})
+
+    def _list_workflows(self, query):
+        session_id = query.get("sessionId", [None])[0]
+        status = query.get("status", [None])[0]
+        if session_id is not None and not _valid(session_id):
+            return self._json(400, {"error": "invalid_session_id"})
+        if status is not None and status not in WORKFLOW_STATUSES:
+            return self._json(400, {"error": "invalid_status"})
+        limit = 100
+        limit_raw = query.get("limit", [None])[0]
+        if limit_raw is not None:
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                return self._json(400, {"error": "invalid_limit"})
+            if limit <= 0:
+                return self._json(400, {"error": "invalid_limit"})
+        limit = min(limit, MAX_TASKS)
+        return self._json(200, {"workflows": WORKFLOW_ENGINE.list(session_id, status, limit)})
+
+    def _get_workflow(self, workflow_id, query):
+        wait_raw = query.get("waitMs", [None])[0]
+        if wait_raw is None:
+            return self._workflow_response(workflow_id)
+        try:
+            wait_ms = int(wait_raw)
+        except ValueError:
+            return self._json(400, _invalid_wait())
+        if not _is_valid_wait(wait_ms):
+            return self._json(400, _invalid_wait())
+        if WORKFLOW_ENGINE.wait(workflow_id, wait_ms) is None:
+            return self._workflow_not_found(workflow_id)
+        view = WORKFLOW_ENGINE.public(workflow_id, detail=True)
+        if view is None:
+            return self._workflow_not_found(workflow_id)
+        if view["status"] in ("queued", "running"):
+            # Say that the wait ended, so a caller need not compare status strings.
+            view.update(waitExpired=True, waitedMs=wait_ms,
+                        hint="The wait expired before the run finished. Call get_workflow again "
+                             "with the same workflowId, or repeat this request.")
+        return self._json(200, view)
+
+    def _workflow_response(self, workflow_id):
+        view = WORKFLOW_ENGINE.public(workflow_id, detail=True)
+        if view is None:
+            return self._workflow_not_found(workflow_id)
+        return self._json(200, view)
+
+    def _workflow_not_found(self, workflow_id):
+        if WORKFLOW_ENGINE.journaled(workflow_id):
+            return self._json(404, {
+                "error": "unknown_workflow",
+                "message": f"The run is not active; POST /v1/workflows/{workflow_id}/resume"
+                           f" to continue it from its journal"})
+        return self._json(404, {"error": "unknown_workflow"})
+
+    def _delete_workflow(self, workflow_id):
+        view = WORKFLOW_ENGINE.cancel(workflow_id)
+        if view is None:
+            return self._workflow_not_found(workflow_id)
+        self._json(200, view)
+        _drain()
+
+    def _resume_workflow(self, workflow_id):
+        # Resume takes no document, but the body is still read so a keep-alive connection
+        # stays in sync for the next request on it.
+        self._read_json_body(document=False)
+        status, body = WORKFLOW_ENGINE.resume(workflow_id)
+        self._json(status, body)
+
     def _reload(self):
         if not is_loopback(self.client_address[0]):
             return self._json(403, {"error": "forbidden"})
@@ -1742,6 +1922,8 @@ def main():
     REVISION = deployed_revision(str(Path(__file__).resolve().parent.parent))
     if TASK_RETENTION_MS:
         threading.Thread(target=_purge_periodically, daemon=True).start()
+    if PRESSURE_GUARD:
+        threading.Thread(target=_pressure_guard, daemon=True).start()
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     if hasattr(signal, "SIGHUP"):
