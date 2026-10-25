@@ -238,6 +238,7 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 - `cancel_workflow { workflowId }` → cancel the run and every task it started.
 - `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
   that already completed.
+- `get_pressure {}` → the host reading: `verdict` (`ok`, `warn`, `critical`), `reasons`,
   memory, swap, and any thermal throttle. Call it before a long run.
 
 Task objects leave out `input` and carry `inputChars` (its length) instead, because you
@@ -382,6 +383,17 @@ with `untilOutputMatches` loops until the output matches a regular expression, f
 `repeat_limit_reached` when `max` is spent. `DELETE /v1/workflows/:id` cancels the run and
 every task it started. A run that does not finish inside `waitMs` returns the same
 `waitExpired` shape a task wait does.
+
+**Host pressure.** `GET /v1/pressure` reads what this machine can tell you without root: the
+kernel's memory-pressure level, free-memory percentage, swap in use, and any thermal speed limit.
+It returns a `verdict` of `ok`, `warn` or `critical` with the `reasons` behind it, and
+`temperatureC` is null because `powermetrics` needs root. A `critical` verdict refuses a new
+workflow with `503 device_pressure`, and while a run is active the relay re-reads the host every
+`AGENT_RELAY_PRESSURE_INTERVAL_MS` (default 5000) and stops every active run if it turns critical.
+`POST /v1/pressure/kill` is the same stop on demand. A stopped run is `cancelled` with `error`
+starting `device_pressure:` and keeps its journal, so `POST /v1/workflows/:id/resume` continues it
+without repeating the steps that finished. `AGENT_RELAY_PRESSURE_GUARD=0` turns the automatic stop
+off and leaves the endpoints in place.
 
 Runs journal to `<state dir>/workflows/<id>.jsonl` (`AGENT_RELAY_STATE_DIR`, default
 `~/.local/state/agent-relay`), so `POST /v1/workflows/:id/resume` continues a failed or interrupted run without

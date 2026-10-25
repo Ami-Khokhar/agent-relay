@@ -27,6 +27,7 @@ from pathlib import Path
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlsplit
 
+import pressure
 from workflows import WORKFLOW_STATUSES, WorkflowEngine
 
 ADAPTER_PROTOCOL = "relay.adapter/v1"
@@ -114,6 +115,12 @@ MAX_FOREACH = _positive_int(32, "AGENT_RELAY_MAX_FOREACH", "A2A_RELAY_MAX_FOREAC
 # Workflow journals are state, not configuration: they live beside relay.log, not beside the token.
 STATE_DIR = Path(_env("AGENT_RELAY_STATE_DIR", "A2A_RELAY_STATE_DIR")
                  or Path.home() / ".local" / "state" / "agent-relay")
+# Device pressure: stop active runs when the host reaches critical, checking this often. The
+# guard decides nothing on an idle relay, so an unused relay never shells out to probe.
+PRESSURE_GUARD = _env("AGENT_RELAY_PRESSURE_GUARD", "A2A_RELAY_PRESSURE_GUARD",
+                      default="1").lower() not in ("0", "false", "no", "off")
+PRESSURE_INTERVAL_MS = _positive_int(5000, "AGENT_RELAY_PRESSURE_INTERVAL_MS",
+                                     "A2A_RELAY_PRESSURE_INTERVAL_MS")
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
@@ -1098,6 +1105,25 @@ def _purge_periodically():
 
 
 
+def _pressure_guard():
+    """Stop active runs when the host reaches critical pressure. An idle relay never probes."""
+    while not SHUTTING_DOWN:
+        time.sleep(PRESSURE_INTERVAL_MS / 1000.0)
+        try:
+            if not WORKFLOW_ENGINE.active_ids():
+                continue
+            reading = pressure.snapshot()
+            if reading["verdict"] != "critical":
+                continue
+            killed = WORKFLOW_ENGINE.kill_all(
+                "device_pressure: " + "; ".join(reading["reasons"]))
+            if killed:
+                print(f"device pressure critical: stopped {len(killed)} workflow run(s); "
+                      f"resume them when the machine recovers", flush=True)
+        except Exception as exc:  # noqa: BLE001 - the guard must never take the relay down
+            print(f"pressure guard error: {exc}", file=sys.stderr, flush=True)
+
+
 def _make_room():
     if len(TASKS) < MAX_TASKS:
         return True
@@ -1614,6 +1640,14 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self._list(query)
                 return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/pressure":
+                if method == "GET":
+                    return self._json(200, pressure.snapshot())
+                return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/pressure/kill":
+                if method == "POST":
+                    return self._kill_workflows()
+                return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/workflows":
                 if method == "POST":
                     return self._submit_workflow()
@@ -1744,9 +1778,23 @@ class Handler(BaseHTTPRequestHandler):
         error, spec = self._read_json_body()
         if error:
             return self._json(error, spec)
-        # The engine drains from its own scheduling thread once it has launched a step.
-        status, body = WORKFLOW_ENGINE.submit(spec)
+        # The engine asks this only when the submission would create a new run, so replaying a
+        # requestId still returns the run that exists rather than a refusal that loses its id.
+        status, body = WORKFLOW_ENGINE.submit(
+            spec, refusal=lambda: pressure.should_refuse(pressure.snapshot()))
         self._json(status, body)
+
+    def _kill_workflows(self):
+        """The kill button: stop every active run now, keeping each journal for a resume."""
+        # Consume any body so a keep-alive connection stays in sync; the button takes no input.
+        self._read_json_body(document=False)
+        reading = pressure.snapshot()
+        detail = f" ({'; '.join(reading['reasons'])})" if reading["reasons"] else ""
+        # Say that a human asked, not that the guard fired: the verdict here may be only ok.
+        reason = (f"device_pressure: stopped on request while the verdict was "
+                  f"{reading['verdict']}{detail}")
+        killed = WORKFLOW_ENGINE.kill_all(reason)
+        self._json(200, {"killed": killed, "reason": reason, "pressure": reading})
 
     def _list_workflows(self, query):
         session_id = query.get("sessionId", [None])[0]
@@ -1876,6 +1924,8 @@ def main():
     REVISION = deployed_revision(str(Path(__file__).resolve().parent.parent))
     if TASK_RETENTION_MS:
         threading.Thread(target=_purge_periodically, daemon=True).start()
+    if PRESSURE_GUARD:
+        threading.Thread(target=_pressure_guard, daemon=True).start()
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     if hasattr(signal, "SIGHUP"):
