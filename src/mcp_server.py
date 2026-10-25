@@ -21,6 +21,7 @@ from urllib import request as urlrequest
 from urllib.parse import quote, urlencode, urlsplit
 
 STATUSES = ("queued", "running", "completed", "failed", "timed_out", "cancelled")
+WORKFLOW_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 FALSE_VALUES = ("0", "false", "no", "off")
 
 
@@ -56,6 +57,85 @@ def _token():
         return path.read_text(encoding="utf-8").strip() or None
     except OSError:
         return None
+
+
+# The relay validates workflow documents itself. This schema exists so an agent authoring a
+# run can see the accepted shape from tools/list, without reading the HTTP reference.
+WORKFLOW_SPEC = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["steps"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 128,
+                 "description": "Label for the run. Defaults to \"workflow\"."},
+        "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
+                      "description": "Correlation tag passed to every task the run starts. "
+                                     "Defaults to the run ID."},
+        "requestId": {"type": "string", "minLength": 1, "maxLength": 128,
+                      "description": "Idempotency key for the submission. Resend the same one "
+                                     "to get the existing run instead of starting a second."},
+        "steps": {
+            "type": "array", "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["id", "agentId", "input"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1, "maxLength": 128,
+                           "description": "Unique in the document. Other steps name it in needs "
+                                          "and read its result as {{id.output}}."},
+                    "agentId": {"type": "string", "minLength": 1, "maxLength": 128,
+                                "description": "ID of the target agent. Get valid IDs from "
+                                               "list_agents."},
+                    "input": {"type": "string", "minLength": 1,
+                              "description": "Full prompt for that agent. May contain "
+                                             "{{stepId.output}} for a step this one needs, and "
+                                             "{{item}} / {{index}} on a foreach step."},
+                    "needs": {"type": "array", "items": {"type": "string"},
+                              "description": "Step ids that must complete first. A step with no "
+                                             "needs starts immediately; the graph must be acyclic."},
+                    "foreach": {"type": "array", "minItems": 1,
+                                "items": {"type": "string", "minLength": 1, "maxLength": 1024},
+                                "description": "Run this step once per item, in parallel, with "
+                                               "{{item}} and {{index}} set. The step then yields a "
+                                               "JSON array of the per-item outputs."},
+                    "retries": {"type": "integer", "minimum": 0, "maximum": 5,
+                                "description": "Extra attempts after the task fails or times out."},
+                    "repeat": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["max", "untilOutputMatches"],
+                        "description": "Re-run until the output matches. Use for a review or fix "
+                                       "loop; not allowed with foreach.",
+                        "properties": {
+                            "max": {"type": "integer", "minimum": 1, "maximum": 10,
+                                    "description": "Attempts before the step fails with "
+                                                   "repeat_limit_reached."},
+                            "untilOutputMatches": {"type": "string", "minLength": 1,
+                                                   "description": "Python regular expression "
+                                                                  "tested against the output."},
+                        },
+                    },
+                    "timeoutMs": {"type": "integer", "minimum": 1,
+                                  "description": "Per-step timeout. Defaults to the agent's."},
+                    "cwd": {"type": "string", "minLength": 1,
+                            "description": "Per-step working directory, inside the agent's "
+                                           "allowedRoots."},
+                    "options": {"type": "object", "additionalProperties": {"type": "string"},
+                                "description": "Named options for that agent, exactly as for a "
+                                               "task submission, for example {\"effort\": "
+                                               "\"high\"}. list_agents shows the names and "
+                                               "values each agent allows; the step fails with "
+                                               "unknown_option if you invent one."},
+                    "readOnly": {"type": "boolean",
+                                 "description": "Run that step read-only, exactly as for a task "
+                                                "submission. An agent whose list_agents entry "
+                                                "does not show readOnly: supported fails the "
+                                                "step with read_only_unsupported."},
+                },
+            },
+        },
+    },
+}
 
 
 TOOLS = [
@@ -147,6 +227,73 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     },
+    {
+        "name": "run_workflow",
+        "description": "Submit a whole multi-agent workflow in one call: named steps, each bound to a registered agent, wired together with needs. Use this instead of calling delegate repeatedly when you already know the shape of the work: a pipeline (A writes, B reviews, C fixes), a fan-out over several items, or a review loop. The relay starts a step only once every step it needs has completed, threads each output into the next prompt, and owns the queue, timeouts, cancellation, and retries. A step whose dependency did not succeed is skipped and the run fails, so a broken review never reaches the fix step. The relay refuses the run with device_pressure while this machine is under critical host pressure, so call get_pressure first when the run will be long. Returns the run with every step's status; pass waitMs to block until it finishes. Get valid agentId values from list_agents first. The spec schema in tools/list describes every step field.",
+        "inputSchema": {
+            "type": "object", "required": ["spec"], "additionalProperties": False,
+            "properties": {
+                "spec": WORKFLOW_SPEC,
+                "waitMs": {"type": "integer", "minimum": 1,
+                           "description": "Maximum time, in milliseconds, that this call waits for the run to reach a terminal state. If the run is still going when the wait ends, the result carries waitExpired: true; then call get_workflow again with the same workflowId. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+            },
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+    },
+    {
+        "name": "get_workflow",
+        "description": "Get a workflow run with every step, its status, attempts, output, and error. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
+        "inputSchema": {
+            "type": "object", "required": ["workflowId"], "additionalProperties": False,
+            "properties": {
+                "workflowId": {"type": "string", "minLength": 1, "maxLength": 128,
+                               "description": "Run ID returned by run_workflow."},
+                "maxWaitMs": {"type": "integer", "minimum": 1,
+                              "description": "Maximum time, in milliseconds, to wait for the run to become terminal before returning its current state. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "list_workflows",
+        "description": "List stored workflow runs, most recent first, optionally filtered by session or status. Entries carry every step's status but omit the run's spec and each step's output; use get_workflow for one run in full. Use it to recover a workflowId after a context reset.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
+                              "description": "Filter to one session. Get the ID from a run_workflow result."},
+                "status": {"type": "string", "enum": list(WORKFLOW_STATUSES),
+                           "description": "Filter by workflow status."},
+                "limit": {"type": "integer", "minimum": 1,
+                          "description": "Maximum number of runs to return."},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "cancel_workflow",
+        "description": "Cancel a workflow run and every task it has started. Use it when the user changes their mind or a step is clearly stuck. Terminal runs are returned unchanged.",
+        "inputSchema": {
+            "type": "object", "required": ["workflowId"], "additionalProperties": False,
+            "properties": {"workflowId": {"type": "string", "minLength": 1, "maxLength": 128,
+                                          "description": "Run ID returned by run_workflow."}},
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+    },
+    {
+        "name": "resume_workflow",
+        "description": "Continue a workflow run from its journal after a failed or interrupted attempt, keeping every step that already completed and re-running only the rest. Use it when get_workflow reports that a run is no longer active, or after fixing whatever made a step fail. Pass waitMs to block until the run finishes again.",
+        "inputSchema": {
+            "type": "object", "required": ["workflowId"], "additionalProperties": False,
+            "properties": {
+                "workflowId": {"type": "string", "minLength": 1, "maxLength": 128,
+                               "description": "Run ID returned by run_workflow."},
+                "waitMs": {"type": "integer", "minimum": 1,
+                           "description": "Maximum time, in milliseconds, to wait for the resumed run to become terminal. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+            },
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+    },
 ]
 
 
@@ -203,6 +350,21 @@ def _relay_wait_limit(base_url, rejected, wait_ms):
 def _is_string_map(value):
     return isinstance(value, dict) and all(
         isinstance(name, str) and name and isinstance(item, str) for name, item in value.items())
+
+
+def _wait_workflow(base_url, workflow_id, wait_ms, timeout):
+    """Long-poll a run, clamping the wait to the relay's limit when it refuses the first one."""
+    path = "/v1/workflows/" + quote(workflow_id, safe="") + f"?waitMs={wait_ms}"
+    try:
+        return _relay_request(base_url, path, timeout=max(timeout, wait_ms / 1000.0 + 5))
+    except RelayError as exc:
+        limit = _relay_wait_limit(base_url, exc, wait_ms)
+        if limit is None:
+            raise
+        path = "/v1/workflows/" + quote(workflow_id, safe="") + f"?waitMs={limit}"
+        value = _relay_request(base_url, path, timeout=max(timeout, limit / 1000.0 + 5))
+        value.update(waitMs=limit, waitClamped=True)
+        return value
 
 
 def _arguments_for(rpc, allowed):
@@ -492,6 +654,63 @@ def create_http_handler(base_url=None, timeout=None):
                 _non_empty(args, "taskId", 128)
                 value = _relay_request(base_url, "/v1/tasks/" + quote(args["taskId"], safe=""),
                                        method="DELETE", timeout=timeout)
+            elif name == "run_workflow":
+                args = _arguments_for(rpc, ["spec", "waitMs"])
+                spec = args.get("spec")
+                if not isinstance(spec, dict):
+                    _invalid("spec must be an object")
+                if "waitMs" in args and not _is_positive_int(args["waitMs"]):
+                    _invalid("waitMs must be a positive integer")
+                value = _relay_request(base_url, "/v1/workflows", method="POST", body=spec,
+                                       timeout=timeout)
+                wait_ms = args.get("waitMs")
+                if wait_ms and value.get("status") in ("queued", "running"):
+                    value = _wait_workflow(base_url, value["id"], wait_ms, timeout)
+            elif name == "get_workflow":
+                args = _arguments_for(rpc, ["workflowId", "maxWaitMs"])
+                _non_empty(args, "workflowId", 128)
+                wait_ms = args.get("maxWaitMs")
+                if wait_ms is None:
+                    value = _relay_request(
+                        base_url, "/v1/workflows/" + quote(args["workflowId"], safe=""),
+                        timeout=timeout)
+                elif not _is_positive_int(wait_ms):
+                    _invalid("maxWaitMs must be a positive integer")
+                else:
+                    value = _wait_workflow(base_url, args["workflowId"], wait_ms, timeout)
+            elif name == "list_workflows":
+                args = _arguments_for(rpc, ["sessionId", "status", "limit"])
+                params = {}
+                if "sessionId" in args:
+                    _non_empty(args, "sessionId", 128)
+                    params["sessionId"] = args["sessionId"]
+                if "status" in args:
+                    if args["status"] not in WORKFLOW_STATUSES:
+                        _invalid(f"status must be one of {', '.join(WORKFLOW_STATUSES)}")
+                    params["status"] = args["status"]
+                if "limit" in args:
+                    if not _is_positive_int(args["limit"]):
+                        _invalid("limit must be a positive integer")
+                    params["limit"] = args["limit"]
+                path = "/v1/workflows" + (f"?{urlencode(params)}" if params else "")
+                value = _relay_request(base_url, path, timeout=timeout)
+            elif name == "cancel_workflow":
+                args = _arguments_for(rpc, ["workflowId"])
+                _non_empty(args, "workflowId", 128)
+                value = _relay_request(
+                    base_url, "/v1/workflows/" + quote(args["workflowId"], safe=""),
+                    method="DELETE", timeout=timeout)
+            elif name == "resume_workflow":
+                args = _arguments_for(rpc, ["workflowId", "waitMs"])
+                _non_empty(args, "workflowId", 128)
+                if "waitMs" in args and not _is_positive_int(args["waitMs"]):
+                    _invalid("waitMs must be a positive integer")
+                value = _relay_request(
+                    base_url, "/v1/workflows/" + quote(args["workflowId"], safe="") + "/resume",
+                    method="POST", timeout=timeout)
+                wait_ms = args.get("waitMs")
+                if wait_ms and value.get("status") in ("queued", "running"):
+                    value = _wait_workflow(base_url, args["workflowId"], wait_ms, timeout)
             else:
                 raise RpcError(-32602, f"Unknown tool: {name or ''}")
         except RpcError:

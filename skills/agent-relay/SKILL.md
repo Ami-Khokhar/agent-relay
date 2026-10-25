@@ -231,6 +231,13 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 - `get_task { taskId, includeInput? }` → current task state and result.
 - `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
 - `cancel_task { taskId }` → cancel a queued or running task.
+- `run_workflow { spec, waitMs? }` → submit a whole multi-step run; `spec` is the workflow
+  document, and `tools/list` types its steps, so you can author one from the schema.
+- `get_workflow { workflowId, maxWaitMs? }` → the run with every step and its output.
+- `list_workflows { sessionId?, status?, limit? }` → stored runs, most recent first.
+- `cancel_workflow { workflowId }` → cancel the run and every task it started.
+- `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
+  that already completed.
   memory, swap, and any thermal throttle. Call it before a long run.
 
 Task objects leave out `input` and carry `inputChars` (its length) instead, because you
