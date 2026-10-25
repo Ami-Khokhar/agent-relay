@@ -257,7 +257,7 @@ A task whose time runs out while the relay is still locating git metadata ends `
 The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
 - `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo }`
-- `tools/list` → the six tools below
+- `tools/list` → the eleven tools below
 - `ping`
 - `tools/call`
 
@@ -269,6 +269,11 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | `get_task` | `{ taskId, includeInput? }` | Current task. With `includeInput: true` it also carries `input`. |
 | `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
 | `cancel_task` | `{ taskId }` | Cancelled task. |
+| `run_workflow` | `{ spec, waitMs? }` | Submitted run; with `waitMs`, the terminal run, or the current run with `waitExpired: true` if the wait elapses first. `spec` is the workflow document itself, typed with the full step schema in `tools/list`. |
+| `get_workflow` | `{ workflowId, maxWaitMs? }` | The run with every step and its output; with `maxWaitMs`, the terminal run, or the current run with `waitExpired: true`. |
+| `list_workflows` | `{ sessionId?, status?, limit? }` | `{ workflows: [...] }`. |
+| `cancel_workflow` | `{ workflowId }` | Cancelled run. |
+| `resume_workflow` | `{ workflowId, waitMs? }` | Restarted run; with `waitMs`, the terminal run. |
 
 Each result is returned as `content: [{ type: "text", text: "<json>" }]` plus
 `structuredContent` holding the same object. Relay errors come back as `isError: true`
