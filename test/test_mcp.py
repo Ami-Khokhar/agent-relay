@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from relay_helpers import MCP_SERVER, PYTHON, ROOT, send_json, start_http_server, stop_http_server
 import mcp_server
+import workflows
 
 
 class FakeUpstream:
@@ -219,6 +220,68 @@ class McpHandlerTests(unittest.TestCase):
             self.assertEqual([call[1] for call in upstream.calls], ["/v1/tasks/task-1?waitMs=600000"])
         finally:
             upstream.close()
+
+    def test_run_workflow_clamps_a_wait_above_the_relay_limit(self):
+        def responder(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+            if method == "POST" and path == "/v1/workflows":
+                return 202, {"id": "wf-1", "status": "queued"}
+            if "waitMs=900000" in path:
+                return 400, {"error": "invalid_wait",
+                             "message": "waitMs must be an integer from 1 to 600000"}
+            return 200, {"id": "wf-1", "status": "completed", "steps": []}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "run_workflow",
+                "arguments": {"spec": {"steps": []}, "waitMs": 900000}}})
+            run = result["structuredContent"]
+            self.assertEqual(run["status"], "completed")
+            self.assertEqual(run["waitMs"], 600000)
+            self.assertIs(run["waitClamped"], True)
+            self.assertEqual([call[1] for call in upstream.calls],
+                             ["/v1/workflows", "/v1/workflows/wf-1?waitMs=900000", "/healthz",
+                              "/v1/workflows/wf-1?waitMs=600000"])
+        finally:
+            upstream.close()
+
+    def test_get_workflow_clamps_a_wait_above_the_relay_limit(self):
+        def responder(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+            if "waitMs=900000" in path:
+                return 400, {"error": "invalid_wait",
+                             "message": "waitMs must be an integer from 1 to 600000"}
+            return 200, {"id": "wf-1", "status": "completed", "steps": []}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "get_workflow",
+                "arguments": {"workflowId": "wf-1", "maxWaitMs": 900000}}})
+            run = result["structuredContent"]
+            self.assertEqual(run["waitMs"], 600000)
+            self.assertIs(run["waitClamped"], True)
+            self.assertEqual([call[1] for call in upstream.calls],
+                             ["/v1/workflows/wf-1?waitMs=900000", "/healthz",
+                              "/v1/workflows/wf-1?waitMs=600000"])
+        finally:
+            upstream.close()
+
+    def test_the_step_schema_matches_the_engine(self):
+        # The schema tells a client what the engine will accept; these are the engine's own limits,
+        # so a constant that changes without the schema fails here instead of at a client's submit.
+        tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "run_workflow")
+        step = tool["inputSchema"]["properties"]["spec"]["properties"]["steps"]["items"]["properties"]
+        self.assertEqual(step["id"]["pattern"], workflows.STEP_ID_RE.pattern)
+        self.assertEqual(step["needs"]["items"]["pattern"], workflows.STEP_ID_RE.pattern)
+        self.assertEqual(step["foreach"]["items"]["maxLength"], workflows.MAX_ITEM_CHARS)
+        self.assertEqual(step["retries"]["maximum"], workflows.MAX_RETRIES)
+        self.assertEqual(step["repeat"]["properties"]["max"]["maximum"], workflows.MAX_REPEAT_ROUNDS)
 
     def test_wait_task_returns_the_relay_error_when_it_cannot_clamp_the_wait(self):
         rejected = {"error": "invalid_wait", "message": "invalid_wait"}

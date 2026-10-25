@@ -302,11 +302,11 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | `get_task` | `{ taskId, includeInput? }` | Current task. With `includeInput: true` it also carries `input`. |
 | `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
 | `cancel_task` | `{ taskId }` | Cancelled task. |
-| `run_workflow` | `{ spec, waitMs? }` | Submitted run; with `waitMs`, the terminal run, or the current run with `waitExpired: true` if the wait elapses first. `spec` is the workflow document itself, typed with the full step schema in `tools/list`. |
-| `get_workflow` | `{ workflowId, maxWaitMs? }` | The run with every step and its output; with `maxWaitMs`, the terminal run, or the current run with `waitExpired: true`. |
+| `run_workflow` | `{ spec, waitMs? }` | Submitted run; with `waitMs`, the terminal run, or the current run with `waitExpired: true` if the wait elapses first. `spec` is the workflow document itself, typed with the full step schema in `tools/list`. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
+| `get_workflow` | `{ workflowId, maxWaitMs? }` | The run with every step and its output; with `maxWaitMs`, the terminal run, or the current run with `waitExpired: true`. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
 | `list_workflows` | `{ sessionId?, status?, limit? }` | `{ workflows: [...] }`. |
 | `cancel_workflow` | `{ workflowId }` | Cancelled run. |
-| `resume_workflow` | `{ workflowId, waitMs? }` | Restarted run; with `waitMs`, the terminal run. |
+| `resume_workflow` | `{ workflowId, waitMs? }` | Restarted run; with `waitMs`, the terminal run. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
 | `get_pressure` | `{}` | The host reading, same payload as `GET /v1/pressure`. |
 
 Each result is returned as `content: [{ type: "text", text: "<json>" }]` plus

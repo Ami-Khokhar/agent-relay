@@ -40,8 +40,9 @@ Use it when the user wants to:
 - delegate implementation work to pi, Codex, OpenCode, or Claude Code instead of
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
-- give an MCP client the tools `list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`.
+- give an MCP client the six task tools (`list_agents`, `delegate`, `wait_task`, `get_task`,
+  `list_tasks`, `cancel_task`), the five workflow tools, and `get_pressure`; `tools/list` is
+  authoritative.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
 `PATH` and can run the task: the relay adds task IDs, status, timeouts,

@@ -117,8 +117,7 @@ STATE_DIR = Path(_env("AGENT_RELAY_STATE_DIR", "A2A_RELAY_STATE_DIR")
                  or Path.home() / ".local" / "state" / "agent-relay")
 # Device pressure: stop active runs when the host reaches critical, checking this often. The
 # guard decides nothing on an idle relay, so an unused relay never shells out to probe.
-PRESSURE_GUARD = _env("AGENT_RELAY_PRESSURE_GUARD", "A2A_RELAY_PRESSURE_GUARD",
-                      default="1").lower() not in ("0", "false", "no", "off")
+PRESSURE_GUARD = pressure.guard_enabled()
 PRESSURE_INTERVAL_MS = _positive_int(5000, "AGENT_RELAY_PRESSURE_INTERVAL_MS",
                                      "A2A_RELAY_PRESSURE_INTERVAL_MS")
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
