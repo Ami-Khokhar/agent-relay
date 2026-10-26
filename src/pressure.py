@@ -11,9 +11,11 @@ Three unprivileged signals come from macOS itself:
 The verdict is decided from those readings rather than from a single opaque flag, so every
 verdict can name the number that produced it. CPU temperature in degrees is not readable
 without root on Apple Silicon: ``powermetrics`` refuses a non-root caller and macOS exposes
-no SMC sensor node, so ``temperatureC`` is null with the reason attached rather than guessed.
-A missing thermal reading from ``pmset`` means the OS has recorded no throttle, which is the
-ordinary state on a cool machine.
+no SMC sensor node. The owner may allowlist an unprivileged reader — ``macmon`` reads the
+sensors through IOKit without root — by naming it in ``AGENT_RELAY_TEMP_READER``; with no
+reader, or one that does not answer, ``temperatureC`` is null with the reason attached
+rather than guessed. A missing thermal reading from ``pmset`` means the OS has recorded no
+throttle, which is the ordinary state on a cool machine.
 
 The probes are macOS-only. On another host every signal is null, the verdict is ``ok``, and the
 guard never stops a run: the reading is absent rather than guessed, and a caller that needs a
@@ -21,8 +23,10 @@ verdict must not read ``ok`` as a measurement.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -37,7 +41,8 @@ CRITICAL_SPEED_LIMIT = 40
 WARN_FREE_PERCENT = 12
 WARN_SWAP_PERCENT = 70
 WARN_SPEED_LIMIT = 75
-TEMPERATURE_REASON = ("macOS exposes no unprivileged CPU temperature; powermetrics needs root")
+TEMPERATURE_REASON = "macOS exposes no unprivileged CPU temperature; powermetrics needs root"
+READER_SILENT_REASON = "the configured temperature reader did not answer"
 # How long the verdict must stay critical before the guard stops a run. A spike between two
 # normal readings costs a long run its work in progress, so one reading is not a state.
 DEFAULT_GUARD_HOLD_MS = 30_000
@@ -89,6 +94,13 @@ def _as_int(value):
         return None
 
 
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 _UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
 _SWAP_RE = re.compile(r"(total|used|free)\s*=\s*([\d.]+)([KMG])")
 
@@ -107,6 +119,53 @@ def _parse_swap(text):
 def _parse_speed_limit(text):
     match = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", text or "")
     return int(match.group(1)) if match else None
+
+
+def _temperature_reader():
+    """The owner's allowlisted temperature reader as argv, or None. Never a PATH lookup.
+
+    The owner names it in the relay's own environment, which a task cannot change. The value is
+    a command line whose first word is an absolute path to an executable file — for example
+    ``/opt/homebrew/bin/macmon pipe -s 1 -i 200`` — and the rest is passed as that program's
+    arguments. Anything else means no reader: a planted tool must not become the program the
+    relay runs.
+    """
+    raw = os.environ.get("AGENT_RELAY_TEMP_READER")
+    if not raw:
+        return None
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        return None
+    if not argv or not (os.path.isabs(argv[0]) and os.path.isfile(argv[0])
+                        and os.access(argv[0], os.X_OK)):
+        return None
+    return argv
+
+
+def _parse_temperature(text):
+    """The Celsius figure from one ``macmon pipe`` JSON line, or None."""
+    for line in (text or "").splitlines():
+        try:
+            sample = json.loads(line)
+        except ValueError:
+            continue
+        temp = sample.get("temp") if isinstance(sample, dict) else None
+        value = temp.get("cpu_temp_avg") if isinstance(temp, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _temperature():
+    """The CPU temperature in Celsius and the reason it is missing, or (value, None)."""
+    argv = _temperature_reader()
+    if argv is None:
+        return None, TEMPERATURE_REASON
+    reading = _parse_temperature(_run(argv[0], argv[1:]))
+    if reading is None:
+        return None, READER_SILENT_REASON
+    return reading, None
 
 
 def _now_iso():
@@ -207,6 +266,8 @@ def snapshot():
                                    ["-n", "vm.swapusage"]))
     speed_limit = _parse_speed_limit(_run(_probe_path("AGENT_RELAY_PMSET", TRUSTED_PMSET),
                                           ["-g", "therm"]))
+    temperature, temperature_reason = _temperature()
+    temp_warn_c = _as_float(os.environ.get("AGENT_RELAY_TEMP_WARN_C"))
     swap_percent = round(used * 100 / total) if used is not None and total else None
 
     critical, warn = [], []
@@ -229,6 +290,8 @@ def snapshot():
             critical.append(f"CPU is throttled to {speed_limit}% of its speed")
         elif speed_limit < WARN_SPEED_LIMIT:
             warn.append(f"CPU is throttled to {speed_limit}% of its speed")
+    if temperature is not None and temp_warn_c is not None and temperature >= temp_warn_c:
+        warn.append(f"CPU temperature is {temperature}C")
 
     verdict = "critical" if critical else ("warn" if warn else "ok")
     return {
@@ -237,8 +300,8 @@ def snapshot():
         "memory": {"pressureLevel": level, "freePercent": free_percent},
         "swap": {"usedBytes": used, "totalBytes": total, "usedPercent": swap_percent},
         "thermal": {"speedLimitPercent": speed_limit},
-        "temperatureC": None,
-        "temperatureReason": TEMPERATURE_REASON,
+        "temperatureC": temperature,
+        "temperatureReason": temperature_reason,
         "sampledAt": _now_iso(),
         "guard": {"enabled": guard_enabled(), "stopsAt": "critical",
                   "holdMs": guard_hold_ms()},
