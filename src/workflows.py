@@ -18,7 +18,10 @@ output matches a regular expression with ``repeat``.
 
 Every run is journaled to ``<state dir>/workflows/<id>.jsonl``. Completed steps therefore
 survive a relay restart with their output and their ``startedAt`` / ``finishedAt`` window,
-and ``resume`` continues a run without repeating finished work.
+and ``resume`` continues a run without repeating finished work. Each step and run status
+change is also appended to an in-memory, per-session change feed with a rising sequence
+number, so a caller can wait for the next change of any run in one session instead of
+polling each run.
 """
 from __future__ import annotations
 
@@ -47,6 +50,9 @@ REPEAT_FIELDS = frozenset(("max", "untilOutputMatches"))
 MAX_REPEAT_ROUNDS = 10
 MAX_RETRIES = 5
 MAX_ITEM_CHARS = 1024
+# The change feed is bounded; the oldest events fall off the back, so an ``after`` older
+# than that still works and simply skips what is gone.
+MAX_EVENT_FEED = 4096
 
 
 def _text(value, limit):
@@ -342,6 +348,8 @@ class WorkflowEngine:
         self._now = now
         self._workflows = {}
         self._request_ids = {}
+        self._events = []
+        self._seq = 0
 
     # ------------------------------------------------------------------ public API
 
@@ -524,6 +532,20 @@ class WorkflowEngine:
                     return workflow
                 self._condition.wait(remaining)
 
+    def wait_events(self, session_id, after, wait_ms):
+        """Long-poll for the session's changes after seq ``after``; ``[]`` when the wait elapses."""
+        deadline = time.monotonic() + wait_ms / 1000.0
+        with self._condition:
+            while True:
+                events = [event for event in self._events
+                          if event["sessionId"] == session_id and event["seq"] > after]
+                if events:
+                    return events
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                self._condition.wait(remaining)
+
     # -------------------------------------------------------------- run internals
 
     def _new_workflow(self, spec, request_id, workflow_id=None):
@@ -584,6 +606,7 @@ class WorkflowEngine:
                     workflow["finishedAt"] = self._now()
                     self._journal(workflow, {"type": "finished", "at": self._now(),
                                              "status": "failed"})
+                    self._record_events(workflow)
                     self._condition.notify_all()
                 return
             with self._condition:
@@ -639,6 +662,7 @@ class WorkflowEngine:
                 else:
                     self._finish(workflow, "completed")
                 return True
+            self._record_events(workflow)
             self._condition.notify_all()
         if launched:
             self._drain()
@@ -817,6 +841,37 @@ class WorkflowEngine:
         if workflow["error"]:
             record["error"] = workflow["error"]
         self._journal(workflow, record)
+        self._record_events(workflow)
+        self._condition.notify_all()
+
+    def _record_events(self, workflow):
+        """Append one event per step or run status change since the last record. Lock held.
+
+        Events carry the public status (a step waiting on the queue reads ``pending``, as in a
+        run view), the run, the step (``None`` for a run-level change), and a seq that rises
+        across the relay, so one ordered feed per session replaces polling each run.
+        """
+        changes = []
+        run_status = workflow["status"]
+        last_run = workflow.get("_event_run_status", "queued")
+        if run_status != last_run:
+            changes.append((None, last_run, run_status))
+            workflow["_event_run_status"] = run_status
+        for step in workflow["steps"]:
+            status = "pending" if step["status"] == "ready" else step["status"]
+            last = step.get("_event_status", "pending")
+            if status != last:
+                changes.append((step["id"], last, status))
+                step["_event_status"] = status
+        if not changes:
+            return
+        for step_id, old_status, new_status in changes:
+            self._seq += 1
+            self._events.append({"seq": self._seq, "sessionId": workflow["sessionId"],
+                                 "workflowId": workflow["id"], "stepId": step_id,
+                                 "oldStatus": old_status, "newStatus": new_status})
+        if len(self._events) > MAX_EVENT_FEED:
+            del self._events[:len(self._events) - MAX_EVENT_FEED]
         self._condition.notify_all()
 
     # ------------------------------------------------------------------- journaling
