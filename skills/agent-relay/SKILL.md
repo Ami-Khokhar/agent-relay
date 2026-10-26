@@ -234,7 +234,8 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 - `cancel_task { taskId }` → cancel a queued or running task.
 - `run_workflow { spec, waitMs? }` → submit a whole multi-step run; `spec` is the workflow
   document, and `tools/list` types its steps, so you can author one from the schema.
-- `get_workflow { workflowId, maxWaitMs? }` → the run with every step and its output.
+- `get_workflow { workflowId, maxWaitMs? }` → the run with every step, its output, and its
+  `startedAt` / `finishedAt` window (plus `attemptTimes`, one window per attempt).
 - `list_workflows { sessionId?, status?, limit? }` → stored runs, most recent first.
 - `cancel_workflow { workflowId }` → cancel the run and every task it started.
 - `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
@@ -364,7 +365,10 @@ A workflow document names steps; each step is an ordinary task on one registered
 `needs` wires them together. The relay starts a step only once every step it needs has
 completed. Statuses: `queued` → `running` → one of `completed`, `failed`, `cancelled`. A
 step moves `pending` → `running` → one of `completed`, `failed`, `skipped`, `cancelled`,
-where `skipped` means a step it depended on did not succeed.
+where `skipped` means a step it depended on did not succeed. Every step carries `startedAt`
+and `finishedAt`, null until it starts and finishes, and a run view adds `attemptTimes`, one
+`{startedAt, finishedAt}` window per attempt — so a report can give each step its own time
+window without reading task ids.
 
 ```
 {"name": "review-loop", "steps": [

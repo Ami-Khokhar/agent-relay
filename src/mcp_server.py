@@ -245,7 +245,7 @@ TOOLS = [
     },
     {
         "name": "get_workflow",
-        "description": "Get a workflow run with every step, its status, attempts, output, and error. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
+        "description": "Get a workflow run with every step: its status, attempts, startedAt and finishedAt, output, and error. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
         "inputSchema": {
             "type": "object", "required": ["workflowId"], "additionalProperties": False,
             "properties": {

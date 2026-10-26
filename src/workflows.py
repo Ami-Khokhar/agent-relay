@@ -17,7 +17,8 @@ out with ``foreach``, re-run on a task failure with ``retries``, and loop until 
 output matches a regular expression with ``repeat``.
 
 Every run is journaled to ``<state dir>/workflows/<id>.jsonl``. Completed steps therefore
-survive a relay restart, and ``resume`` continues a run without repeating finished work.
+survive a relay restart with their output and their ``startedAt`` / ``finishedAt`` window,
+and ``resume`` continues a run without repeating finished work.
 """
 from __future__ import annotations
 
@@ -495,6 +496,9 @@ class WorkflowEngine:
                     step["status"] = "completed"
                     step["output"] = done["output"]
                     step["attempts"] = done["attempts"]
+                    step["startedAt"] = done["startedAt"]
+                    step["finishedAt"] = done["finishedAt"]
+                    step["attemptTimes"] = done["attemptTimes"]
             self._workflows[workflow_id] = workflow
             # The one field _new_workflow sets and _make_room releases; reading the old
             # name left every resumed run unregistered.
@@ -551,6 +555,9 @@ class WorkflowEngine:
             "status": "pending",
             "attempts": 0,
             "retries": 0,
+            "startedAt": None,
+            "finishedAt": None,
+            "attemptTimes": [],
             "taskIds": [],
             "output": None,
             "error": None,
@@ -664,9 +671,27 @@ class WorkflowEngine:
             context["foreach.index"] = str(index)
         return context
 
+    def _end_attempt(self, step, now):
+        """Close the window of the attempt that just ended."""
+        windows = step["attemptTimes"]
+        if windows and windows[-1]["finishedAt"] is None:
+            windows[-1]["finishedAt"] = now
+
+    def _settle(self, step):
+        """Stamp a terminal step: close its last attempt and record when it ended."""
+        if step["finishedAt"] is not None:
+            return
+        now = self._now()
+        self._end_attempt(step, now)
+        if step["startedAt"] is not None:
+            step["finishedAt"] = now
+
     def _launch(self, workflow, step):
         """Render and submit every task this attempt needs."""
         spec = step["_spec"]
+        now = self._now()
+        if step["startedAt"] is None:
+            step["startedAt"] = now
         items = spec["foreach"] if spec["foreach"] is not None else [None]
         submitted = []
         attempt = step["attempts"] + 1
@@ -678,6 +703,7 @@ class WorkflowEngine:
                 self._abort_children(submitted)
                 step["status"] = "failed"
                 step["error"] = f"unresolved template reference: {exc.args[0]}"
+                self._settle(step)
                 return True
             request = {"agentId": spec["agentId"], "input": text,
                        "sessionId": workflow["sessionId"]}
@@ -698,9 +724,11 @@ class WorkflowEngine:
                 code = body.get("error")
                 message = body.get("message") or code or "task_rejected"
                 step["error"] = f"{code}: {message}" if code and code not in message else message
+                self._settle(step)
                 return True
             submitted.append(body["id"])
         step["attempts"] = attempt
+        step["attemptTimes"].append({"startedAt": now, "finishedAt": None})
         step["_current"] = submitted
         step["taskIds"].extend(submitted)
         step["status"] = "running"
@@ -712,6 +740,7 @@ class WorkflowEngine:
         if not tasks or any(task is None for task in tasks):
             step["status"] = "failed"
             step["error"] = "task_evicted_from_the_relay_store"
+            self._settle(step)
             return True
         if not all(task["status"] in TASK_TERMINAL for task in tasks):
             return False
@@ -723,16 +752,19 @@ class WorkflowEngine:
                 step["retries"] += 1
                 step["_current"] = []
                 step["status"] = "ready"
+                self._end_attempt(step, self._now())
                 return True
             step["status"] = "failed"
             step["error"] = failures[0].get("error") or failures[0]["status"]
             step["output"] = failures[0].get("output") or None
+            self._settle(step)
             return True
 
         cancelled = [task for task in tasks if task["status"] == "cancelled"]
         if cancelled:
             step["status"] = "cancelled"
             step["error"] = "task_cancelled"
+            self._settle(step)
             return True
 
         outputs = [task.get("output") or "" for task in tasks]
@@ -745,15 +777,21 @@ class WorkflowEngine:
                 if step["attempts"] < spec["repeat"]["max"]:
                     step["_current"] = []
                     step["status"] = "ready"
+                    self._end_attempt(step, self._now())
                     return True
                 step["status"] = "failed"
                 step["error"] = "repeat_limit_reached"
+                self._settle(step)
                 return True
 
         step["status"] = "completed"
+        self._settle(step)
         self._journal(workflow, {"type": "step", "at": self._now(), "step": step["id"],
                                  "status": "completed", "output": step["output"],
-                                 "attempts": step["attempts"]})
+                                 "attempts": step["attempts"],
+                                 "startedAt": step["startedAt"],
+                                 "finishedAt": step["finishedAt"],
+                                 "attemptTimes": step["attemptTimes"]})
         return True
 
     def _cancel_children(self, workflow):
@@ -763,6 +801,7 @@ class WorkflowEngine:
             self._abort_children(step["_current"])
             step["status"] = "cancelled"
             step["error"] = "workflow_cancelled"
+            self._settle(step)
             step["_current"] = []
 
     def _abort_children(self, task_ids):
@@ -817,6 +856,9 @@ class WorkflowEngine:
                 outputs[record.get("step")] = {
                     "output": record.get("output") or "",
                     "attempts": record.get("attempts") or 1,
+                    "startedAt": record.get("startedAt"),
+                    "finishedAt": record.get("finishedAt"),
+                    "attemptTimes": record.get("attemptTimes") or [],
                 }
         if not isinstance(spec, dict) or "ancestors" not in spec:
             return None
@@ -853,11 +895,14 @@ class WorkflowEngine:
             "needs": step["needs"],
             "status": "pending" if step["status"] == "ready" else step["status"],
             "attempts": step["attempts"],
+            "startedAt": step["startedAt"],
+            "finishedAt": step["finishedAt"],
         }
         if step["error"]:
             view["error"] = step["error"]
         if detail:
             view["taskIds"] = list(step["taskIds"])
+            view["attemptTimes"] = [dict(window) for window in step["attemptTimes"]]
             if step["output"] is not None:
                 view["output"] = step["output"]
         return view
