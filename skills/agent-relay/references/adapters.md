@@ -135,6 +135,21 @@ Codex: `--skip-git-repo-check` allows `codex exec` outside a git repository, and
 files (checked against codex-cli 0.155.1). Without the second flag, a task can succeed
 while making no changes.
 
+The `workspace-write` sandbox also blocks every socket, so a step under
+`codex exec -s workspace-write` cannot run a test suite that binds `127.0.0.1`: the bind
+fails and the step can only run part of the suite. The owner can allowlist codex's
+`sandbox_workspace_write.network_access=true` config as a per-task option, passed as
+`-c sandbox_workspace_write.network_access=true`. Its risk is that it opens all network —
+every destination, not just loopback — so declare it off by default and let only the
+steps that need the bind choose it (see `config/agents.example.json`):
+
+```json
+{ "options": { "network": { "off": [], "on": ["-c", "sandbox_workspace_write.network_access=true"] } } }
+```
+
+A step that runs such a suite delegates with `"options": {"network": "on"}`; any other
+step leaves the option off and keeps the socket block.
+
 A task can choose among the per-task `options` the agent declares in its registry entry
 (`"options": {"effort": {"high": ["-c", "model_reasoning_effort=high"]}}`, chosen with
 `"options": {"effort": "high"}`). The mapped args are added after the entry's `args` and before
