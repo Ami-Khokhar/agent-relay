@@ -202,6 +202,26 @@ Same query parameters as `GET /v1/tasks` (`sessionId`, `status`, `limit`), restr
 workflow statuses. Entries omit `spec`, and steps omit `output`, `taskIds`,
 `attemptTimes`, and `errorDetail`. Returns `{ "workflows": [ ... ] }`, most recent first.
 
+### `GET /v1/workflows/events`
+
+One ordered change feed per session. `sessionId` is required; `after` (default `0`) is the
+seq of the last event the caller saw; `waitMs` long-polls for the next change and ends with
+an empty list when it elapses. Returns `{ "events": [ ... ] }`, oldest first, each event:
+
+```json
+{ "seq": 17, "workflowId": "wf-...", "stepId": "review",
+  "oldStatus": "running", "newStatus": "completed" }
+```
+
+`seq` rises across the relay; pass the last one seen as `after` to continue. `stepId` is
+`null` for a run-level status change (the run's own `queued` → `running` → terminal
+movement); otherwise it is a step of that run changing between its public statuses
+(`pending`, `running`, `completed`, `failed`, `skipped`, `cancelled`). A `waitMs` outside
+`1..maxWaitMs` returns `400 invalid_wait`, exactly as on `GET /v1/workflows/:id`; an
+`after` that is not a non-negative integer returns `400 invalid_after`. The feed lives in
+memory and keeps at most 4096 events in total: the oldest fall off, and an `after` older
+than that still works, simply skipping what is gone.
+
 ### `DELETE /v1/workflows/:id`
 
 Cancels the run, cancels every task it started, and returns the run as `cancelled`.
@@ -274,7 +294,7 @@ Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow ste
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
-| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_input`, `invalid_wait`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error`, and the workflow validation codes listed under `POST /v1/workflows` | Malformed request or registry. |
+| 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_input`, `invalid_wait`, `invalid_after`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error`, and the workflow validation codes listed under `POST /v1/workflows` | Malformed request or registry. |
 | 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route. |
 | 403 | `forbidden`, `origin_not_allowed`, `delegation_not_allowed` | Admin route called from a non-loopback address; request from a browser origin not in `AGENT_RELAY_ALLOWED_ORIGINS`; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
 | 404 | `unknown_agent`, `unknown_task`, `unknown_workflow`, `not_found` | Missing agent/task/run/route. |
@@ -303,7 +323,7 @@ A task whose time runs out while the relay is still locating git metadata ends `
 The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
 - `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo }`
-- `tools/list` → the twelve tools below
+- `tools/list` → the thirteen tools below
 - `ping`
 - `tools/call`
 
@@ -317,6 +337,7 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | `cancel_task` | `{ taskId }` | Cancelled task. |
 | `run_workflow` | `{ spec, waitMs? }` | Submitted run; with `waitMs`, the terminal run, or the current run with `waitExpired: true` if the wait elapses first. `spec` is the workflow document itself, typed with the full step schema in `tools/list`. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
 | `get_workflow` | `{ workflowId, maxWaitMs? }` | The run with every step and its output; with `maxWaitMs`, the terminal run, or the current run with `waitExpired: true`. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
+| `wait_workflow_events` | `{ sessionId, after?, maxWaitMs? }` | The session's change feed: `{ events: [ { seq, workflowId, stepId, oldStatus, newStatus } ] }`, oldest first, waiting up to `maxWaitMs` (default 60000) for the next change and returning an empty list when the wait ends. `after` (default 0) is the seq of the last event seen. A `maxWaitMs` above the relay limit is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
 | `list_workflows` | `{ sessionId?, status?, limit? }` | `{ workflows: [...] }`. |
 | `cancel_workflow` | `{ workflowId }` | Cancelled run. |
 | `resume_workflow` | `{ workflowId, waitMs? }` | Restarted run; with `waitMs`, the terminal run. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |

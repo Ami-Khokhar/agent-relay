@@ -41,7 +41,7 @@ Use it when the user wants to:
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
 - give an MCP client the six task tools (`list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`), the five workflow tools, and `get_pressure`; `tools/list` is
+  `list_tasks`, `cancel_task`), the six workflow tools, and `get_pressure`; `tools/list` is
   authoritative.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
@@ -236,6 +236,10 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
   document, and `tools/list` types its steps, so you can author one from the schema.
 - `get_workflow { workflowId, maxWaitMs? }` → the run with every step, its output, and its
   `startedAt` / `finishedAt` window (plus `attemptTimes`, one window per attempt).
+- `wait_workflow_events { sessionId, after?, maxWaitMs? }` → the session's ordered change
+  feed: each step or run status change with `workflowId`, `stepId`, `oldStatus`, `newStatus`
+  and a rising `seq`. Pass the last `seq` seen as `after`; an empty `events` list means the
+  wait ended with no change, so call again with the same `after`.
 - `list_workflows { sessionId?, status?, limit? }` → stored runs, most recent first.
 - `cancel_workflow { workflowId }` → cancel the run and every task it started.
 - `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
@@ -393,6 +397,14 @@ completed task's output matches that regular expression, the step fails with
 `BLOCKED: ...` cannot feed a later step. `DELETE /v1/workflows/:id` cancels the run and
 every task it started. A run that does not finish inside `waitMs` returns the same
 `waitExpired` shape a task wait does.
+
+To learn about whichever run in a session changes first — an orchestrator running several
+workflows — read the session's change feed instead of polling each run:
+`GET /v1/workflows/events?sessionId=<id>&after=<seq>&waitMs=<ms>` (or the
+`wait_workflow_events` tool) long-polls and returns each step or run status change in order:
+`workflowId`, `stepId` (`null` for a run-level change), `oldStatus`, `newStatus`, and a
+rising `seq`. Pass the last `seq` seen as `after`; an empty `events` list means the wait
+ended with no change.
 
 **Host pressure.** `GET /v1/pressure` reads what this machine can tell you without root: the
 kernel's memory-pressure level, free-memory percentage, swap in use, and any thermal speed limit.

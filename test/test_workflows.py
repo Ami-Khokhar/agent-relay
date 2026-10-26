@@ -157,6 +157,66 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(view["status"], TERMINAL)
         self.assertEqual(view["spec"]["steps"][0]["input"], "fast")
 
+    # ----------------------------------------------------------------- change feed
+
+    def test_streams_each_step_completion_in_order_with_rising_seq(self):
+        relay = self.start(echo())
+        status, submitted = relay.request("POST", "/v1/workflows", {"name": "feed", "steps": [
+            {"id": "first", "agentId": "echo", "input": "one"},
+            {"id": "second", "agentId": "echo", "needs": ["first"], "input": "two"},
+        ]})
+        self.assertEqual(status, 202)
+        session_id = submitted["sessionId"]
+        events, after = [], 0
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            status, body = relay.request(
+                "GET", f"/v1/workflows/events?sessionId={session_id}&after={after}&waitMs=8000")
+            self.assertEqual(status, 200, body)
+            events.extend(body["events"])
+            if body["events"]:
+                after = body["events"][-1]["seq"]
+            seen = {(event["stepId"], event["newStatus"]) for event in events}
+            if ("first", "completed") in seen and ("second", "completed") in seen:
+                break
+        else:
+            self.fail(f"the feed never reported both steps completed: {events}")
+
+        completed = [event for event in events
+                     if event["stepId"] and event["newStatus"] == "completed"]
+        self.assertEqual([event["stepId"] for event in completed], ["first", "second"])
+        self.assertEqual([event["oldStatus"] for event in completed], ["running", "running"])
+        self.assertEqual({event["workflowId"] for event in events}, {submitted["id"]})
+        seqs = [event["seq"] for event in events]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(seqs), len(set(seqs)))
+
+    def test_an_ended_wait_returns_no_events_and_an_overlong_wait_is_refused_as_for_get_workflow(self):
+        relay = self.start(echo())
+        started = time.time()
+        status, body = relay.request(
+            "GET", "/v1/workflows/events?sessionId=lonely&after=0&waitMs=300")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["events"], [])
+        self.assertGreaterEqual(time.time() - started, 0.2)
+
+        # An overlong wait is refused exactly as GET /v1/workflows/:id refuses one.
+        status, get_body = relay.request(
+            "GET", "/v1/workflows/wf-00000000000000000000000000000000?waitMs=900000")
+        self.assertEqual((status, get_body["error"]), (400, "invalid_wait"))
+        status, feed_body = relay.request(
+            "GET", "/v1/workflows/events?sessionId=lonely&after=0&waitMs=900000")
+        self.assertEqual((status, feed_body["error"]), (400, "invalid_wait"))
+
+        status, body = relay.request("GET", "/v1/workflows/events?after=0&waitMs=100")
+        self.assertEqual((status, body["error"]), (400, "invalid_session_id"))
+        status, body = relay.request(
+            "GET", "/v1/workflows/events?sessionId=lonely&after=-1&waitMs=100")
+        self.assertEqual((status, body["error"]), (400, "invalid_after"))
+        status, body = relay.request(
+            "GET", "/v1/workflows/events?sessionId=lonely&after=1.5&waitMs=100")
+        self.assertEqual((status, body["error"]), (400, "invalid_after"))
+
     # -------------------------------------------------------------------- fan-out
 
     def test_fans_out_with_foreach_and_passes_the_array_to_the_next_step(self):

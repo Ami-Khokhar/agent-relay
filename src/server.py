@@ -1666,6 +1666,11 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self._list_workflows(query)
                 return self._json(405, {"error": "method_not_allowed"})
+            # Checked before the :id pattern below, which would match "events" as a run id.
+            if path == "/v1/workflows/events":
+                if method == "GET":
+                    return self._workflow_events(query)
+                return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/admin/reload":
                 if method == "POST":
                     return self._reload()
@@ -1826,6 +1831,32 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "invalid_limit"})
         limit = min(limit, MAX_TASKS)
         return self._json(200, {"workflows": WORKFLOW_ENGINE.list(session_id, status, limit)})
+
+    def _workflow_events(self, query):
+        """One ordered change feed per session: step and run status changes, oldest first."""
+        session_id = query.get("sessionId", [None])[0]
+        if session_id is None or not _valid(session_id):
+            return self._json(400, {"error": "invalid_session_id"})
+        after_raw = query.get("after", [None])[0]
+        after = 0
+        if after_raw is not None:
+            try:
+                after = int(after_raw)
+            except ValueError:
+                after = -1
+            if after < 0:
+                return self._json(400, {"error": "invalid_after",
+                                        "message": "after must be a non-negative integer"})
+        wait_raw = query.get("waitMs", [None])[0]
+        wait_ms = 0
+        if wait_raw is not None:
+            try:
+                wait_ms = int(wait_raw)
+            except ValueError:
+                return self._json(400, _invalid_wait())
+            if not _is_valid_wait(wait_ms):
+                return self._json(400, _invalid_wait())
+        return self._json(200, {"events": WORKFLOW_ENGINE.wait_events(session_id, after, wait_ms)})
 
     def _get_workflow(self, workflow_id, query):
         wait_raw = query.get("waitMs", [None])[0]
