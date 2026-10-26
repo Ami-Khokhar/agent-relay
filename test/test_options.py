@@ -14,6 +14,8 @@ from relay_helpers import PRINT_ARGV, PYTHON, STDIO_ARGV, McpClient, Relay
 import server
 
 EFFORT = {"low": ["-c", "model_reasoning_effort=low"], "high": ["-c", "model_reasoning_effort=high"]}
+EXAMPLE_REGISTRY = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "agents.example.json")
 
 
 def fake(**extra):
@@ -190,6 +192,14 @@ class OptionsRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "agent remote: options need a command or stdio agent"):
             self.load({"id": "remote", "type": "http", "url": "http://127.0.0.1:9000/run",
                        "options": {"effort": EFFORT}})
+
+
+class ExampleRegistryTests(unittest.TestCase):
+    def test_the_example_registry_offers_the_codex_network_option_off_by_default(self):
+        codex = server.load_registry(EXAMPLE_REGISTRY)["codex"]
+        self.assertEqual(codex["options"]["network"],
+                         {"off": [], "on": ["-c", "sandbox_workspace_write.network_access=true"]})
+        self.assertNotIn("sandbox_workspace_write.network_access", " ".join(codex["args"]))
 
 
 if __name__ == "__main__":

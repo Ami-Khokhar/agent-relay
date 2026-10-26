@@ -98,10 +98,26 @@ If the harness exposes only an API or needs structured output:
 Add the MCP server to the client's config and start the HTTP service alongside it (or let
 the MCP process start it on demand). The client then sees the task tools (`list_agents`,
 `delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`) and the workflow tools
-(`run_workflow`, `get_workflow`, `list_workflows`, `cancel_workflow`, `resume_workflow`) and
-`get_pressure`. Because submission is asynchronous,
+(`run_workflow`, `get_workflow`, `wait_workflow_events`, `list_workflows`, `cancel_workflow`,
+`resume_workflow`) and `get_pressure`. Because submission is asynchronous,
 use `wait_task` (or `delegate` with `waitMs`) to block until the result is ready. Use a wait
-of about 110000 ms or less, and wait again while the result has `waitExpired: true`.
+of about 110000 ms or less, and wait again while the result has `waitExpired: true`. When
+several workflow runs share one session, `wait_workflow_events` (or
+`GET /v1/workflows/events`) reports each step or run status change in one ordered feed, so
+the orchestrator reacts to whichever run progresses first without polling every run.
+
+## 7. A write step whose test suite binds 127.0.0.1
+
+A codex `-s workspace-write` sandbox blocks every socket, so a delegated step under
+`codex exec -s workspace-write` cannot run a test suite that starts a local server on
+`127.0.0.1`: the bind fails and the step can only run part of the suite, so the gate
+looks red or reports BLOCKED even when the change is fine. When a step must run such a
+suite, the owner allowlists codex's network option in the agent's registry entry (the
+Codex recipe in [adapters.md](adapters.md) shows it, off by default) and the task
+delegates with `"options": {"network": "on"}`, which adds
+`-c sandbox_workspace_write.network_access=true`. Its risk is that it opens all network,
+not just loopback, so only the steps that need the bind ask for it; a step that does not
+run such a suite keeps the option off and keeps the sandbox's socket block.
 
 ## Choosing limits
 

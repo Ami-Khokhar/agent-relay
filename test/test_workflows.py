@@ -157,6 +157,66 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(view["status"], TERMINAL)
         self.assertEqual(view["spec"]["steps"][0]["input"], "fast")
 
+    # ----------------------------------------------------------------- change feed
+
+    def test_streams_each_step_completion_in_order_with_rising_seq(self):
+        relay = self.start(echo())
+        status, submitted = relay.request("POST", "/v1/workflows", {"name": "feed", "steps": [
+            {"id": "first", "agentId": "echo", "input": "one"},
+            {"id": "second", "agentId": "echo", "needs": ["first"], "input": "two"},
+        ]})
+        self.assertEqual(status, 202)
+        session_id = submitted["sessionId"]
+        events, after = [], 0
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            status, body = relay.request(
+                "GET", f"/v1/workflows/events?sessionId={session_id}&after={after}&waitMs=8000")
+            self.assertEqual(status, 200, body)
+            events.extend(body["events"])
+            if body["events"]:
+                after = body["events"][-1]["seq"]
+            seen = {(event["stepId"], event["newStatus"]) for event in events}
+            if ("first", "completed") in seen and ("second", "completed") in seen:
+                break
+        else:
+            self.fail(f"the feed never reported both steps completed: {events}")
+
+        completed = [event for event in events
+                     if event["stepId"] and event["newStatus"] == "completed"]
+        self.assertEqual([event["stepId"] for event in completed], ["first", "second"])
+        self.assertEqual([event["oldStatus"] for event in completed], ["running", "running"])
+        self.assertEqual({event["workflowId"] for event in events}, {submitted["id"]})
+        seqs = [event["seq"] for event in events]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(seqs), len(set(seqs)))
+
+    def test_an_ended_wait_returns_no_events_and_an_overlong_wait_is_refused_as_for_get_workflow(self):
+        relay = self.start(echo())
+        started = time.time()
+        status, body = relay.request(
+            "GET", "/v1/workflows/events?sessionId=lonely&after=0&waitMs=300")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["events"], [])
+        self.assertGreaterEqual(time.time() - started, 0.2)
+
+        # An overlong wait is refused exactly as GET /v1/workflows/:id refuses one.
+        status, get_body = relay.request(
+            "GET", "/v1/workflows/wf-00000000000000000000000000000000?waitMs=900000")
+        self.assertEqual((status, get_body["error"]), (400, "invalid_wait"))
+        status, feed_body = relay.request(
+            "GET", "/v1/workflows/events?sessionId=lonely&after=0&waitMs=900000")
+        self.assertEqual((status, feed_body["error"]), (400, "invalid_wait"))
+
+        status, body = relay.request("GET", "/v1/workflows/events?after=0&waitMs=100")
+        self.assertEqual((status, body["error"]), (400, "invalid_session_id"))
+        status, body = relay.request(
+            "GET", "/v1/workflows/events?sessionId=lonely&after=-1&waitMs=100")
+        self.assertEqual((status, body["error"]), (400, "invalid_after"))
+        status, body = relay.request(
+            "GET", "/v1/workflows/events?sessionId=lonely&after=1.5&waitMs=100")
+        self.assertEqual((status, body["error"]), (400, "invalid_after"))
+
     # -------------------------------------------------------------------- fan-out
 
     def test_fans_out_with_foreach_and_passes_the_array_to_the_next_step(self):
@@ -348,6 +408,33 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["check"]["error"], "repeat_limit_reached")
         self.assertEqual(finished["check"]["attempts"], 1)
 
+    # ------------------------------------------------------------ fail on own report
+
+    def test_fails_a_step_whose_output_matches_the_fail_pattern_and_skips_its_dependents(self):
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "fix", "agentId": "echo", "input": "BLOCKED: tests need a socket",
+             "failIfOutputMatches": "^BLOCKED"},
+            {"id": "ship", "agentId": "echo", "needs": ["fix"], "input": "ship it"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["fix"]["status"], "failed")
+        self.assertEqual(finished["fix"]["error"], "output_matched_fail_pattern")
+        self.assertEqual(finished["fix"]["output"], "BLOCKED: tests need a socket")
+        self.assertEqual(finished["ship"]["status"], "skipped")
+        self.assertEqual(finished["ship"]["error"], "dependency_not_completed")
+        self.assertEqual(finished["ship"]["taskIds"], [])
+
+    def test_completes_a_step_whose_output_does_not_match_the_fail_pattern(self):
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "fix", "agentId": "echo", "input": "DONE: fixed",
+             "failIfOutputMatches": "^BLOCKED"},
+        ]})
+        self.assertEqual(workflow["status"], "completed")
+        self.assertEqual(steps_of(workflow)["fix"]["status"], "completed")
+
     # ------------------------------------------------------------------- control
 
     def test_cancel_stops_the_run_and_its_running_children(self):
@@ -423,6 +510,40 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["first"]["finishedAt"], kept["finishedAt"])
         self.assertEqual(finished["first"]["attemptTimes"], kept["attemptTimes"])
         self.assertEqual(finished["second"]["output"], "recovered")
+
+    def test_resume_reads_a_journal_written_before_fail_if_output_matches_existed(self):
+        mark = self.path("legacy-journal-mark")
+        agents = [
+            echo(),
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+             "env": {"WF_MARK": mark}},
+        ]
+        relay = self.start(agents)
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "first", "agentId": "echo", "input": "kept"},
+            {"id": "second", "agentId": "flaky", "needs": ["first"], "input": "retry me"},
+        ]})
+        workflow_id = submitted["id"]
+        self.assertEqual(wait(relay, workflow_id)["status"], "failed")
+        self.stop(relay)
+
+        # Rewrite the journal the way a pre-failIfOutputMatches version wrote it.
+        journal = os.path.join(self.state, "workflows", f"{workflow_id}.jsonl")
+        with open(journal, encoding="utf-8") as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+        for record in records:
+            for step in record.get("spec", {}).get("steps", []):
+                step.pop("failIfOutputMatches", None)
+        with open(journal, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+        relay = self.start(agents)
+        status, _ = relay.request("POST", f"/v1/workflows/{workflow_id}/resume")
+        self.assertEqual(status, 202)
+        done = wait(relay, workflow_id)
+        self.assertEqual(done["status"], "completed")
+        self.assertEqual(steps_of(done)["second"]["output"], "recovered")
 
     def test_a_resumed_run_keeps_its_request_id(self):
         mark = self.path("resume-request-mark")
@@ -501,6 +622,12 @@ class WorkflowTests(unittest.TestCase):
             ("repeat_bad_regex",
              {"steps": [{**base, "repeat": {"max": 2, "untilOutputMatches": "("}}]},
              "invalid_repeat"),
+            ("fail_if_bad_regex", {"steps": [{**base, "failIfOutputMatches": "("}]},
+             "invalid_fail_if"),
+            ("fail_if_empty", {"steps": [{**base, "failIfOutputMatches": ""}]},
+             "invalid_fail_if"),
+            ("fail_if_not_a_string", {"steps": [{**base, "failIfOutputMatches": 5}]},
+             "invalid_fail_if"),
             ("zero_timeout", {"steps": [{**base, "timeoutMs": 0}]}, "invalid_timeout"),
             ("bad_cwd", {"steps": [{**base, "cwd": ""}]}, "invalid_cwd"),
             ("too_many_retries", {"steps": [{**base, "retries": 99}]}, "invalid_retries"),

@@ -55,6 +55,16 @@ GIT_TIMEOUT_S = 5
 TRUSTED_GIT_PATHS = ("/usr/bin/git", "/bin/git")
 
 
+def _log(message, err=False):
+    """One line for the relay's log (relay.log): a UTC ISO 8601 timestamp, then the message.
+
+    Launches capture stdout and stderr into the same file, so both streams carry the prefix
+    and every line of the log can be placed in time.
+    """
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"{stamp} {message}", file=sys.stderr if err else sys.stdout, flush=True)
+
+
 def _env(*names, default=None):
     """Return the first non-empty environment value among ``names``.
 
@@ -242,7 +252,7 @@ def default_config_path():
     if user.exists():
         return user
     if not _WARNED_FALLBACK:
-        print(f"warning: user registry not found at {user}; falling back to {repo}", file=sys.stderr)
+        _log(f"warning: user registry not found at {user}; falling back to {repo}", err=True)
         _WARNED_FALLBACK = True
     return repo
 
@@ -1130,10 +1140,10 @@ def _pressure_guard():
             killed = WORKFLOW_ENGINE.kill_all(hold.message())
             hold.reset()
             if killed:
-                print(f"device pressure critical: stopped {len(killed)} workflow run(s); "
-                      f"resume them when the machine recovers", flush=True)
+                _log(f"device pressure critical: stopped {len(killed)} workflow run(s) "
+                     f"({', '.join(killed)}); resume them when the machine recovers")
         except Exception as exc:  # noqa: BLE001 - the guard must never take the relay down
-            print(f"pressure guard error: {exc}", file=sys.stderr, flush=True)
+            _log(f"pressure guard error: {exc}", err=True)
 
 
 def _make_room():
@@ -1666,6 +1676,11 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self._list_workflows(query)
                 return self._json(405, {"error": "method_not_allowed"})
+            # Checked before the :id pattern below, which would match "events" as a run id.
+            if path == "/v1/workflows/events":
+                if method == "GET":
+                    return self._workflow_events(query)
+                return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/admin/reload":
                 if method == "POST":
                     return self._reload()
@@ -1827,6 +1842,32 @@ class Handler(BaseHTTPRequestHandler):
         limit = min(limit, MAX_TASKS)
         return self._json(200, {"workflows": WORKFLOW_ENGINE.list(session_id, status, limit)})
 
+    def _workflow_events(self, query):
+        """One ordered change feed per session: step and run status changes, oldest first."""
+        session_id = query.get("sessionId", [None])[0]
+        if session_id is None or not _valid(session_id):
+            return self._json(400, {"error": "invalid_session_id"})
+        after_raw = query.get("after", [None])[0]
+        after = 0
+        if after_raw is not None:
+            try:
+                after = int(after_raw)
+            except ValueError:
+                after = -1
+            if after < 0:
+                return self._json(400, {"error": "invalid_after",
+                                        "message": "after must be a non-negative integer"})
+        wait_raw = query.get("waitMs", [None])[0]
+        wait_ms = 0
+        if wait_raw is not None:
+            try:
+                wait_ms = int(wait_raw)
+            except ValueError:
+                return self._json(400, _invalid_wait())
+            if not _is_valid_wait(wait_ms):
+                return self._json(400, _invalid_wait())
+        return self._json(200, {"events": WORKFLOW_ENGINE.wait_events(session_id, after, wait_ms)})
+
     def _get_workflow(self, workflow_id, query):
         wait_raw = query.get("waitMs", [None])[0]
         if wait_raw is None:
@@ -1903,7 +1944,8 @@ def _shutdown(signum, _frame):
         running = [task for task in TASKS.values() if task["status"] == "running"]
     if running:
         name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-        print(f"Received {name}; cancelling {len(running)} running task(s)", flush=True)
+        ids = ", ".join(task["id"] for task in running)
+        _log(f"Received {name}; cancelling {len(running)} running task(s) ({ids})")
     for task in running:
         _terminate_task(task)
     time.sleep(1.5 if running else 0)
@@ -1914,24 +1956,24 @@ def _reload_signal(_signum, _frame):
     try:
         path = reload_registry()
     except (OSError, ValueError) as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr, flush=True)
+        _log(f"Configuration error: {exc}", err=True)
         return
-    print(f"Reloaded registry from {path} ({len(AGENTS)} agents)", flush=True)
+    _log(f"Reloaded registry from {path} ({len(AGENTS)} agents)")
 
 
 def main():
     global AGENTS, REGISTRY_PATH, REVISION, TOKEN
     if not is_loopback(HOST) and not ALLOW_NON_LOOPBACK:
-        print(f"error: refusing to listen on non-loopback address {HOST}: the relay has no TLS and "
-              "is a single-user local service. Put it behind an authenticated HTTPS proxy and set "
-              "AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK=1 to accept the risk.", file=sys.stderr)
+        _log(f"error: refusing to listen on non-loopback address {HOST}: the relay has no TLS and "
+             "is a single-user local service. Put it behind an authenticated HTTPS proxy and set "
+             "AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK=1 to accept the risk.", err=True)
         return 1
     path = config_path()
     try:
         AGENTS = load_registry(str(path))
         REGISTRY_PATH = str(path)
     except (OSError, ValueError) as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
+        _log(f"Configuration error: {exc}", err=True)
         return 1
     REVISION = deployed_revision(str(Path(__file__).resolve().parent.parent))
     if TASK_RETENTION_MS:
@@ -1946,22 +1988,21 @@ def main():
         server = ThreadingHTTPServer((HOST, PORT), Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
-            print(f"error: port {PORT} is in use (another relay?); set A2A_RELAY_PORT",
-                  file=sys.stderr)
+            _log(f"error: port {PORT} is in use (another relay?); set A2A_RELAY_PORT", err=True)
             return 1
-        print(f"error: {exc}", file=sys.stderr)
+        _log(f"error: {exc}", err=True)
         return 1
     server.daemon_threads = True
     try:
         TOKEN = load_token()
     except (OSError, ValueError) as exc:
         server.server_close()
-        print(f"error: cannot load the API token: {exc}", file=sys.stderr)
+        _log(f"error: cannot load the API token: {exc}", err=True)
         return 1
     if not is_loopback(HOST):
-        print(f"WARNING: listening on non-loopback address {HOST} without TLS; anyone who can "
-              "reach it and obtain the token can run your coding agents.", file=sys.stderr, flush=True)
-    print(f"agent-relay listening at http://{HOST}:{PORT} (registry: {path})", flush=True)
+        _log(f"WARNING: listening on non-loopback address {HOST} without TLS; anyone who can "
+             "reach it and obtain the token can run your coding agents.", err=True)
+    _log(f"agent-relay listening at http://{HOST}:{PORT} (registry: {path})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

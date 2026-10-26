@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """agent-relay MCP stdio interface.
 
-A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the six task tools, the five workflow
+A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the six task tools, the six workflow
 tools, and get_pressure; tools/list is the authoritative list. Set A2A_RELAY_URL to point at a
 non-default relay. When the relay is not reachable and the URL is loopback, the interface
 starts the HTTP service detached on first use.
@@ -104,6 +104,12 @@ WORKFLOW_SPEC = {
                                                "JSON array of the per-item outputs."},
                     "retries": {"type": "integer", "minimum": 0, "maximum": 5,
                                 "description": "Extra attempts after the task fails or times out."},
+                    "failIfOutputMatches": {"type": "string", "minLength": 1,
+                                            "description": "Python regular expression tested "
+                                                           "against the step's output; a match "
+                                                           "fails the step with "
+                                                           "output_matched_fail_pattern and "
+                                                           "skips its dependents."},
                     "repeat": {
                         "type": "object", "additionalProperties": False,
                         "required": ["max", "untilOutputMatches"],
@@ -267,6 +273,22 @@ TOOLS = [
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
+        "name": "wait_workflow_events",
+        "description": "Long-poll for the next state change of a session's workflow runs in one ordered feed, instead of polling get_workflow per run. Pass the sessionId the runs share (a run_workflow result carries it); the result's events list carries each change in order: workflowId, stepId (null for a run-level status change), oldStatus, newStatus, and a rising seq. Pass the last seq you saw as after to continue the feed from there. A wait that ends with no change returns an empty events list; call again with the same after. A maxWaitMs above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background.",
+        "inputSchema": {
+            "type": "object", "required": ["sessionId"], "additionalProperties": False,
+            "properties": {
+                "sessionId": {"type": "string", "minLength": 1, "maxLength": 128,
+                              "description": "Correlation tag the runs share. Get it from a run_workflow result or a get_workflow view."},
+                "after": {"type": "integer", "minimum": 0,
+                          "description": "Return only changes whose seq is greater than this. Pass the seq of the last event you saw (0 for the whole retained feed)."},
+                "maxWaitMs": {"type": "integer", "minimum": 1,
+                              "description": "Maximum time to wait, in milliseconds (default 60000), for the next change. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
+    {
         "name": "list_workflows",
         "description": "List stored workflow runs, most recent first, optionally filtered by session or status. Entries carry every step's status but omit the run's spec and each step's output; use get_workflow for one run in full. Use it to recover a workflowId after a context reset.",
         "inputSchema": {
@@ -308,7 +330,7 @@ TOOLS = [
     },
     {
         "name": "get_pressure",
-        "description": "Report how hard this machine is working: the kernel's memory pressure level and free percentage, swap in use, and any CPU thermal throttle. Call it before starting a long or multi-agent workflow: the relay refuses a new workflow while the verdict is `critical`, and its guard stops running workflows only after the verdict has stayed `critical` for `guard.holdMs` milliseconds (default 30000, read at least twice; `guard.holdMs` 0 stops on the first critical reading), so one spike does not cost a run its work. The verdict is `ok`, `warn` or `critical`, and `reasons` names the reading that decided it. A stopped run says `device_pressure:` at the start of its `error`, naming how long pressure held and the readings that decided it, and can be continued with resume_workflow once the machine recovers. `temperatureC` is null on Apple Silicon, because macOS exposes no unprivileged CPU temperature.",
+        "description": "Report how hard this machine is working: the kernel's memory pressure level and free percentage, swap in use, and any CPU thermal throttle. Call it before starting a long or multi-agent workflow: the relay refuses a new workflow while the verdict is `critical`, and its guard stops running workflows only after the verdict has stayed `critical` for `guard.holdMs` milliseconds (default 30000, read at least twice; `guard.holdMs` 0 stops on the first critical reading), so one spike does not cost a run its work. The verdict is `ok`, `warn` or `critical`, and `reasons` names the reading that decided it. A stopped run says `device_pressure:` at the start of its `error`, naming how long pressure held and the readings that decided it, and can be continued with resume_workflow once the machine recovers. `temperatureC` is null unless the owner allowlists an unprivileged reader such as `macmon` in `AGENT_RELAY_TEMP_READER`.",
         "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
@@ -720,6 +742,28 @@ def create_http_handler(base_url=None, timeout=None):
                     _invalid("maxWaitMs must be a positive integer")
                 else:
                     value = _wait_workflow(base_url, args["workflowId"], wait_ms, timeout)
+            elif name == "wait_workflow_events":
+                args = _arguments_for(rpc, ["sessionId", "after", "maxWaitMs"])
+                _non_empty(args, "sessionId", 128)
+                after = args.get("after", 0)
+                if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+                    _invalid("after must be a non-negative integer")
+                max_wait = args.get("maxWaitMs", 60_000)
+                if not _is_positive_int(max_wait):
+                    _invalid("maxWaitMs must be a positive integer")
+                params = urlencode({"sessionId": args["sessionId"], "after": after})
+                path = f"/v1/workflows/events?{params}&waitMs={max_wait}"
+                try:
+                    value = _relay_request(base_url, path,
+                                           timeout=max(timeout, max_wait / 1000.0 + 5))
+                except RelayError as exc:
+                    limit = _relay_wait_limit(base_url, exc, max_wait)
+                    if limit is None:
+                        raise
+                    path = f"/v1/workflows/events?{params}&waitMs={limit}"
+                    value = _relay_request(base_url, path,
+                                           timeout=max(timeout, limit / 1000.0 + 5))
+                    value.update(waitMs=limit, waitClamped=True)
             elif name == "list_workflows":
                 args = _arguments_for(rpc, ["sessionId", "status", "limit"])
                 params = {}

@@ -41,7 +41,7 @@ Use it when the user wants to:
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
 - give an MCP client the six task tools (`list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`), the five workflow tools, and `get_pressure`; `tools/list` is
+  `list_tasks`, `cancel_task`), the six workflow tools, and `get_pressure`; `tools/list` is
   authoritative.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
@@ -200,7 +200,7 @@ bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints
 `/healthz`, `/v1/agents`, and the `list_agents` tool also report `revision`: the commit
 (`commit`, `short`) and commit `date` of the checkout the relay started from. A `date` weeks
 old means the running relay is stale: run `scripts/update.sh`. A field is `"unknown"` when
-the relay does not run from a git checkout. If the list is empty, the registry did not parse — the relay prints `Configuration error: ...`
+the relay does not run from a git checkout. If the list is empty, the registry did not parse — the relay prints a timestamped `Configuration error: ...` line
 and exits on a bad registry, so check the server log.
 
 ## 5. Delegate work
@@ -240,6 +240,10 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
   file that is not UTF-8 text is refused with `-32602` and nothing runs.
 - `get_workflow { workflowId, maxWaitMs? }` → the run with every step, its output, and its
   `startedAt` / `finishedAt` window (plus `attemptTimes`, one window per attempt).
+- `wait_workflow_events { sessionId, after?, maxWaitMs? }` → the session's ordered change
+  feed: each step or run status change with `workflowId`, `stepId`, `oldStatus`, `newStatus`
+  and a rising `seq`. Pass the last `seq` seen as `after`; an empty `events` list means the
+  wait ended with no change, so call again with the same `after`.
 - `list_workflows { sessionId?, status?, limit? }` → stored runs, most recent first.
 - `cancel_workflow { workflowId }` → cancel the run and every task it started.
 - `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
@@ -391,14 +395,26 @@ cannot read a sibling that has not finished.
 
 `foreach` fans one step into N tasks, `retries` absorbs task failures (`0`–`5`), and `repeat`
 with `untilOutputMatches` loops until the output matches a regular expression, failing with
-`repeat_limit_reached` when `max` is spent. `DELETE /v1/workflows/:id` cancels the run and
+`repeat_limit_reached` when `max` is spent. `failIfOutputMatches` goes the other way: when a
+completed task's output matches that regular expression, the step fails with
+`output_matched_fail_pattern` and its dependents are skipped, so an agent that reports
+`BLOCKED: ...` cannot feed a later step. `DELETE /v1/workflows/:id` cancels the run and
 every task it started. A run that does not finish inside `waitMs` returns the same
 `waitExpired` shape a task wait does.
+
+To learn about whichever run in a session changes first — an orchestrator running several
+workflows — read the session's change feed instead of polling each run:
+`GET /v1/workflows/events?sessionId=<id>&after=<seq>&waitMs=<ms>` (or the
+`wait_workflow_events` tool) long-polls and returns each step or run status change in order:
+`workflowId`, `stepId` (`null` for a run-level change), `oldStatus`, `newStatus`, and a
+rising `seq`. Pass the last `seq` seen as `after`; an empty `events` list means the wait
+ended with no change.
 
 **Host pressure.** `GET /v1/pressure` reads what this machine can tell you without root: the
 kernel's memory-pressure level, free-memory percentage, swap in use, and any thermal speed limit.
 It returns a `verdict` of `ok`, `warn` or `critical` with the `reasons` behind it, and
-`temperatureC` is null because `powermetrics` needs root. A `critical` verdict refuses a new
+`temperatureC` is null unless the owner allowlists an unprivileged reader such as `macmon` in
+`AGENT_RELAY_TEMP_READER`. A `critical` verdict refuses a new
 workflow with `503 device_pressure`, and while a run is active the relay re-reads the host every
 `AGENT_RELAY_PRESSURE_INTERVAL_MS` (default 5000) and stops every active run once the verdict has
 stayed `critical` for `AGENT_RELAY_PRESSURE_HOLD_MS` milliseconds (default 30000, read at least

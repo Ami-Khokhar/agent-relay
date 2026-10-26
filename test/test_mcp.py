@@ -99,8 +99,9 @@ class McpHandlerTests(unittest.TestCase):
             listed = handle({"method": "tools/list"})
             self.assertEqual([tool["name"] for tool in listed["tools"]],
                              ["list_agents", "delegate", "wait_task", "get_task", "list_tasks",
-                              "cancel_task", "run_workflow", "get_workflow", "list_workflows",
-                              "cancel_workflow", "resume_workflow", "get_pressure"])
+                              "cancel_task", "run_workflow", "get_workflow",
+                              "wait_workflow_events", "list_workflows", "cancel_workflow",
+                              "resume_workflow", "get_pressure"])
             agents = handle({"method": "tools/call", "params": {"name": "list_agents", "arguments": {}}})
             self.assertEqual(agents["structuredContent"]["agents"][0]["id"], "fake")
             submitted = handle({"method": "tools/call", "params": {
@@ -674,6 +675,61 @@ class McpHandlerTests(unittest.TestCase):
         finally:
             upstream.close()
 
+    def test_maps_wait_workflow_events_onto_the_events_endpoint(self):
+        def responder(method, path, body):
+            if path.startswith("/v1/workflows/events"):
+                return 200, {"events": [{"seq": 7, "workflowId": "wf-1", "stepId": "a",
+                                         "oldStatus": "running", "newStatus": "completed"}]}
+            return 200, {}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "wait_workflow_events",
+                "arguments": {"sessionId": "s-1", "after": 6, "maxWaitMs": 5000}}})
+            events = result["structuredContent"]["events"]
+            self.assertEqual(events[0]["seq"], 7)
+            self.assertEqual(events[0]["newStatus"], "completed")
+            self.assertEqual(upstream.calls[0][0], "GET")
+            self.assertEqual(upstream.calls[0][1],
+                             "/v1/workflows/events?sessionId=s-1&after=6&waitMs=5000")
+
+            # after defaults to 0 and maxWaitMs to 60000.
+            handle({"method": "tools/call", "params": {
+                "name": "wait_workflow_events", "arguments": {"sessionId": "s-1"}}})
+            self.assertEqual(upstream.calls[1][1],
+                             "/v1/workflows/events?sessionId=s-1&after=0&waitMs=60000")
+        finally:
+            upstream.close()
+
+    def test_wait_workflow_events_clamps_a_wait_above_the_relay_limit(self):
+        def responder(method, path, body):
+            if path == "/healthz":
+                return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+            if "waitMs=900000" in path:
+                return 400, {"error": "invalid_wait",
+                             "message": "waitMs must be an integer from 1 to 600000"}
+            return 200, {"events": []}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "wait_workflow_events",
+                "arguments": {"sessionId": "s-1", "maxWaitMs": 900000}}})
+            self.assertNotIn("isError", result)
+            value = result["structuredContent"]
+            self.assertEqual(value["events"], [])
+            self.assertEqual(value["waitMs"], 600000)
+            self.assertIs(value["waitClamped"], True)
+            self.assertEqual([call[1] for call in upstream.calls],
+                             ["/v1/workflows/events?sessionId=s-1&after=0&waitMs=900000",
+                              "/healthz",
+                              "/v1/workflows/events?sessionId=s-1&after=0&waitMs=600000"])
+        finally:
+            upstream.close()
+
     def test_validates_workflow_tool_arguments_before_calling_the_relay(self):
         upstream = FakeUpstream(lambda method, path, body: (200, {}))
         handle = mcp_server.create_http_handler(upstream.url, timeout=5)
@@ -685,6 +741,10 @@ class McpHandlerTests(unittest.TestCase):
             ("list_workflows", {"status": "timed_out"}),
             ("cancel_workflow", {}),
             ("resume_workflow", {"workflowId": "wf-1", "waitMs": -1}),
+            ("wait_workflow_events", {}),
+            ("wait_workflow_events", {"sessionId": "s-1", "after": -1}),
+            ("wait_workflow_events", {"sessionId": "s-1", "after": 1.5}),
+            ("wait_workflow_events", {"sessionId": "s-1", "maxWaitMs": 0}),
         ]
         try:
             for name, arguments in cases:
@@ -786,8 +846,10 @@ class McpHandlerTests(unittest.TestCase):
         self.assertEqual(spec["required"], ["steps"])
         step = spec["properties"]["steps"]["items"]
         self.assertEqual(step["required"], ["id", "agentId", "input"])
-        for key in ("needs", "foreach", "retries", "repeat", "timeoutMs", "cwd"):
+        for key in ("needs", "foreach", "retries", "repeat", "timeoutMs", "cwd",
+                    "failIfOutputMatches"):
             self.assertTrue(step["properties"][key].get("description"), f"{key} has no description")
+        self.assertEqual(step["properties"]["failIfOutputMatches"]["type"], "string")
         self.assertIn("list_agents", step["properties"]["agentId"]["description"])
         self.assertIn("{{id.output}}", step["properties"]["id"]["description"])
 
