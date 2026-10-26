@@ -104,6 +104,12 @@ WORKFLOW_SPEC = {
                                                "JSON array of the per-item outputs."},
                     "retries": {"type": "integer", "minimum": 0, "maximum": 5,
                                 "description": "Extra attempts after the task fails or times out."},
+                    "failIfOutputMatches": {"type": "string", "minLength": 1,
+                                            "description": "Python regular expression tested "
+                                                           "against the step's output; a match "
+                                                           "fails the step with "
+                                                           "output_matched_fail_pattern and "
+                                                           "skips its dependents."},
                     "repeat": {
                         "type": "object", "additionalProperties": False,
                         "required": ["max", "untilOutputMatches"],
