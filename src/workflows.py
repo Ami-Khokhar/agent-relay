@@ -17,6 +17,12 @@ out with ``foreach``, re-run on a task failure with ``retries``, loop until thei
 output matches a regular expression with ``repeat``, and fail when their own output
 matches a regular expression with ``failIfOutputMatches``.
 
+By default a step starts only once every step it needs has completed. A step may set
+``needsPolicy: "any"`` to tolerate a failed branch: it then starts once every need is
+terminal and at least one completed, and ``{{stepId.output}}`` of a need that did not
+complete renders as a short ``[id status: error]`` marker instead of its output. A step
+with no needs starts immediately under either policy.
+
 Every run is journaled to ``<state dir>/workflows/<id>.jsonl``. Completed steps therefore
 survive a relay restart with their output and their ``startedAt`` / ``finishedAt`` window,
 and ``resume`` continues a run without repeating finished work. Each step and run status
@@ -44,8 +50,10 @@ STEP_TERMINAL = frozenset(("completed", "failed", "skipped", "cancelled"))
 TASK_TERMINAL = frozenset(("completed", "failed", "timed_out", "cancelled"))
 
 WORKFLOW_FIELDS = frozenset(("name", "sessionId", "requestId", "steps"))
-STEP_FIELDS = frozenset(("id", "agentId", "input", "needs", "foreach", "timeoutMs", "cwd",
-                         "options", "readOnly", "retries", "repeat", "failIfOutputMatches"))
+STEP_FIELDS = frozenset(("id", "agentId", "input", "needs", "needsPolicy", "foreach",
+                         "timeoutMs", "cwd", "options", "readOnly", "retries", "repeat",
+                         "failIfOutputMatches"))
+NEEDS_POLICIES = ("all", "any")
 REPEAT_FIELDS = frozenset(("max", "untilOutputMatches"))
 
 MAX_REPEAT_ROUNDS = 10
@@ -88,6 +96,13 @@ def _step_cause(stderr, output):
     if QUOTA_CAUSE_RE.search(cause):
         return f"agent_quota: {cause}"
     return cause
+
+
+def _unmet_output(step):
+    """The stand-in for ``{{id.output}}`` of a need that did not complete."""
+    if step["error"]:
+        return f"[{step['id']} {step['status']}: {step['error']}]"
+    return f"[{step['id']} {step['status']}]"
 
 
 def _dependency_order(steps):
@@ -214,6 +229,11 @@ def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_in
         if step_id in needs:
             return bad("cyclic_dependency", f"Step {step_id} cannot depend on itself")
 
+        needs_policy = raw.get("needsPolicy", "all")
+        if needs_policy not in NEEDS_POLICIES:
+            return bad("invalid_needs_policy",
+                       f"Step {step_id}.needsPolicy must be one of: {', '.join(NEEDS_POLICIES)}")
+
         foreach = raw.get("foreach")
         if foreach is not None:
             if not isinstance(foreach, list) or not foreach:
@@ -310,6 +330,7 @@ def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_in
             "agentId": agent_id,
             "input": text,
             "needs": list(needs),
+            "needsPolicy": needs_policy,
             "foreach": list(foreach) if foreach is not None else None,
             "timeoutMs": timeout,
             "cwd": cwd,
@@ -722,6 +743,20 @@ class WorkflowEngine:
     def _release(self, workflow, step, by_id):
         """Move a step from pending to ready, or skip it when a dependency failed."""
         dependencies = [by_id[dep] for dep in step["_spec"]["needs"]]
+        # Nothing to wait for: start immediately under any policy, as under "all".
+        if not dependencies:
+            step["status"] = "ready"
+            return True
+        # A journal written before needsPolicy existed resumes with the field absent.
+        if (step["_spec"].get("needsPolicy") or "all") == "any":
+            if not all(dep["status"] in STEP_TERMINAL for dep in dependencies):
+                return False
+            if not any(dep["status"] == "completed" for dep in dependencies):
+                step["status"] = "skipped"
+                step["error"] = "dependency_not_completed"
+                return True
+            step["status"] = "ready"
+            return True
         if any(dep["status"] in ("failed", "skipped", "cancelled") for dep in dependencies):
             step["status"] = "skipped"
             step["error"] = "dependency_not_completed"
@@ -732,8 +767,13 @@ class WorkflowEngine:
         return False
 
     def _context(self, workflow, step, item, index):
-        outputs = {other["id"]: other["output"] for other in workflow["steps"]
-                   if other["status"] == "completed"}
+        outputs = {}
+        for other in workflow["steps"]:
+            if other["status"] == "completed":
+                outputs[other["id"]] = other["output"]
+            else:
+                # An "any" fan-in reads the needs that failed; an empty string would hide why.
+                outputs[other["id"]] = _unmet_output(other)
         context = {}
         for dep in workflow["_ancestors"][step["id"]]:
             value = outputs.get(dep) or ""

@@ -254,6 +254,66 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["after"]["error"], "dependency_not_completed")
         self.assertEqual(finished["after"]["taskIds"], [])
 
+    # ------------------------------------------------------------- needsPolicy
+
+    def test_a_needs_policy_any_step_runs_after_one_build_times_out_and_reads_a_marker_for_it(self):
+        relay = self.start([
+            echo(),
+            {"id": "slow", "command": PYTHON, "args": ["-c", SLOW]},
+        ])
+        workflow = run(relay, {"name": "compare", "steps": [
+            {"id": "build-ok", "agentId": "echo", "input": "build done"},
+            {"id": "build-slow", "agentId": "slow", "input": "zzz", "timeoutMs": 400},
+            {"id": "review", "agentId": "echo", "needs": ["build-ok", "build-slow"],
+             "needsPolicy": "any",
+             "input": "good={{build-ok.output}} bad={{build-slow.output}}"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["build-ok"]["status"], "completed")
+        self.assertEqual(finished["build-slow"]["status"], "failed")
+        # The review ran despite the timed-out build, and the failed need's output slot
+        # is a marker naming its status and error instead of the empty string.
+        self.assertEqual(finished["review"]["status"], "completed")
+        self.assertEqual(finished["review"]["output"],
+                         "good=build done bad=[build-slow failed: Agent exceeded 400 ms]")
+
+    def test_a_needs_policy_any_step_is_skipped_when_no_need_completed(self):
+        relay = self.start({"id": "gate", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]})
+        workflow = run(relay, {"steps": [
+            {"id": "left", "agentId": "gate", "input": "FAIL left"},
+            {"id": "right", "agentId": "gate", "input": "FAIL right"},
+            {"id": "review", "agentId": "gate", "needs": ["left", "right"],
+             "needsPolicy": "any", "input": "later"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["review"]["status"], "skipped")
+        self.assertEqual(finished["review"]["error"], "dependency_not_completed")
+        self.assertEqual(finished["review"]["taskIds"], [])
+
+    def test_a_needs_policy_any_step_with_no_needs_runs_immediately(self):
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "solo", "agentId": "echo", "input": "hello", "needsPolicy": "any"},
+        ]})
+        self.assertEqual(workflow["status"], "completed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["solo"]["status"], "completed")
+        self.assertEqual(finished["solo"]["output"], "hello")
+
+    def test_a_needs_policy_all_step_still_skips_when_a_need_fails(self):
+        relay = self.start({"id": "gate", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]})
+        workflow = run(relay, {"steps": [
+            {"id": "boom", "agentId": "gate", "input": "FAIL this"},
+            {"id": "after", "agentId": "gate", "needs": ["boom"], "needsPolicy": "all",
+             "input": "later"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["after"]["status"], "skipped")
+        self.assertEqual(finished["after"]["error"], "dependency_not_completed")
+
     def test_retries_a_failed_step_once_before_giving_up(self):
         mark = self.path("retry-mark")
         relay = self.start({"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
@@ -600,6 +660,10 @@ class WorkflowTests(unittest.TestCase):
              "unknown_agent"),
             ("unknown_need", {"steps": [{**base, "needs": ["zzz"]}]}, "unknown_step"),
             ("self_need", {"steps": [{**base, "needs": ["a"]}]}, "cyclic_dependency"),
+            ("bad_needs_policy", {"steps": [{**base, "needsPolicy": "some"}]},
+             "invalid_needs_policy"),
+            ("non_string_needs_policy", {"steps": [{**base, "needsPolicy": 1}]},
+             "invalid_needs_policy"),
             ("cycle", {"steps": [{**base, "needs": ["b"]},
                                  {"id": "b", "agentId": "echo", "input": "y",
                                   "needs": ["a"]}]}, "cyclic_dependency"),

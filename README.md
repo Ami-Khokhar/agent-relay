@@ -231,7 +231,7 @@ Task objects (the submit, get, wait, list and cancel responses, and the MCP tool
 
 ## Run a workflow
 
-A workflow is one JSON document: named steps, each bound to a registered agent, wired together with `needs`. The relay starts a step only once every step it needs has completed and threads each output into the next prompt, so a pipeline, a fan-out, or a review loop is one submission instead of a state machine in the caller.
+A workflow is one JSON document: named steps, each bound to a registered agent, wired together with `needs`. By default the relay starts a step only once every step it needs has completed and threads each output into the next prompt, so a pipeline, a fan-out, or a review loop is one submission instead of a state machine in the caller. A step that sets `"needsPolicy": "any"` instead starts once every need is terminal and at least one completed, so a fan-in such as a compare-and-pick review still runs when one of its branches failed or timed out.
 
 ```bash
 AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
@@ -256,6 +256,7 @@ Step fields:
 | `agentId` | A registered agent. |
 | `input` | Prompt for that agent. May contain `{{stepId.output}}`, and `{{item}}` and `{{index}}` on a `foreach` step. A reference must name a step in `needs`, directly or through another step. |
 | `needs` | Step ids that must complete first. The graph must be acyclic. |
+| `needsPolicy` | `"all"` (default) starts the step once every need completed. `"any"` waits until every need is terminal and starts it once at least one completed; `{{stepId.output}}` of a need that did not complete then reads as a short `[id status: error]` marker, and with none completed the step is skipped with `dependency_not_completed`. A step with no `needs` starts immediately under either policy. |
 | `foreach` | Fans the step out over an array of strings. The step completes when every item does, and `{{stepId.output}}` then reads as a JSON array of the item outputs. |
 | `retries` | Extra attempts after the task fails or times out, `0` to `5`. |
 | `repeat` | `{"max": 1..10, "untilOutputMatches": "regex"}` re-runs the step until its output matches. Spending `max` without matching fails the step with `repeat_limit_reached`. |
