@@ -7,6 +7,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKILL = os.path.join(ROOT, "skills", "agent-relay", "SKILL.md")
 USE_CASES = os.path.join(ROOT, "skills", "agent-relay", "references", "use-cases.md")
+ADAPTERS = os.path.join(ROOT, "skills", "agent-relay", "references", "adapters.md")
 
 
 def _frontmatter_lines():
@@ -65,6 +66,16 @@ class SkillFrontmatterTests(unittest.TestCase):
             self.assertIn(needle, text)
         self.assertNotIn("waitMs=600000", text)
         self.assertNotIn("until terminal", text)
+
+
+class CodexSandboxDocsTests(unittest.TestCase):
+    def test_docs_say_workspace_write_blocks_every_socket_and_show_the_network_option(self):
+        for path in (ADAPTERS, USE_CASES):
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            for needle in ("blocks every socket", "127.0.0.1",
+                           "-c sandbox_workspace_write.network_access=true", "opens all network"):
+                self.assertIn(needle, text, "%s is missing %r" % (path, needle))
 
 
 if __name__ == "__main__":
