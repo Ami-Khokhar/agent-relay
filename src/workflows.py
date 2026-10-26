@@ -13,8 +13,9 @@ steps that follow::
 
 Input strings are templates. ``{{stepId.output}}`` resolves against a completed
 dependency, ``{{item}}`` and ``{{index}}`` against a ``foreach`` expansion. Steps may fan
-out with ``foreach``, re-run on a task failure with ``retries``, and loop until their
-output matches a regular expression with ``repeat``.
+out with ``foreach``, re-run on a task failure with ``retries``, loop until their
+output matches a regular expression with ``repeat``, and fail when their own output
+matches a regular expression with ``failIfOutputMatches``.
 
 Every run is journaled to ``<state dir>/workflows/<id>.jsonl``. Completed steps therefore
 survive a relay restart with their output and their ``startedAt`` / ``finishedAt`` window,
@@ -41,7 +42,7 @@ TASK_TERMINAL = frozenset(("completed", "failed", "timed_out", "cancelled"))
 
 WORKFLOW_FIELDS = frozenset(("name", "sessionId", "requestId", "steps"))
 STEP_FIELDS = frozenset(("id", "agentId", "input", "needs", "foreach", "timeoutMs", "cwd",
-                         "options", "readOnly", "retries", "repeat"))
+                         "options", "readOnly", "retries", "repeat", "failIfOutputMatches"))
 REPEAT_FIELDS = frozenset(("max", "untilOutputMatches"))
 
 MAX_REPEAT_ROUNDS = 10
@@ -254,6 +255,19 @@ def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_in
             return bad("invalid_retries",
                        f"Step {step_id}.retries must be an integer between 0 and {MAX_RETRIES}")
 
+        fail_pattern = raw.get("failIfOutputMatches")
+        if fail_pattern is not None:
+            if not isinstance(fail_pattern, str) or not fail_pattern:
+                return bad("invalid_fail_if",
+                           f"Step {step_id}.failIfOutputMatches must be a non-empty regular "
+                           f"expression")
+            try:
+                re.compile(fail_pattern)
+            except re.error as exc:
+                return bad("invalid_fail_if",
+                           f"Step {step_id}.failIfOutputMatches is not a valid regular "
+                           f"expression: {exc}")
+
         repeat = raw.get("repeat")
         repeat_value = None
         if repeat is not None:
@@ -297,6 +311,7 @@ def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_in
             "readOnly": read_only,
             "retries": retries,
             "repeat": repeat_value,
+            "failIfOutputMatches": fail_pattern,
         })
 
     known_ids = {step["id"] for step in steps}
@@ -812,6 +827,16 @@ class WorkflowEngine:
         outputs = [task.get("output") or "" for task in tasks]
         step["output"] = json.dumps(outputs) if spec["foreach"] is not None else outputs[0]
         step["error"] = None
+
+        # The CLI exited 0 but the agent's own report says it failed; a dependent would
+        # otherwise run on a blocked result. A journal written before this field existed
+        # resumes with the check absent, not with a KeyError.
+        fail_pattern = spec.get("failIfOutputMatches")
+        if fail_pattern is not None and re.search(fail_pattern, step["output"]):
+            step["status"] = "failed"
+            step["error"] = "output_matched_fail_pattern"
+            self._settle(step)
+            return True
 
         if spec["repeat"] is not None:
             pattern = spec["repeat"]["untilOutputMatches"]

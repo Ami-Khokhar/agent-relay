@@ -387,7 +387,10 @@ cannot read a sibling that has not finished.
 
 `foreach` fans one step into N tasks, `retries` absorbs task failures (`0`–`5`), and `repeat`
 with `untilOutputMatches` loops until the output matches a regular expression, failing with
-`repeat_limit_reached` when `max` is spent. `DELETE /v1/workflows/:id` cancels the run and
+`repeat_limit_reached` when `max` is spent. `failIfOutputMatches` goes the other way: when a
+completed task's output matches that regular expression, the step fails with
+`output_matched_fail_pattern` and its dependents are skipped, so an agent that reports
+`BLOCKED: ...` cannot feed a later step. `DELETE /v1/workflows/:id` cancels the run and
 every task it started. A run that does not finish inside `waitMs` returns the same
 `waitExpired` shape a task wait does.
 

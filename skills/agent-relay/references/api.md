@@ -151,6 +151,7 @@ Step fields:
 | `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
 | `retries` | no | `0` to `5`; extra attempts after a task fails or times out. |
 | `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
+| `failIfOutputMatches` | no | Python regular expression. A match on the output of a completed task fails the step with `output_matched_fail_pattern` and skips its dependents. |
 | `timeoutMs` | no | Positive integer, same cap as a task. |
 | `cwd` | no | Same `allowedRoots` check as a task. |
 | `options` | no | `{"<name>": "<value>"}`, exactly as for a task submission. The agent decides which names and values it allows. |
@@ -167,7 +168,7 @@ Returns `202` with the run. Replaying the same `requestId` with the same documen
 
 Validation failures use `400` with: `invalid_steps`, `invalid_step_id`, `duplicate_step`,
 `unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_foreach`, `invalid_retries`,
-`invalid_repeat`, `invalid_template`, `unknown_reference`, `invalid_options`,
+`invalid_repeat`, `invalid_fail_if`, `invalid_template`, `unknown_reference`, `invalid_options`,
 `invalid_read_only`, `command_input_too_large`, and the shared `unknown_field`,
 `unknown_agent`, `input_required`, `invalid_name`, `invalid_session_id`,
 `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`.
@@ -373,7 +374,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].attemptTimes` | always | One `{startedAt, finishedAt}` window per attempt, oldest first; `finishedAt` is null for an attempt still open. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
 | `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
-| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the agent's stderr and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` in front when those lines name a usage limit, rate limit, or quota (any stated retry time stays inside the text). |
+| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the agent's stderr and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` in front when those lines name a usage limit, rate limit, or quota (any stated retry time stays inside the text). |
 | `steps[].errorDetail` | failed step, single run view only | The failing task's full stderr, behind its own field so the summary stays short; the list view never carries it. |
 
 ## Workflow journals

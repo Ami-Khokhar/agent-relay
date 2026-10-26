@@ -703,8 +703,10 @@ class McpHandlerTests(unittest.TestCase):
         self.assertEqual(spec["required"], ["steps"])
         step = spec["properties"]["steps"]["items"]
         self.assertEqual(step["required"], ["id", "agentId", "input"])
-        for key in ("needs", "foreach", "retries", "repeat", "timeoutMs", "cwd"):
+        for key in ("needs", "foreach", "retries", "repeat", "timeoutMs", "cwd",
+                    "failIfOutputMatches"):
             self.assertTrue(step["properties"][key].get("description"), f"{key} has no description")
+        self.assertEqual(step["properties"]["failIfOutputMatches"]["type"], "string")
         self.assertIn("list_agents", step["properties"]["agentId"]["description"])
         self.assertIn("{{id.output}}", step["properties"]["id"]["description"])
 

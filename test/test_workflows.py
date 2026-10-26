@@ -348,6 +348,33 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["check"]["error"], "repeat_limit_reached")
         self.assertEqual(finished["check"]["attempts"], 1)
 
+    # ------------------------------------------------------------ fail on own report
+
+    def test_fails_a_step_whose_output_matches_the_fail_pattern_and_skips_its_dependents(self):
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "fix", "agentId": "echo", "input": "BLOCKED: tests need a socket",
+             "failIfOutputMatches": "^BLOCKED"},
+            {"id": "ship", "agentId": "echo", "needs": ["fix"], "input": "ship it"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["fix"]["status"], "failed")
+        self.assertEqual(finished["fix"]["error"], "output_matched_fail_pattern")
+        self.assertEqual(finished["fix"]["output"], "BLOCKED: tests need a socket")
+        self.assertEqual(finished["ship"]["status"], "skipped")
+        self.assertEqual(finished["ship"]["error"], "dependency_not_completed")
+        self.assertEqual(finished["ship"]["taskIds"], [])
+
+    def test_completes_a_step_whose_output_does_not_match_the_fail_pattern(self):
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "fix", "agentId": "echo", "input": "DONE: fixed",
+             "failIfOutputMatches": "^BLOCKED"},
+        ]})
+        self.assertEqual(workflow["status"], "completed")
+        self.assertEqual(steps_of(workflow)["fix"]["status"], "completed")
+
     # ------------------------------------------------------------------- control
 
     def test_cancel_stops_the_run_and_its_running_children(self):
@@ -423,6 +450,40 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["first"]["finishedAt"], kept["finishedAt"])
         self.assertEqual(finished["first"]["attemptTimes"], kept["attemptTimes"])
         self.assertEqual(finished["second"]["output"], "recovered")
+
+    def test_resume_reads_a_journal_written_before_fail_if_output_matches_existed(self):
+        mark = self.path("legacy-journal-mark")
+        agents = [
+            echo(),
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+             "env": {"WF_MARK": mark}},
+        ]
+        relay = self.start(agents)
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "first", "agentId": "echo", "input": "kept"},
+            {"id": "second", "agentId": "flaky", "needs": ["first"], "input": "retry me"},
+        ]})
+        workflow_id = submitted["id"]
+        self.assertEqual(wait(relay, workflow_id)["status"], "failed")
+        self.stop(relay)
+
+        # Rewrite the journal the way a pre-failIfOutputMatches version wrote it.
+        journal = os.path.join(self.state, "workflows", f"{workflow_id}.jsonl")
+        with open(journal, encoding="utf-8") as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+        for record in records:
+            for step in record.get("spec", {}).get("steps", []):
+                step.pop("failIfOutputMatches", None)
+        with open(journal, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+        relay = self.start(agents)
+        status, _ = relay.request("POST", f"/v1/workflows/{workflow_id}/resume")
+        self.assertEqual(status, 202)
+        done = wait(relay, workflow_id)
+        self.assertEqual(done["status"], "completed")
+        self.assertEqual(steps_of(done)["second"]["output"], "recovered")
 
     def test_a_resumed_run_keeps_its_request_id(self):
         mark = self.path("resume-request-mark")
@@ -501,6 +562,12 @@ class WorkflowTests(unittest.TestCase):
             ("repeat_bad_regex",
              {"steps": [{**base, "repeat": {"max": 2, "untilOutputMatches": "("}}]},
              "invalid_repeat"),
+            ("fail_if_bad_regex", {"steps": [{**base, "failIfOutputMatches": "("}]},
+             "invalid_fail_if"),
+            ("fail_if_empty", {"steps": [{**base, "failIfOutputMatches": ""}]},
+             "invalid_fail_if"),
+            ("fail_if_not_a_string", {"steps": [{**base, "failIfOutputMatches": 5}]},
+             "invalid_fail_if"),
             ("zero_timeout", {"steps": [{**base, "timeoutMs": 0}]}, "invalid_timeout"),
             ("bad_cwd", {"steps": [{**base, "cwd": ""}]}, "invalid_cwd"),
             ("too_many_retries", {"steps": [{**base, "retries": 99}]}, "invalid_retries"),
