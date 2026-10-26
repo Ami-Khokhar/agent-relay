@@ -235,7 +235,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertIsNotNone(step["finishedAt"])
             self.assertLessEqual(step["startedAt"], step["finishedAt"])
         self.assertLessEqual(first["startedAt"], second["startedAt"])
-        self.assertLessEqual(second["startedAt"], first["finishedAt"])
+        self.assertLessEqual(first["finishedAt"], second["startedAt"])
 
         self.assertEqual(second["attempts"], 2)
         windows = second["attemptTimes"]
