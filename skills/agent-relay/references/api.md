@@ -182,7 +182,8 @@ the step starts, exactly as a registry change would be for a queued task.
 
 Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
 `finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `status`,
-`attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, and `error`.
+`attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, `error`, and
+(for a failed step) `errorDetail`.
 Every step carries `startedAt` and `finishedAt`, null until the step starts and finishes;
 `attemptTimes` is one `{startedAt, finishedAt}` window per attempt, oldest first, so a
 `retries` or `repeat` step reports each try separately.
@@ -197,8 +198,8 @@ A run that has left memory but still has a journal returns `404 unknown_workflow
 ### `GET /v1/workflows`
 
 Same query parameters as `GET /v1/tasks` (`sessionId`, `status`, `limit`), restricted to
-workflow statuses. Entries omit `spec`, and steps omit `output`, `taskIds`, and
-`attemptTimes`. Returns `{ "workflows": [ ... ] }`, most recent first.
+workflow statuses. Entries omit `spec`, and steps omit `output`, `taskIds`,
+`attemptTimes`, and `errorDetail`. Returns `{ "workflows": [ ... ] }`, most recent first.
 
 ### `GET /v1/workflows/events`
 
@@ -245,7 +246,7 @@ The host reading, with a verdict a caller can act on:
   "temperatureC": null,
   "temperatureReason": "macOS exposes no unprivileged CPU temperature; powermetrics needs root",
   "sampledAt": "2026-10-25T11:23:38.461Z",
-  "guard": { "enabled": true, "stopsAt": "critical" } }
+  "guard": { "enabled": true, "stopsAt": "critical", "holdMs": 30000 } }
 ```
 
 `verdict` is `critical` when the kernel reports critical memory pressure (`vm.memory_pressure`),
@@ -254,6 +255,13 @@ less than 4% of memory is free (`kern.memorystatus_level`), swap is at least 90%
 the softer readings (kernel warning, 12% free, 70% swap, 75% throttled); otherwise `ok`.
 `reasons` names the reading that decided it. Every signal is `null` when the host cannot report
 it, so a missing probe never fails the call.
+
+`guard` says whether the relay stops active runs on its own, at which verdict, and after how long:
+`holdMs` is `A2A_RELAY_PRESSURE_HOLD_MS` (default 30000), the time the verdict must stay
+`critical` before a running workflow is stopped, read at least twice so one spike between normal
+readings costs a run nothing. `holdMs` 0 stops on the first critical reading. A run the guard
+stops is `cancelled` with `error` beginning `device_pressure:`, naming how long pressure stayed
+critical and the readings that decided it.
 
 `POST /v1/workflows` returns `503 device_pressure` with this body while the verdict is
 `critical`. `temperatureC` is null on Apple Silicon; `thermal.speedLimitPercent` is null when
@@ -378,7 +386,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `sessionId` | always | Shared by every task the run starts. |
 | `createdAt` / `startedAt` / `finishedAt` | as applicable | ISO-8601; `startedAt` and `finishedAt` are null until reached. |
 | `spec` | single run only | The document as submitted, without the internal dependency closure. |
-| `error` | failed/cancelled | Names the first step that did not succeed. |
+| `error` | failed/cancelled | Names the first step that did not succeed; when that step failed, its short cause is appended after `: `. |
 | `steps[].id` / `agentId` / `needs` | always | As submitted. |
 | `steps[].status` | always | Step status values. |
 | `steps[].attempts` | always | How many times the step has run, restored from the journal on resume. |
@@ -386,7 +394,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].attemptTimes` | always | One `{startedAt, finishedAt}` window per attempt, oldest first; `finishedAt` is null for an attempt still open. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
 | `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
-| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `task_evicted_from_the_relay_store`, an adapter error, or a rejected submission message. |
+| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the agent's stderr and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` in front when those lines name a usage limit, rate limit, or quota (any stated retry time stays inside the text). |
+| `steps[].errorDetail` | failed step, single run view only | The failing task's full stderr, behind its own field so the summary stays short; the list view never carries it. |
 
 ## Workflow journals
 

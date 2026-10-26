@@ -245,7 +245,7 @@ TOOLS = [
     },
     {
         "name": "get_workflow",
-        "description": "Get a workflow run with every step: its status, attempts, startedAt and finishedAt, output, and error. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
+        "description": "Get a workflow run with every step: its status, attempts, startedAt and finishedAt, output, and error. A failed step's error is the short cause — the last non-empty lines the agent printed, with agent_quota in front when they name a quota or rate limit — and errorDetail (this detailed view only) keeps the agent's full stderr. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
         "inputSchema": {
             "type": "object", "required": ["workflowId"], "additionalProperties": False,
             "properties": {
@@ -315,7 +315,7 @@ TOOLS = [
     },
     {
         "name": "get_pressure",
-        "description": "Report how hard this machine is working: the kernel's memory pressure level and free percentage, swap in use, and any CPU thermal throttle. Call it before starting a long or multi-agent workflow: the relay refuses a new workflow while the verdict is `critical`, and its guard stops running workflows if the machine becomes critical mid-run. The verdict is `ok`, `warn` or `critical`, and `reasons` names the reading that decided it. A stopped run says `device_pressure:` at the start of its `error` and can be continued with resume_workflow once the machine recovers. `temperatureC` is null on Apple Silicon, because macOS exposes no unprivileged CPU temperature.",
+        "description": "Report how hard this machine is working: the kernel's memory pressure level and free percentage, swap in use, and any CPU thermal throttle. Call it before starting a long or multi-agent workflow: the relay refuses a new workflow while the verdict is `critical`, and its guard stops running workflows only after the verdict has stayed `critical` for `guard.holdMs` milliseconds (default 30000, read at least twice; `guard.holdMs` 0 stops on the first critical reading), so one spike does not cost a run its work. The verdict is `ok`, `warn` or `critical`, and `reasons` names the reading that decided it. A stopped run says `device_pressure:` at the start of its `error`, naming how long pressure held and the readings that decided it, and can be continued with resume_workflow once the machine recovers. `temperatureC` is null on Apple Silicon, because macOS exposes no unprivileged CPU temperature.",
         "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },

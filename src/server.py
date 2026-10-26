@@ -120,6 +120,13 @@ STATE_DIR = Path(_env("AGENT_RELAY_STATE_DIR", "A2A_RELAY_STATE_DIR")
 PRESSURE_GUARD = pressure.guard_enabled()
 PRESSURE_INTERVAL_MS = _positive_int(5000, "AGENT_RELAY_PRESSURE_INTERVAL_MS",
                                      "A2A_RELAY_PRESSURE_INTERVAL_MS")
+# How long the verdict must stay critical before the guard stops a run; 0 stops at once. Read
+# once, at startup, so a bad value stops the relay before any run starts instead of being
+# noticed in the middle of one.
+try:
+    PRESSURE_HOLD_MS = pressure.guard_hold_ms()
+except ValueError as error:
+    sys.exit(str(error))
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
@@ -1105,17 +1112,23 @@ def _purge_periodically():
 
 
 def _pressure_guard():
-    """Stop active runs when the host reaches critical pressure. An idle relay never probes."""
+    """Stop active runs once critical pressure has held for the whole hold time.
+
+    An idle relay never probes: with nothing running there is nothing to lose, and the streak
+    restarts with the next run instead of carrying its age across a quiet gap.
+    """
+    hold = pressure.CriticalHold(PRESSURE_HOLD_MS)
     while not SHUTTING_DOWN:
         time.sleep(PRESSURE_INTERVAL_MS / 1000.0)
         try:
             if not WORKFLOW_ENGINE.active_ids():
+                hold.reset()
                 continue
-            reading = pressure.snapshot()
-            if reading["verdict"] != "critical":
+            hold.sample(pressure.snapshot())
+            if not hold.should_stop():
                 continue
-            killed = WORKFLOW_ENGINE.kill_all(
-                "device_pressure: " + "; ".join(reading["reasons"]))
+            killed = WORKFLOW_ENGINE.kill_all(hold.message())
+            hold.reset()
             if killed:
                 print(f"device pressure critical: stopped {len(killed)} workflow run(s); "
                       f"resume them when the machine recovers", flush=True)

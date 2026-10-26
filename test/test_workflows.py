@@ -37,6 +37,16 @@ EXIT_ON_FAIL = (
     "print(sys.argv[1])\n"
     "sys.exit(1 if sys.argv[1].startswith('FAIL') else 0)\n"
 )
+# A CLI-shaped failure: banner lines first, the real cause last, on a line long enough that
+# keeping the whole transcript would flood the caller.
+BANNER_THEN_ERROR = (
+    "import sys\n"
+    "for line in ('Reading additional input from stdin...', 'compiling excuses',\n"
+    "             'still working'):\n"
+    "    sys.stderr.write(line + '\\n')\n"
+    "sys.stderr.write(\"ERROR: usage limit; try again at 4:40 PM \" + 'x' * 8000 + '\\n')\n"
+    "sys.exit(1)\n"
+)
 SLOW = "import time; time.sleep(30)"
 
 TERMINAL = ("completed", "failed", "cancelled")
@@ -235,7 +245,9 @@ class WorkflowTests(unittest.TestCase):
             {"id": "after", "agentId": "gate", "needs": ["boom"], "input": "later"},
         ]})
         self.assertEqual(workflow["status"], "failed")
-        self.assertEqual(workflow["error"], "step boom failed")
+        # The run's error carries the failed step's short cause: the last lines of the
+        # agent's stderr ("Agent exited with 1") and output ("FAIL this").
+        self.assertEqual(workflow["error"], "step boom failed: Agent exited with 1\nFAIL this")
         finished = steps_of(workflow)
         self.assertEqual(finished["boom"]["status"], "failed")
         self.assertEqual(finished["after"]["status"], "skipped")
@@ -264,6 +276,48 @@ class WorkflowTests(unittest.TestCase):
         finished = steps_of(workflow)
         self.assertEqual(finished["doomed"]["status"], "failed")
         self.assertEqual(finished["doomed"]["attempts"], 3)
+
+    def test_a_failed_step_shows_the_last_lines_the_agent_printed(self):
+        relay = self.start({"id": "noisy", "command": PYTHON, "args": ["-c", BANNER_THEN_ERROR]})
+        workflow = run(relay, {"steps": [
+            {"id": "codex", "agentId": "noisy", "input": "go"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        error = steps_of(workflow)["codex"]["error"]
+        self.assertIn("usage limit", error)
+        # The banner is the first line the agent printed; the cause is the last, and the
+        # long tail is capped so the summary stays short.
+        self.assertNotIn("Reading additional input from stdin", error)
+        self.assertLess(len(error), 3000)
+        # The run's own error carries the same cause, not just the step id.
+        self.assertIn("usage limit", workflow["error"])
+
+    def test_a_quota_failure_is_named_agent_quota_with_its_retry_time(self):
+        relay = self.start({"id": "noisy", "command": PYTHON, "args": ["-c", BANNER_THEN_ERROR]})
+        workflow = run(relay, {"steps": [
+            {"id": "codex", "agentId": "noisy", "input": "go"},
+        ]})
+        error = steps_of(workflow)["codex"]["error"]
+        self.assertTrue(error.startswith("agent_quota: "), error)
+        self.assertIn("try again at 4:40 PM", error)
+
+    def test_the_full_stderr_stays_available_as_error_detail(self):
+        relay = self.start({"id": "noisy", "command": PYTHON, "args": ["-c", BANNER_THEN_ERROR]})
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "codex", "agentId": "noisy", "input": "go"},
+        ]})
+        workflow = wait(relay, submitted["id"])
+        step = steps_of(workflow)["codex"]
+        self.assertIn("usage limit", step["error"])
+        # The single-run view keeps the whole transcript behind its own field.
+        self.assertIn("Reading additional input from stdin", step["errorDetail"])
+        self.assertIn("try again at 4:40 PM", step["errorDetail"])
+        self.assertGreater(len(step["errorDetail"]), len(step["error"]))
+        # The list summary carries the short cause only.
+        _, listing = relay.request("GET", "/v1/workflows")
+        listed = listing["workflows"][0]["steps"][0]
+        self.assertNotIn("errorDetail", listed)
+        self.assertNotIn("output", listed)
 
     # ---------------------------------------------------------------- step timing
 
