@@ -236,8 +236,8 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
   document, and `tools/list` types its steps, so you can author one from the schema. `specPath` is
   the absolute path of that document as a JSON file on the machine running the MCP server: the
   server reads it and submits it unchanged, so a workflow kept on disk runs without being retyped.
-  Pass exactly one of the two; both, neither, a missing file, a relative path or invalid JSON is
-  refused with `-32602` and nothing runs.
+  Pass exactly one of the two; both, neither, a missing file, a relative path, invalid JSON or a
+  file that is not UTF-8 text is refused with `-32602` and nothing runs.
 - `get_workflow { workflowId, maxWaitMs? }` → the run with every step, its output, and its
   `startedAt` / `finishedAt` window (plus `attemptTimes`, one window per attempt).
 - `list_workflows { sessionId?, status?, limit? }` → stored runs, most recent first.

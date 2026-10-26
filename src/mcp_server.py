@@ -243,9 +243,9 @@ TOOLS = [
                                             "machine running this server. The server reads the "
                                             "file and submits its document unchanged, exactly as "
                                             "if it had been passed as spec. A missing file, a "
-                                            "relative path or invalid JSON is refused with "
-                                            "-32602 and nothing runs. Pass exactly one of spec "
-                                            "and specPath."},
+                                            "relative path, invalid JSON or a file that is not "
+                                            "UTF-8 text is refused with -32602 and nothing runs. "
+                                            "Pass exactly one of spec and specPath."},
                 "waitMs": {"type": "integer", "minimum": 1,
                            "description": "Maximum time, in milliseconds, that this call waits for the run to reach a terminal state. If the run is still going when the wait ends, the result carries waitExpired: true; then call get_workflow again with the same workflowId. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
@@ -418,8 +418,8 @@ def _workflow_spec(args):
         _invalid("specPath must be an absolute path")
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
-        _invalid(f"specPath cannot be read: {path} ({exc.strerror or exc})")
+    except (OSError, UnicodeDecodeError) as exc:
+        _invalid(f"specPath cannot be read: {path} ({exc})")
     try:
         spec = json.loads(text)
     except ValueError as exc:

@@ -760,6 +760,25 @@ class McpHandlerTests(unittest.TestCase):
         finally:
             upstream.close()
 
+    def test_run_workflow_refuses_a_spec_file_that_is_not_utf8(self):
+        upstream = FakeUpstream(lambda method, path, body: (202, {"id": "wf-1", "status": "queued"}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "workflow.json")
+                for payload in (b"\xff\xfe{", b'{"steps": []}\x80'):
+                    with open(path, "wb") as saved:
+                        saved.write(payload)
+                    with self.subTest(payload=payload):
+                        with self.assertRaises(mcp_server.RpcError) as raised:
+                            handle({"method": "tools/call", "params": {
+                                "name": "run_workflow", "arguments": {"specPath": path}}})
+                        self.assertEqual(raised.exception.code, -32602)
+                        self.assertIn(path, raised.exception.message)
+            self.assertEqual(upstream.calls, [])
+        finally:
+            upstream.close()
+
     def test_run_workflow_spec_schema_documents_the_step_fields(self):
         handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
         tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
