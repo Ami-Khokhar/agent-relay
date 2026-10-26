@@ -182,7 +182,8 @@ the step starts, exactly as a registry change would be for a queued task.
 
 Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
 `finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `status`,
-`attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, and `error`.
+`attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, `error`, and
+(for a failed step) `errorDetail`.
 Every step carries `startedAt` and `finishedAt`, null until the step starts and finishes;
 `attemptTimes` is one `{startedAt, finishedAt}` window per attempt, oldest first, so a
 `retries` or `repeat` step reports each try separately.
@@ -197,8 +198,8 @@ A run that has left memory but still has a journal returns `404 unknown_workflow
 ### `GET /v1/workflows`
 
 Same query parameters as `GET /v1/tasks` (`sessionId`, `status`, `limit`), restricted to
-workflow statuses. Entries omit `spec`, and steps omit `output`, `taskIds`, and
-`attemptTimes`. Returns `{ "workflows": [ ... ] }`, most recent first.
+workflow statuses. Entries omit `spec`, and steps omit `output`, `taskIds`,
+`attemptTimes`, and `errorDetail`. Returns `{ "workflows": [ ... ] }`, most recent first.
 
 ### `DELETE /v1/workflows/:id`
 
@@ -357,7 +358,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `sessionId` | always | Shared by every task the run starts. |
 | `createdAt` / `startedAt` / `finishedAt` | as applicable | ISO-8601; `startedAt` and `finishedAt` are null until reached. |
 | `spec` | single run only | The document as submitted, without the internal dependency closure. |
-| `error` | failed/cancelled | Names the first step that did not succeed. |
+| `error` | failed/cancelled | Names the first step that did not succeed; when that step failed, its short cause is appended after `: `. |
 | `steps[].id` / `agentId` / `needs` | always | As submitted. |
 | `steps[].status` | always | Step status values. |
 | `steps[].attempts` | always | How many times the step has run, restored from the journal on resume. |
@@ -365,7 +366,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].attemptTimes` | always | One `{startedAt, finishedAt}` window per attempt, oldest first; `finishedAt` is null for an attempt still open. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
 | `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
-| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `task_evicted_from_the_relay_store`, an adapter error, or a rejected submission message. |
+| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the agent's stderr and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` in front when those lines name a usage limit, rate limit, or quota (any stated retry time stays inside the text). |
+| `steps[].errorDetail` | failed step, single run view only | The failing task's full stderr, behind its own field so the summary stays short; the list view never carries it. |
 
 ## Workflow journals
 

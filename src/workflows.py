@@ -48,9 +48,39 @@ MAX_REPEAT_ROUNDS = 10
 MAX_RETRIES = 5
 MAX_ITEM_CHARS = 1024
 
+# A failed step reports the cause, not the whole transcript: coding CLIs print a banner first
+# and the reason they failed last, so only the tail of each stream belongs in the summary.
+CAUSE_TAIL_LINES = 3
+CAUSE_MAX_CHARS = 2000
+QUOTA_CAUSE_RE = re.compile(r"usage limit|rate.?limit|quota|too many requests", re.IGNORECASE)
+
 
 def _text(value, limit):
     return isinstance(value, str) and 0 < len(value) <= limit
+
+
+def _tail_lines(text, keep):
+    """The last ``keep`` non-empty lines of a stream, whitespace-trimmed."""
+    return [line.strip() for line in (text or "").splitlines() if line.strip()][-keep:]
+
+
+def _step_cause(stderr, output):
+    """The short cause for a failed step: the last non-empty lines the agent printed.
+
+    The whole transcript stays on the task and in the step's ``errorDetail``. A quota or
+    rate-limit line names the cause ``agent_quota`` (with any stated retry time inside it),
+    so a caller can wait or switch agents without reading the transcript.
+    """
+    lines = _tail_lines(stderr, CAUSE_TAIL_LINES) + _tail_lines(output, CAUSE_TAIL_LINES)
+    kept = []
+    for line in reversed(lines):
+        if kept and sum(len(item) + 1 for item in kept) + len(line) > CAUSE_MAX_CHARS:
+            break
+        kept.append(line[:CAUSE_MAX_CHARS])
+    cause = "\n".join(reversed(kept))
+    if QUOTA_CAUSE_RE.search(cause):
+        return f"agent_quota: {cause}"
+    return cause
 
 
 def _dependency_order(steps):
@@ -561,6 +591,7 @@ class WorkflowEngine:
             "taskIds": [],
             "output": None,
             "error": None,
+            "errorDetail": None,
             "_spec": step,
             "_current": [],
         }
@@ -634,7 +665,12 @@ class WorkflowEngine:
                 elif "failed" in statuses or "skipped" in statuses:
                     culprit = next(step for step in workflow["steps"]
                                    if step["status"] in ("failed", "skipped"))
-                    workflow["error"] = f"step {culprit['id']} {culprit['status']}"
+                    message = f"step {culprit['id']} {culprit['status']}"
+                    if culprit["status"] == "failed" and culprit.get("error"):
+                        # The run's own error carries the cause, so the summary a caller sees
+                        # first is the last line the agent printed, not just the step id.
+                        message = f"{message}: {culprit['error']}"
+                    workflow["error"] = message
                     self._finish(workflow, "failed")
                 else:
                     self._finish(workflow, "completed")
@@ -754,9 +790,15 @@ class WorkflowEngine:
                 step["status"] = "ready"
                 self._end_attempt(step, self._now())
                 return True
+            failed = failures[0]
+            stderr = failed.get("error") or ""
+            cause = _step_cause(stderr, failed.get("output") or "")
             step["status"] = "failed"
-            step["error"] = failures[0].get("error") or failures[0]["status"]
-            step["output"] = failures[0].get("output") or None
+            step["error"] = cause or stderr or failed["status"]
+            # The full transcript stays available on request (a single-run view), never in
+            # the step error a summary or an event carries.
+            step["errorDetail"] = stderr or None
+            step["output"] = failed.get("output") or None
             self._settle(step)
             return True
 
@@ -905,4 +947,6 @@ class WorkflowEngine:
             view["attemptTimes"] = [dict(window) for window in step["attemptTimes"]]
             if step["output"] is not None:
                 view["output"] = step["output"]
+            if step["errorDetail"]:
+                view["errorDetail"] = step["errorDetail"]
         return view
