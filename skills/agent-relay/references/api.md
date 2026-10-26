@@ -221,7 +221,7 @@ The host reading, with a verdict a caller can act on:
   "temperatureC": null,
   "temperatureReason": "macOS exposes no unprivileged CPU temperature; powermetrics needs root",
   "sampledAt": "2026-10-25T11:23:38.461Z",
-  "guard": { "enabled": true, "stopsAt": "critical" } }
+  "guard": { "enabled": true, "stopsAt": "critical", "holdMs": 30000 } }
 ```
 
 `verdict` is `critical` when the kernel reports critical memory pressure (`vm.memory_pressure`),
@@ -230,6 +230,13 @@ less than 4% of memory is free (`kern.memorystatus_level`), swap is at least 90%
 the softer readings (kernel warning, 12% free, 70% swap, 75% throttled); otherwise `ok`.
 `reasons` names the reading that decided it. Every signal is `null` when the host cannot report
 it, so a missing probe never fails the call.
+
+`guard` says whether the relay stops active runs on its own, at which verdict, and after how long:
+`holdMs` is `A2A_RELAY_PRESSURE_HOLD_MS` (default 30000), the time the verdict must stay
+`critical` before a running workflow is stopped, read at least twice so one spike between normal
+readings costs a run nothing. `holdMs` 0 stops on the first critical reading. A run the guard
+stops is `cancelled` with `error` beginning `device_pressure:`, naming how long pressure stayed
+critical and the readings that decided it.
 
 `POST /v1/workflows` returns `503 device_pressure` with this body while the verdict is
 `critical`. `temperatureC` is null on Apple Silicon; `thermal.speedLimitPercent` is null when
