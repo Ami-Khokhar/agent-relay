@@ -200,7 +200,7 @@ bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints
 `/healthz`, `/v1/agents`, and the `list_agents` tool also report `revision`: the commit
 (`commit`, `short`) and commit `date` of the checkout the relay started from. A `date` weeks
 old means the running relay is stale: run `scripts/update.sh`. A field is `"unknown"` when
-the relay does not run from a git checkout. If the list is empty, the registry did not parse — the relay prints `Configuration error: ...`
+the relay does not run from a git checkout. If the list is empty, the registry did not parse — the relay prints a timestamped `Configuration error: ...` line
 and exits on a bad registry, so check the server log.
 
 ## 5. Delegate work
@@ -409,7 +409,8 @@ ended with no change.
 **Host pressure.** `GET /v1/pressure` reads what this machine can tell you without root: the
 kernel's memory-pressure level, free-memory percentage, swap in use, and any thermal speed limit.
 It returns a `verdict` of `ok`, `warn` or `critical` with the `reasons` behind it, and
-`temperatureC` is null because `powermetrics` needs root. A `critical` verdict refuses a new
+`temperatureC` is null unless the owner allowlists an unprivileged reader such as `macmon` in
+`AGENT_RELAY_TEMP_READER`. A `critical` verdict refuses a new
 workflow with `503 device_pressure`, and while a run is active the relay re-reads the host every
 `AGENT_RELAY_PRESSURE_INTERVAL_MS` (default 5000) and stops every active run once the verdict has
 stayed `critical` for `AGENT_RELAY_PRESSURE_HOLD_MS` milliseconds (default 30000, read at least

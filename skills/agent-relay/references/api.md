@@ -266,8 +266,10 @@ stops is `cancelled` with `error` beginning `device_pressure:`, naming how long 
 critical and the readings that decided it.
 
 `POST /v1/workflows` returns `503 device_pressure` with this body while the verdict is
-`critical`. `temperatureC` is null on Apple Silicon; `thermal.speedLimitPercent` is null when
-macOS has recorded no throttle.
+`critical`. `temperatureC` is null unless the owner allowlists an unprivileged reader in
+`AGENT_RELAY_TEMP_READER` (for example `macmon`); `AGENT_RELAY_TEMP_WARN_C` adds a `warn` reason
+at or above that many degrees. `thermal.speedLimitPercent` is null when macOS has recorded no
+throttle.
 
 ### `POST /v1/pressure/kill`
 

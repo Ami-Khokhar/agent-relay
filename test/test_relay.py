@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -116,7 +117,8 @@ class RelayTests(unittest.TestCase):
         _, stderr = proc.communicate(timeout=10)
         self.assertEqual(proc.returncode, 1)
         text = stderr.decode("utf-8")
-        self.assertTrue(text.startswith("Configuration error: Invalid command agent: bad"), text)
+        self.assertRegex(text, r"(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00 "
+                               r"Configuration error: Invalid command agent: bad")
         self.assertNotIn("Traceback (most recent call last)", text)
 
     def test_returns_413_for_oversized_requests_and_command_arguments(self):
@@ -510,6 +512,98 @@ class RelayTests(unittest.TestCase):
             self.assertNotIn("Traceback (most recent call last)", text)
         finally:
             relay.close()
+
+
+class RelayLogLineTests(unittest.TestCase):
+    """Every relay log line starts with a UTC ISO 8601 time and names the ids it stopped."""
+
+    def test_a_cancelled_task_and_a_stopped_run_are_named_in_the_timestamped_log(self):
+        directory = tempfile.mkdtemp(prefix="a2a-logline-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        state = tempfile.mkdtemp(prefix="a2a-logline-state-")
+        self.addCleanup(shutil.rmtree, state, True)
+        # A stub host that starts calm and turns critical when the test says so, so the
+        # submission preflight passes and later the guard stops the running workflow.
+        level_file = os.path.join(directory, "level")
+        with open(level_file, "w", encoding="utf-8") as handle:
+            handle.write("0\n")
+        probes = {
+            "sysctl": (
+                '#!/bin/sh\ncase "$2" in\n'
+                f'  vm.memory_pressure) cat "{level_file}" ;;\n'
+                "  kern.memorystatus_level) echo 60 ;;\n"
+                '  vm.swapusage) echo "total = 2048.00M  used = 100.00M  free = 1948.00M'
+                '  (encrypted)" ;;\n'
+                "  *) exit 1 ;;\nesac\n"
+            ),
+            "pmset": '#!/bin/sh\necho "Note: No thermal warning level has been recorded"\n',
+        }
+        env = {}
+        for name, body in probes.items():
+            path = os.path.join(directory, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            os.chmod(path, 0o755)
+            env["AGENT_RELAY_" + name.upper()] = path
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(30)"]},
+                      env={**env, "AGENT_RELAY_PRESSURE_GUARD": "1",
+                           "AGENT_RELAY_PRESSURE_INTERVAL_MS": "100",
+                           "AGENT_RELAY_PRESSURE_HOLD_MS": "0",
+                           "AGENT_RELAY_STATE_DIR": state})
+        try:
+            _, submitted = relay.request("POST", "/v1/workflows", {
+                "steps": [{"id": "wait", "agentId": "slow", "input": "long job"}]})
+            workflow_id = submitted["id"]
+            self.wait_step_running(relay, workflow_id)
+            _, task = relay.submit(agentId="slow", input="standalone")
+            task_id = task["id"]
+            self.wait_task_running(relay, task_id)
+
+            with open(level_file, "w", encoding="utf-8") as handle:
+                handle.write("2\n")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                _, view = relay.request("GET", f"/v1/workflows/{workflow_id}")
+                if view["status"] == "cancelled":
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("the guard never stopped the workflow")
+
+            relay.proc.send_signal(signal.SIGTERM)
+            relay.proc.wait(timeout=10)
+            lines = relay.proc.stdout.read().decode("utf-8").splitlines()
+        finally:
+            relay.close()
+
+        for line in lines:
+            if line:
+                self.assertRegex(line, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00 ", line)
+        startup = next(line for line in lines if "agent-relay listening at" in line)
+        self.assertTrue(startup.endswith(f"(registry: {relay.config})"), startup)
+        stopped = next(line for line in lines if "device pressure critical" in line)
+        self.assertIn(workflow_id, stopped)
+        cancelled = next(line for line in lines if "Received SIGTERM" in line)
+        self.assertIn(task_id, cancelled)
+        self.assertIn("cancelling 1 running task(s)", cancelled)
+
+    def wait_step_running(self, relay, workflow_id, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _, view = relay.request("GET", f"/v1/workflows/{workflow_id}")
+            if view["steps"][0]["status"] == "running":
+                return
+            time.sleep(0.02)
+        self.fail("the workflow step never started")
+
+    def wait_task_running(self, relay, task_id, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _, view = relay.request("GET", f"/v1/tasks/{task_id}")
+            if view["status"] == "running":
+                return
+            time.sleep(0.02)
+        self.fail("the task never started")
 
 
 class DefaultConfigPathTests(unittest.TestCase):

@@ -40,8 +40,13 @@ PMSET_STUB = """#!/bin/sh
 echo "pmset $1 $2" >> "@DIR@/calls"
 cat "@DIR@/therm"
 """
+READER_STUB = """#!/bin/sh
+echo "reader $*" >> "@DIR@/calls"
+cat "@DIR@/temp"
+"""
 SWAP_IDLE = "total = 2048.00M  used = 100.00M  free = 1948.00M  (encrypted)"
 NO_THERM = "Note: No thermal warning level has been recorded"
+TEMP_SAMPLE = '{"temp": {"cpu_temp_avg": 43.5}}'
 
 
 def echo(agent_id="echo"):
@@ -62,7 +67,9 @@ class PressureTests(unittest.TestCase):
         self.set_signal("free", "60")
         self.set_signal("swap", SWAP_IDLE)
         self.set_signal("therm", NO_THERM)
-        for name, body in (("sysctl", SYSCTL_STUB), ("pmset", PMSET_STUB)):
+        self.set_signal("temp", TEMP_SAMPLE)
+        for name, body in (("sysctl", SYSCTL_STUB), ("pmset", PMSET_STUB),
+                           ("reader", READER_STUB)):
             path = os.path.join(self.stubs, name)
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(body.replace("@DIR@", self.stubs))
@@ -147,6 +154,62 @@ class PressureTests(unittest.TestCase):
         self.assertIn("powermetrics", body["temperatureReason"])
         self.assertEqual(body["guard"], {"enabled": True, "stopsAt": "critical",
                                          "holdMs": 30000})
+
+    def test_an_allowlisted_reader_reports_temperature_and_absent_it_stays_null(self):
+        # macmon reads Apple Silicon's sensors through IOKit without root. The owner names it in
+        # the relay's own environment, and the relay takes the Celsius figure from its JSON line.
+        original = dict(os.environ)
+        os.environ["AGENT_RELAY_SYSCTL"] = os.path.join(self.stubs, "sysctl")
+        os.environ["AGENT_RELAY_PMSET"] = os.path.join(self.stubs, "pmset")
+        try:
+            os.environ.pop("AGENT_RELAY_TEMP_READER", None)
+            reading = pressure.snapshot()
+            self.assertIsNone(reading["temperatureC"])
+            self.assertIn("powermetrics", reading["temperatureReason"])
+
+            os.environ["AGENT_RELAY_TEMP_READER"] = (
+                os.path.join(self.stubs, "reader") + " pipe -s 1")
+            reading = pressure.snapshot()
+            self.assertEqual(reading["temperatureC"], 43.5)
+            self.assertIsNone(reading["temperatureReason"])
+            with open(os.path.join(self.stubs, "calls"), encoding="utf-8") as handle:
+                self.assertIn("reader pipe -s 1", handle.read())
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+
+    def test_a_reader_that_answers_nothing_leaves_temperature_null(self):
+        original = dict(os.environ)
+        os.environ["AGENT_RELAY_SYSCTL"] = os.path.join(self.stubs, "sysctl")
+        os.environ["AGENT_RELAY_PMSET"] = os.path.join(self.stubs, "pmset")
+        os.environ["AGENT_RELAY_TEMP_READER"] = os.path.join(self.stubs, "reader")
+        try:
+            self.set_signal("temp", "not json at all")
+            reading = pressure.snapshot()
+            self.assertIsNone(reading["temperatureC"])
+            self.assertIn("did not answer", reading["temperatureReason"])
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+
+    def test_a_temperature_limit_adds_a_warn_reason_at_or_above_it(self):
+        original = dict(os.environ)
+        os.environ["AGENT_RELAY_SYSCTL"] = os.path.join(self.stubs, "sysctl")
+        os.environ["AGENT_RELAY_PMSET"] = os.path.join(self.stubs, "pmset")
+        os.environ["AGENT_RELAY_TEMP_READER"] = os.path.join(self.stubs, "reader")
+        os.environ["AGENT_RELAY_TEMP_WARN_C"] = "75"
+        try:
+            self.set_signal("temp", '{"temp": {"cpu_temp_avg": 74}}')
+            reading = pressure.snapshot()
+            self.assertEqual(reading["verdict"], "ok")
+
+            self.set_signal("temp", '{"temp": {"cpu_temp_avg": 76.5}}')
+            reading = pressure.snapshot()
+            self.assertEqual(reading["verdict"], "warn")
+            self.assertIn("CPU temperature is 76.5C", reading["reasons"])
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
 
     def test_a_warning_verdict_still_runs_work(self):
         self.set_signal("level", "1")
