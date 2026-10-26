@@ -148,6 +148,7 @@ Step fields:
 | `agentId` | yes | Must match a registry id. |
 | `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. |
 | `needs` | no | Step ids that must complete first. Acyclic; forward references allowed. |
+| `needsPolicy` | no | `"all"` (default) starts the step once every need completed. `"any"` waits until every need is terminal and starts it once at least one completed, for a fan-in that tolerates a failed branch; `{{stepId.output}}` of a need that did not complete then renders as a short `[id status: error]` marker, and with none completed the step is skipped with `dependency_not_completed`. |
 | `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
 | `retries` | no | `0` to `5`; extra attempts after a task fails or times out. |
 | `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
@@ -167,9 +168,9 @@ Returns `202` with the run. Replaying the same `requestId` with the same documen
 `200`; with a different document, `409 idempotency_conflict`.
 
 Validation failures use `400` with: `invalid_steps`, `invalid_step_id`, `duplicate_step`,
-`unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_foreach`, `invalid_retries`,
-`invalid_repeat`, `invalid_fail_if`, `invalid_template`, `unknown_reference`, `invalid_options`,
-`invalid_read_only`, `command_input_too_large`, and the shared `unknown_field`,
+`unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_needs_policy`, `invalid_foreach`,
+`invalid_retries`, `invalid_repeat`, `invalid_fail_if`, `invalid_template`, `unknown_reference`,
+`invalid_options`, `invalid_read_only`, `command_input_too_large`, and the shared `unknown_field`,
 `unknown_agent`, `input_required`, `invalid_name`, `invalid_session_id`,
 `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`.
 

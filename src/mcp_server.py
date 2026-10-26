@@ -97,6 +97,16 @@ WORKFLOW_SPEC = {
                                         "pattern": "^[A-Za-z0-9_.~-]{1,128}$"},
                               "description": "Step ids that must complete first. A step with no "
                                              "needs starts immediately; the graph must be acyclic."},
+                    "needsPolicy": {"type": "string", "enum": ["all", "any"],
+                                    "description": "How needs gate this step. \"all\" (default) "
+                                                   "starts it once every need completed. \"any\" "
+                                                   "waits until every need is terminal and starts "
+                                                   "it once at least one completed, for a fan-in "
+                                                   "that tolerates a failed branch; "
+                                                   "{{id.output}} of a need that did not "
+                                                   "complete then reads as a short "
+                                                   "[id status: error] marker, and with none "
+                                                   "completed the step is skipped."},
                     "foreach": {"type": "array", "minItems": 1,
                                 "items": {"type": "string", "minLength": 1, "maxLength": 1024},
                                 "description": "Run this step once per item, in parallel, with "
@@ -238,7 +248,7 @@ TOOLS = [
     },
     {
         "name": "run_workflow",
-        "description": "Submit a whole multi-agent workflow in one call: named steps, each bound to a registered agent, wired together with needs. Use this instead of calling delegate repeatedly when you already know the shape of the work: a pipeline (A writes, B reviews, C fixes), a fan-out over several items, or a review loop. The relay starts a step only once every step it needs has completed, threads each output into the next prompt, and owns the queue, timeouts, cancellation, and retries. A step whose dependency did not succeed is skipped and the run fails, so a broken review never reaches the fix step. The relay refuses the run with device_pressure while this machine is under critical host pressure, so call get_pressure first when the run will be long. Returns the run with every step's status; pass waitMs to block until it finishes. Get valid agentId values from list_agents first. The spec schema in tools/list describes every step field.",
+        "description": "Submit a whole multi-agent workflow in one call: named steps, each bound to a registered agent, wired together with needs. Use this instead of calling delegate repeatedly when you already know the shape of the work: a pipeline (A writes, B reviews, C fixes), a fan-out over several items, or a review loop. The relay starts a step only once every step it needs has completed, threads each output into the next prompt, and owns the queue, timeouts, cancellation, and retries. A step whose dependency did not succeed is skipped and the run fails, so a broken review never reaches the fix step; set the step's needsPolicy to \"any\" to start it once at least one need has completed and the others are terminal, for a fan-in that tolerates a failed branch. The relay refuses the run with device_pressure while this machine is under critical host pressure, so call get_pressure first when the run will be long. Returns the run with every step's status; pass waitMs to block until it finishes. Get valid agentId values from list_agents first. The spec schema in tools/list describes every step field.",
         "inputSchema": {
             "type": "object", "required": ["spec"], "additionalProperties": False,
             "properties": {
