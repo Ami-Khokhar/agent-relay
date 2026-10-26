@@ -1,0 +1,16 @@
+{
+  "name": "pipeline-demo",
+  "steps": [
+    {
+      "id": "draft",
+      "agentId": "demo",
+      "input": "alpha"
+    },
+    {
+      "id": "polish",
+      "agentId": "demo",
+      "needs": ["draft"],
+      "input": "polish({{draft.output}})"
+    }
+  ]
+}

@@ -1,22 +1,84 @@
-# Local agent relay
+# Agent Relay
 
-One agent can submit a task to another agent through a small local HTTP service. The relay owns task IDs, status, cancellation, timeouts, and a registry of adapters. An MCP stdio entry point exposes the same service as tools to orchestrating agents.
+Delegate tasks between coding agents through a local HTTP service or MCP tools.
+Declare a workflow once, and the relay starts each step when its dependencies finish
+and passes their results into the next prompt.
 
-## Run
+For example: Claude writes a change, Codex reviews it, and Claude receives the review
+to make corrections. The relay tracks the tasks, queues work, handles timeouts and
+cancellation, and journals workflow progress so completed steps survive a restart.
 
-Python 3.9 or newer is required. There are no package dependencies.
-
-```bash
-python3 src/server.py
+```text
+write (Claude) ──→ review (Codex) ──→ fix (Claude)
+       └───────────────────────────────↑
+              implementation + review
 ```
 
-The HTTP API listens on `http://127.0.0.1:43124` by default. Every `/v1/` request needs the API token (see [Local security model](#local-security-model)); the relay creates it on first start at `~/.config/agent-relay/token`, and the MCP interface and `scripts/smoke.sh` read it from there. Start the MCP interface in a second process when the orchestrating client supports MCP:
+[Quickstart](#quickstart) · [Connect your coding agent](#connect-your-coding-agent) ·
+[Workflows](#run-a-workflow) · [API reference](skills/agent-relay/references/api.md) ·
+[Security](#local-security-model)
+
+## Quickstart
+
+Python 3.9 or newer and Git are required. There are no Python package dependencies.
+Try the bundled demonstration adapter first. It echoes text, requires no model
+account, and makes no model calls.
 
 ```bash
-python3 src/mcp_server.py
+git clone https://github.com/Ami-Khokhar/agent-relay.git
+cd agent-relay
+python3 - <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+registry = {"agents": [{
+    "id": "demo", "type": "stdio", "command": sys.executable,
+    "args": [str(root / "examples" / "stdio_adapter.py")], "cwd": str(root)
+}]}
+with (root / "config" / "agents.json").open("x") as handle:
+    json.dump(registry, handle, indent=2)
+PYTHON
+AGENT_RELAY_AGENTS_FILE="$PWD/config/agents.json" python3 src/server.py
 ```
 
-Configure that command as a local stdio MCP server in the client. It provides `list_agents`, `delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`, `list_workflows`, `cancel_workflow`, `resume_workflow`, and `get_pressure`. `A2A_RELAY_URL` overrides the HTTP address it calls. When the relay is unreachable and the URL is loopback, the MCP process starts the HTTP service detached on first use and logs it to `~/.local/state/agent-relay/relay.log`; disable that with `A2A_RELAY_AUTOSTART=0`.
+Keep that terminal open. In another terminal, from the same checkout:
+
+```bash
+curl -sS http://127.0.0.1:43124/healthz
+AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
+curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/workflows \
+  -H 'content-type: application/json' \
+  --data-binary @examples/workflow.json
+```
+
+Copy the returned `id` into this command:
+
+```bash
+curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/workflows/WORKFLOW_ID?waitMs=600000'
+```
+
+The run finishes with `status: "completed"`. Its step outputs are:
+
+```text
+draft:  example harness received: alpha
+polish: example harness received: polish(example harness received: alpha)
+```
+
+The [workflow document](examples/workflow.json) uses `needs: ["draft"]` to wait
+for the first step and `{{draft.output}}` to pass its result to the next one.
+This checks the relay and output threading. To run real coding work, stop the demo relay with Ctrl-C, replace the
+`demo` entry with your installed agents as described in [Register an agent](#register-an-agent),
+set each agent's project directory, and restart the relay. Verify the selected
+agent with `bash scripts/smoke.sh <agentId>` before submitting coding work.
+
+The relay runs as your OS user and can start agents that change files. Keep it local
+and register only adapters you trust. See [Local security model](#local-security-model).
+
+## Connect your coding agent
+
+The HTTP API listens on `http://127.0.0.1:43124` by default. Every `/v1/` request needs the API token (see [Local security model](#local-security-model)); the relay creates it on first start at `~/.config/agent-relay/token`, and the MCP interface and `scripts/smoke.sh` read it from there. Configure `python3 /abs/path/to/agent-relay/src/mcp_server.py` as a local stdio MCP server in your client. The client launches this process when it connects. It provides `list_agents`, `delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`, `list_workflows`, `cancel_workflow`, `resume_workflow`, and `get_pressure`. `A2A_RELAY_URL` overrides the HTTP address it calls. When the relay is unreachable and the URL is loopback, the MCP process starts the HTTP service detached on first use and logs it to `~/.local/state/agent-relay/relay.log`; disable that with `A2A_RELAY_AUTOSTART=0`.
 
 Register the MCP server once with copy-paste commands (use absolute paths; `bash skills/agent-relay/scripts/setup.sh` prints these for your checkout):
 
@@ -218,7 +280,7 @@ AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
 curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/agents
 curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/tasks \
   -H 'content-type: application/json' \
-  -d '{"agentId":"codex","requestId":"review-2026-09-23-1","input":"Inspect this project and report the main risks","cwd":"/path/to/git/project"}'
+  -d '{"agentId":"codex","requestId":"review-2026-09-23-1","sessionId":"review-2026-09-23-1","input":"Inspect this project and report the main risks","cwd":"/path/to/git/project"}'
 curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/tasks?sessionId=review-2026-09-23-1'
 curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/tasks/TASK_ID?waitMs=600000'
 curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/tasks/TASK_ID?includeInput=true'
@@ -237,15 +299,19 @@ A workflow is one JSON document: named steps, each bound to a registered agent, 
 AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
 curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/workflows \
   -H 'content-type: application/json' \
-  -d '{"name":"review-loop","steps":[
+  -d '{"name":"write-review-fix","steps":[
         {"id":"write","agentId":"claude","input":"Fix the failing test"},
         {"id":"review","agentId":"codex","needs":["write"],"input":"Review this change and report findings:\n\n{{write.output}}"},
-        {"id":"prove","agentId":"claude","needs":["review"],"input":"Address the review of:\n\n{{write.output}}"}]}'
+        {"id":"fix","agentId":"claude","needs":["review"],"input":"Apply the review findings.\n\nImplementation:\n{{write.output}}\n\nReview findings:\n{{review.output}}"}]}'
 curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/workflows/WORKFLOW_ID?waitMs=600000'
 curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/workflows?status=completed'
 curl -sS -H "$AUTH" -X DELETE http://127.0.0.1:43124/v1/workflows/WORKFLOW_ID
 curl -sS -H "$AUTH" -X POST http://127.0.0.1:43124/v1/workflows/WORKFLOW_ID/resume
 ```
+
+The `fix` step receives both the implementation summary and the review findings.
+Each agent also needs the correct project `cwd` in its registry entry or step. Outputs
+are text passed into prompts, not file synchronization between separate checkouts.
 
 Step fields:
 

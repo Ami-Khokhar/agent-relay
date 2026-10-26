@@ -61,28 +61,46 @@ for task in tasks:
 
 ## 3. Pipeline / chaining
 
-A produces, B reviews, C fixes. Pass each output into the next `input`.
+Prefer `run_workflow` (or `POST /v1/workflows`) for a declared chain. The relay
+waits for dependencies and passes their output into each prompt:
 
-1. `outA = delegate(A, spec)` → `wait_task`
-2. `outB = delegate(B, "Review this and list concrete problems:\n" + outA.output)` → `wait_task`
-3. `outC = delegate(C, "Apply these fixes:\n" + outB.output)` → `wait_task`
+```json
+{
+  "name": "write-review-fix",
+  "steps": [
+    {"id": "write", "agentId": "claude", "input": "Fix the failing test"},
+    {"id": "review", "agentId": "codex", "needs": ["write"],
+     "input": "Review the change. Implementation summary:\n{{write.output}}"},
+    {"id": "fix", "agentId": "claude", "needs": ["review"],
+     "input": "Apply the review findings.\nImplementation:\n{{write.output}}\nReview findings:\n{{review.output}}"}
+  ]
+}
+```
 
-Each `wait_task` here means the loop from the fan-out pattern: wait about 110000 ms or less,
-and wait again while `waitExpired` is true. Read `.output` only from a terminal result.
+Configure each agent to use the intended checkout, or set `cwd` on each step inside
+that agent's `allowedRoots`. Passing output does not copy changed files between
+checkouts. Wait with `get_workflow`, and wait again while `waitExpired` is true.
+A failed dependency skips downstream steps. A journaled run can be resumed without
+repeating completed steps. See [workflow API](api.md) for fields and statuses.
 
-Give the whole chain one `sessionId` for traceability. If an agent the relay started is
-itself wired to the relay as an MCP client, it can delegate further: its `delegate` calls carry
-the relay's lineage (`parentTaskId`), so the relay applies its delegation policy (`delegateTo`,
-no cycles, depth and task budgets).
+Use separate task submissions when the caller must inspect a result and decide
+which agent or prompt comes next. Give those tasks the same `sessionId` and distinct
+`requestId` values. An agent the relay started can also delegate through the lineage
+policy described in the README.
 
 ## 4. Review loop
 
-Two harnesses checking each other:
+The chain above performs one review and one correction. For a fixed number of
+alternating reviews and corrections, declare more steps with `needs`. For a loop
+whose next action depends on interpreting findings, keep that decision in the caller
+and cap the rounds.
 
-- B reviews A's change and returns findings.
-- Feed findings back to A as a new task (new `requestId`, same `sessionId`).
-- Repeat until findings are empty or a max round count is hit. Cap the rounds; there is no
-  built-in loop.
+A workflow step also supports `repeat: {"max": 3, "untilOutputMatches": "^PASS$"}`.
+This repeats that step until its output matches the regex or the attempt limit is
+spent. It does not repeat the whole write-review-fix chain, and a matching string is
+not independent verification of the change. Use `retries` for failed or timed-out
+tasks instead. Repeated or resumed work may repeat partial file changes made by an
+unfinished attempt, so make those operations safe to run again.
 
 ## 5. Wrap a harness that has no convenient CLI
 
