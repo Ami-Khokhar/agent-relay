@@ -241,7 +241,9 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 - `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
   that already completed.
 - `get_pressure {}` → the host reading: `verdict` (`ok`, `warn`, `critical`), `reasons`,
-  memory, swap, and any thermal throttle. Call it before a long run.
+  memory, swap, any thermal throttle, and the `guard` section (`enabled`, `stopsAt`, and
+  `holdMs`, how long pressure must stay critical before a running run is stopped). Call it
+  before a long run.
 
 Task objects leave out `input` and carry `inputChars` (its length) instead, because you
 already hold the prompt you sent. Pass `includeInput: true` to `get_task` (or
@@ -394,11 +396,14 @@ kernel's memory-pressure level, free-memory percentage, swap in use, and any the
 It returns a `verdict` of `ok`, `warn` or `critical` with the `reasons` behind it, and
 `temperatureC` is null because `powermetrics` needs root. A `critical` verdict refuses a new
 workflow with `503 device_pressure`, and while a run is active the relay re-reads the host every
-`AGENT_RELAY_PRESSURE_INTERVAL_MS` (default 5000) and stops every active run if it turns critical.
-`POST /v1/pressure/kill` is the same stop on demand. A stopped run is `cancelled` with `error`
-starting `device_pressure:` and keeps its journal, so `POST /v1/workflows/:id/resume` continues it
-without repeating the steps that finished. `AGENT_RELAY_PRESSURE_GUARD=0` turns the automatic stop
-off and leaves the endpoints in place.
+`AGENT_RELAY_PRESSURE_INTERVAL_MS` (default 5000) and stops every active run once the verdict has
+stayed `critical` for `AGENT_RELAY_PRESSURE_HOLD_MS` milliseconds (default 30000, read at least
+twice), so a single spike between normal readings does not end a run;
+`AGENT_RELAY_PRESSURE_HOLD_MS=0` stops on the first critical reading. `POST /v1/pressure/kill` is
+the same stop on demand. A stopped run is `cancelled` with `error` starting `device_pressure:`,
+naming how long pressure held and the readings that decided it, and keeps its journal, so
+`POST /v1/workflows/:id/resume` continues it without repeating the steps that finished.
+`AGENT_RELAY_PRESSURE_GUARD=0` turns the automatic stop off and leaves the endpoints in place.
 
 Runs journal to `<state dir>/workflows/<id>.jsonl` (`AGENT_RELAY_STATE_DIR`, default
 `~/.local/state/agent-relay`), so `POST /v1/workflows/:id/resume` continues a failed or interrupted run without

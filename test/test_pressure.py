@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -29,7 +30,7 @@ SLOW_ONCE = (
 SYSCTL_STUB = """#!/bin/sh
 echo "sysctl $1 $2" >> "@DIR@/calls"
 case "$2" in
-  vm.memory_pressure) cat "@DIR@/level" ;;
+  vm.memory_pressure) level=$(cat "@DIR@/level"); echo "level=$level" >> "@DIR@/calls"; echo "$level" ;;
   kern.memorystatus_level) cat "@DIR@/free" ;;
   vm.swapusage) cat "@DIR@/swap" ;;
   *) exit 1 ;;
@@ -85,6 +86,22 @@ class PressureTests(unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             return len(handle.readlines())
 
+    def level_samples(self, text):
+        """How many times a probe read the memory-pressure level and got `text`."""
+        path = os.path.join(self.stubs, "calls")
+        if not os.path.exists(path):
+            return 0
+        with open(path, encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip() == text)
+
+    def wait_level_sample(self, text, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.level_samples(text):
+                return
+            time.sleep(0.02)
+        raise RuntimeError(f"no probe ever read the level {text}")
+
     def start(self, agents, env=None):
         relay = Relay(agents, env={
             # The probes are named, not found on PATH: the relay never searches PATH for them.
@@ -128,7 +145,8 @@ class PressureTests(unittest.TestCase):
         self.assertIsNone(body["thermal"]["speedLimitPercent"])
         self.assertIsNone(body["temperatureC"])
         self.assertIn("powermetrics", body["temperatureReason"])
-        self.assertEqual(body["guard"], {"enabled": True, "stopsAt": "critical"})
+        self.assertEqual(body["guard"], {"enabled": True, "stopsAt": "critical",
+                                         "holdMs": 30000})
 
     def test_a_warning_verdict_still_runs_work(self):
         self.set_signal("level", "1")
@@ -283,7 +301,10 @@ class PressureTests(unittest.TestCase):
     # ------------------------------------------------------------------- the guard
 
     def test_the_guard_stops_a_running_workflow_when_pressure_turns_critical(self):
-        relay = self.start({"id": "slow", "command": PYTHON, "args": ["-c", SLOW]})
+        # A hold of 0 is the stop-at-once rule: the first critical reading ends the run, and the
+        # message still says how long pressure held and which reading decided it.
+        relay = self.start({"id": "slow", "command": PYTHON, "args": ["-c", SLOW]},
+                           env={"AGENT_RELAY_PRESSURE_HOLD_MS": "0"})
         _, submitted = relay.request("POST", "/v1/workflows", {
             "steps": [{"id": "wait", "agentId": "slow", "input": "long job"}]})
         workflow_id = submitted["id"]
@@ -294,6 +315,75 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(stopped["status"], "cancelled")
         self.assertTrue(stopped["error"].startswith("device_pressure: "), stopped["error"])
         self.assertIn("the kernel reports critical memory pressure", stopped["error"])
+        held = re.search(r"critical for (\d+\.\d+)s across 1 reading; decided by ", stopped["error"])
+        self.assertIsNotNone(held, stopped["error"])
+        self.assertLess(float(held.group(1)), 1.0, stopped["error"])
+        self.assertRegex(stopped["error"], r"decided by \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+    def test_one_critical_reading_between_normal_ones_leaves_the_run_going(self):
+        # The reading that cost a long run its work in progress: one critical sample between two
+        # normal ones is a spike, not a state, so the run must keep running.
+        relay = self.start({"id": "slow", "command": PYTHON, "args": ["-c", SLOW]},
+                           env={"AGENT_RELAY_PRESSURE_INTERVAL_MS": "500"})
+        _, submitted = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "wait", "agentId": "slow", "input": "long job"}]})
+        workflow_id = submitted["id"]
+        self.wait_step(relay, workflow_id, "wait", "running")
+
+        self.set_signal("level", "2")
+        self.wait_level_sample("level=2")  # the guard read exactly one critical level
+        self.set_signal("level", "0")
+        self.wait_level_sample("level=0")  # and a normal one after it
+        time.sleep(1.2)  # several more guard intervals with nothing critical to see
+
+        _, view = relay.request("GET", f"/v1/workflows/{workflow_id}")
+        self.assertEqual(view["status"], "running",
+                         f"the guard stopped the run on a spike: {view.get('error')}")
+        self.assertEqual(self.level_samples("level=2"), 1,
+                         "the test never isolated a single critical reading")
+
+    def test_the_guard_stops_only_after_critical_pressure_holds_for_the_hold_time(self):
+        relay = self.start({"id": "slow", "command": PYTHON, "args": ["-c", SLOW]},
+                           env={"AGENT_RELAY_PRESSURE_INTERVAL_MS": "100",
+                                "AGENT_RELAY_PRESSURE_HOLD_MS": "400"})
+        _, submitted = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "wait", "agentId": "slow", "input": "long job"}]})
+        workflow_id = submitted["id"]
+        self.wait_step(relay, workflow_id, "wait", "running")
+
+        self.set_signal("level", "2")
+        stopped = self.wait_workflow(relay, workflow_id, timeout=15)
+        self.assertEqual(stopped["status"], "cancelled")
+        error = stopped["error"]
+        self.assertTrue(error.startswith("device_pressure: "), error)
+        self.assertIn("the kernel reports critical memory pressure", error)
+        held = re.search(r"critical for (\d+\.\d+)s", error)
+        self.assertIsNotNone(held, error)
+        # The whole hold, not one reading: the stop waited out the sustained critical state.
+        self.assertGreaterEqual(float(held.group(1)), 0.4, error)
+        readings = re.search(r"across (\d+) readings", error)
+        self.assertIsNotNone(readings, error)
+        self.assertGreaterEqual(int(readings.group(1)), 2, error)
+        self.assertRegex(error, r"decided by \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.*"
+                                r"the kernel reports critical memory pressure")
+
+    def test_the_reading_reports_the_guard_hold_setting(self):
+        # Either spelling of the setting reaches the reading; the unset default is asserted by
+        # test_reports_the_host_reading_and_what_this_host_cannot_give above.
+        relay = self.start(echo(), env={"AGENT_RELAY_PRESSURE_HOLD_MS": "1500"})
+        _, reading = relay.request("GET", "/v1/pressure")
+        self.assertEqual(reading["guard"]["holdMs"], 1500)
+
+        relay = self.start(echo(), env={"AGENT_RELAY_PRESSURE_HOLD_MS": None,
+                                        "A2A_RELAY_PRESSURE_HOLD_MS": "2500"})
+        _, reading = relay.request("GET", "/v1/pressure")
+        self.assertEqual(reading["guard"]["holdMs"], 2500)
+
+    def test_a_hold_that_is_not_a_non_negative_integer_stops_the_relay(self):
+        with self.assertRaises(RuntimeError) as caught:
+            self.start(echo(), env={"AGENT_RELAY_PRESSURE_HOLD_MS": "-1"})
+        self.assertIn("AGENT_RELAY_PRESSURE_HOLD_MS must be a non-negative integer",
+                      str(caught.exception))
 
     def test_an_idle_relay_never_probes_the_host(self):
         relay = self.start([echo(), {"id": "slow", "command": PYTHON, "args": ["-c", SLOW]}])

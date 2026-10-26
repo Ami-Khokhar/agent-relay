@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 
 PROBE_TIMEOUT_S = 2
@@ -37,6 +38,9 @@ WARN_FREE_PERCENT = 12
 WARN_SWAP_PERCENT = 70
 WARN_SPEED_LIMIT = 75
 TEMPERATURE_REASON = ("macOS exposes no unprivileged CPU temperature; powermetrics needs root")
+# How long the verdict must stay critical before the guard stops a run. A spike between two
+# normal readings costs a long run its work in progress, so one reading is not a state.
+DEFAULT_GUARD_HOLD_MS = 30_000
 
 
 # The probes run outside any sandbox, as the user a read-only task runs as, and a task may write
@@ -123,6 +127,78 @@ def guard_enabled():
     return True
 
 
+def guard_hold_ms():
+    """How long the verdict must stay critical before the guard stops a run, in milliseconds.
+
+    The one implementation of the setting: the guard thread stops from this answer and the
+    reading reports it, so the two cannot disagree. Either spelling counts, an empty value
+    falls through to the alias, and no value at all means ``DEFAULT_GUARD_HOLD_MS``. ``0``
+    keeps the stop-at-once rule; a value that is not a non-negative integer raises
+    ``ValueError``, which the relay reports at startup instead of guessing.
+    """
+    for name in ("AGENT_RELAY_PRESSURE_HOLD_MS", "A2A_RELAY_PRESSURE_HOLD_MS"):
+        value = os.environ.get(name)
+        if value:
+            hold = _as_int(value)
+            if hold is None or hold < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+            return hold
+    return DEFAULT_GUARD_HOLD_MS
+
+
+class CriticalHold:
+    """How long critical pressure has held, and the readings that prove it.
+
+    The guard feeds it one reading at a time: a critical verdict joins the streak and anything
+    else clears it, so one critical reading between two normal ones never stops a run. The
+    streak stops a run once it has held the whole hold time and has been read at least twice —
+    a second reading is what separates a state from a spike — except that a hold of 0 keeps the
+    stop-at-once rule and stops on the first reading. The stop message carries the duration and
+    every reading that counted, so a stopped run says why rather than only that.
+    """
+
+    def __init__(self, hold_ms):
+        self.hold_ms = hold_ms
+        self.readings = []
+        self._started = None
+
+    def reset(self):
+        """Forget the streak, so the next critical reading starts a new one."""
+        self.readings = []
+        self._started = None
+
+    def sample(self, reading, now=None):
+        """Take one host reading into the streak; a non-critical verdict clears it."""
+        if reading["verdict"] != "critical":
+            self.reset()
+            return
+        if not self.readings:
+            self._started = time.monotonic() if now is None else now
+        self.readings.append(reading)
+
+    def should_stop(self, now=None):
+        """Whether critical pressure has held long enough to stop every active run."""
+        if not self.readings:
+            return False
+        if self.hold_ms and len(self.readings) < 2:
+            return False
+        now = time.monotonic() if now is None else now
+        return now - self._started >= self.hold_ms / 1000.0
+
+    def message(self, now=None):
+        """The stop reason: how long pressure held and the readings that decided it.
+
+        Call only once ``should_stop`` said yes: there is no duration to report without a streak.
+        """
+        held = (time.monotonic() if now is None else now) - self._started
+        decided_by = " | ".join(f"{reading['sampledAt']} {', '.join(reading['reasons'])}"
+                                for reading in self.readings)
+        count = len(self.readings)
+        plural = "reading" if count == 1 else "readings"
+        return (f"device_pressure: critical for {held:.1f}s across {count} {plural}; "
+                f"decided by {decided_by}")
+
+
 def snapshot():
     """One reading of this host, with a verdict a caller can act on."""
     level = PRESSURE_LEVELS.get(_as_int(_sysctl("vm.memory_pressure")))
@@ -164,7 +240,8 @@ def snapshot():
         "temperatureC": None,
         "temperatureReason": TEMPERATURE_REASON,
         "sampledAt": _now_iso(),
-        "guard": {"enabled": guard_enabled(), "stopsAt": "critical"},
+        "guard": {"enabled": guard_enabled(), "stopsAt": "critical",
+                  "holdMs": guard_hold_ms()},
     }
 
 
