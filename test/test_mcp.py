@@ -6,6 +6,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -693,6 +694,69 @@ class McpHandlerTests(unittest.TestCase):
                                 "params": {"name": name, "arguments": arguments}})
                     self.assertEqual(raised.exception.code, -32602)
             self.assertEqual(len(upstream.calls), 0)
+        finally:
+            upstream.close()
+
+    def test_run_workflow_reads_a_spec_file_and_submits_the_document_unchanged(self):
+        def responder(method, path, body):
+            if method == "POST" and path == "/v1/workflows":
+                return 202, {"id": "wf-1", "status": "queued"}
+            return 200, {"id": "wf-1", "status": "completed", "steps": []}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        document = {"name": "review-loop",
+                    "steps": [{"id": "a", "agentId": "fake", "input": "x"},
+                              {"id": "b", "agentId": "fake", "needs": ["a"], "input": "y"}]}
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "workflow.json")
+                with open(path, "w", encoding="utf-8") as saved:
+                    json.dump(document, saved)
+                result = handle({"method": "tools/call", "params": {
+                    "name": "run_workflow", "arguments": {"specPath": path, "waitMs": 2000}}})
+            self.assertNotIn("isError", result)
+            self.assertEqual(result["structuredContent"]["status"], "completed")
+            self.assertEqual(upstream.calls[0][:2], ("POST", "/v1/workflows"))
+            self.assertEqual(upstream.calls[0][2], document)
+            self.assertEqual(upstream.calls[1][1], "/v1/workflows/wf-1?waitMs=2000")
+            tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+            schema = tools["run_workflow"]["inputSchema"]
+            spec_path = schema["properties"]["specPath"]
+            self.assertEqual(spec_path["type"], "string")
+            self.assertTrue(spec_path["description"])
+            self.assertEqual(schema["anyOf"], [{"required": ["spec"]}, {"required": ["specPath"]}])
+            self.assertNotIn("required", schema)
+        finally:
+            upstream.close()
+
+    def test_run_workflow_refuses_a_bad_spec_path_before_it_calls_the_relay(self):
+        upstream = FakeUpstream(lambda method, path, body: (202, {"id": "wf-1", "status": "queued"}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                saved_path = os.path.join(directory, "workflow.json")
+                with open(saved_path, "w", encoding="utf-8") as saved:
+                    json.dump({"steps": []}, saved)
+                broken_path = os.path.join(directory, "broken.json")
+                with open(broken_path, "w", encoding="utf-8") as broken:
+                    broken.write("{not json")
+                cases = [
+                    ({"spec": {"steps": []}, "specPath": saved_path},
+                     "exactly one of spec or specPath"),
+                    ({"specPath": os.path.join(directory, "absent.json")}, "cannot be read"),
+                    ({"specPath": broken_path}, "not valid JSON"),
+                    ({"specPath": "workflow.json"}, "absolute path"),
+                    ({}, "exactly one of spec or specPath"),
+                ]
+                for arguments, needle in cases:
+                    with self.subTest(arguments=arguments):
+                        with self.assertRaises(mcp_server.RpcError) as raised:
+                            handle({"method": "tools/call", "params": {
+                                "name": "run_workflow", "arguments": arguments}})
+                        self.assertEqual(raised.exception.code, -32602)
+                        self.assertIn(needle, raised.exception.message)
+            self.assertEqual(upstream.calls, [])
         finally:
             upstream.close()
 
