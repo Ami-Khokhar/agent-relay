@@ -292,6 +292,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["review"]["error"], "dependency_not_completed")
         self.assertEqual(finished["review"]["taskIds"], [])
 
+    def test_a_needs_policy_any_step_with_no_needs_runs_immediately(self):
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "solo", "agentId": "echo", "input": "hello", "needsPolicy": "any"},
+        ]})
+        self.assertEqual(workflow["status"], "completed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["solo"]["status"], "completed")
+        self.assertEqual(finished["solo"]["output"], "hello")
+
     def test_a_needs_policy_all_step_still_skips_when_a_need_fails(self):
         relay = self.start({"id": "gate", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]})
         workflow = run(relay, {"steps": [

@@ -20,7 +20,8 @@ matches a regular expression with ``failIfOutputMatches``.
 By default a step starts only once every step it needs has completed. A step may set
 ``needsPolicy: "any"`` to tolerate a failed branch: it then starts once every need is
 terminal and at least one completed, and ``{{stepId.output}}`` of a need that did not
-complete renders as a short ``[id status: error]`` marker instead of its output.
+complete renders as a short ``[id status: error]`` marker instead of its output. A step
+with no needs starts immediately under either policy.
 
 Every run is journaled to ``<state dir>/workflows/<id>.jsonl``. Completed steps therefore
 survive a relay restart with their output and their ``startedAt`` / ``finishedAt`` window,
@@ -742,6 +743,10 @@ class WorkflowEngine:
     def _release(self, workflow, step, by_id):
         """Move a step from pending to ready, or skip it when a dependency failed."""
         dependencies = [by_id[dep] for dep in step["_spec"]["needs"]]
+        # Nothing to wait for: start immediately under any policy, as under "all".
+        if not dependencies:
+            step["status"] = "ready"
+            return True
         # A journal written before needsPolicy existed resumes with the field absent.
         if (step["_spec"].get("needsPolicy") or "all") == "any":
             if not all(dep["status"] in STEP_TERMINAL for dep in dependencies):

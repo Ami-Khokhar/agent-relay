@@ -148,7 +148,7 @@ Step fields:
 | `agentId` | yes | Must match a registry id. |
 | `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. |
 | `needs` | no | Step ids that must complete first. Acyclic; forward references allowed. |
-| `needsPolicy` | no | `"all"` (default) starts the step once every need completed. `"any"` waits until every need is terminal and starts it once at least one completed, for a fan-in that tolerates a failed branch; `{{stepId.output}}` of a need that did not complete then renders as a short `[id status: error]` marker, and with none completed the step is skipped with `dependency_not_completed`. |
+| `needsPolicy` | no | `"all"` (default) starts the step once every need completed. `"any"` waits until every need is terminal and starts it once at least one completed, for a fan-in that tolerates a failed branch; `{{stepId.output}}` of a need that did not complete then renders as a short `[id status: error]` marker, and with none completed the step is skipped with `dependency_not_completed`. A step with no `needs` starts immediately under either policy. |
 | `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
 | `retries` | no | `0` to `5`; extra attempts after a task fails or times out. |
 | `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
