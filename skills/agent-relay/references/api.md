@@ -182,7 +182,10 @@ the step starts, exactly as a registry change would be for a queued task.
 
 Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
 `finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `status`,
-`attempts`, `taskIds`, `output`, and `error`.
+`attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, and `error`.
+Every step carries `startedAt` and `finishedAt`, null until the step starts and finishes;
+`attemptTimes` is one `{startedAt, finishedAt}` window per attempt, oldest first, so a
+`retries` or `repeat` step reports each try separately.
 
 `?waitMs=<ms>` long-polls until the run is terminal or the wait elapses; a wait that ends
 first adds `waitExpired: true`, `waitedMs` and `hint`, exactly as a task wait does. A
@@ -194,8 +197,8 @@ A run that has left memory but still has a journal returns `404 unknown_workflow
 ### `GET /v1/workflows`
 
 Same query parameters as `GET /v1/tasks` (`sessionId`, `status`, `limit`), restricted to
-workflow statuses. Entries omit `spec`, and steps omit `output` and `taskIds`. Returns
-`{ "workflows": [ ... ] }`, most recent first.
+workflow statuses. Entries omit `spec`, and steps omit `output`, `taskIds`, and
+`attemptTimes`. Returns `{ "workflows": [ ... ] }`, most recent first.
 
 ### `DELETE /v1/workflows/:id`
 
@@ -205,9 +208,10 @@ An already terminal run is returned unchanged.
 ### `POST /v1/workflows/:id/resume`
 
 Reads `<state dir>/workflows/<id>.jsonl`, restores the steps that completed with their
-outputs and attempt counts, and schedules the rest. Returns `202` with the restarted run.
-`409 workflow_active` when the run is still going, `404 unknown_workflow` when nothing is
-journaled under that id. The request takes no body and needs no `content-type`.
+outputs, attempt counts, and time windows, and schedules the rest. Returns `202` with the
+restarted run. `409 workflow_active` when the run is still going, `404 unknown_workflow`
+when nothing is journaled under that id. The request takes no body and needs no
+`content-type`.
 
 ### `GET /v1/pressure`
 
@@ -357,6 +361,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].id` / `agentId` / `needs` | always | As submitted. |
 | `steps[].status` | always | Step status values. |
 | `steps[].attempts` | always | How many times the step has run, restored from the journal on resume. |
+| `steps[].startedAt` / `steps[].finishedAt` | always | ISO-8601, null until the step starts and finishes; a step that never ran keeps both null. Restored from the journal on resume. |
+| `steps[].attemptTimes` | always | One `{startedAt, finishedAt}` window per attempt, oldest first; `finishedAt` is null for an attempt still open. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
 | `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
 | `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `task_evicted_from_the_relay_store`, an adapter error, or a rejected submission message. |
@@ -367,7 +373,7 @@ Each run appends to `<state dir>/workflows/<id>.jsonl`, one JSON object per line
 
 ```jsonl
 {"type":"created","at":"ISO-8601","spec":{...}}
-{"type":"step","at":"ISO-8601","step":"write","status":"completed","output":"...","attempts":1}
+{"type":"step","at":"ISO-8601","step":"write","status":"completed","output":"...","attempts":1,"startedAt":"ISO-8601","finishedAt":"ISO-8601","attemptTimes":[{"startedAt":"ISO-8601","finishedAt":"ISO-8601"}]}
 {"type":"resumed","at":"ISO-8601"}
 {"type":"finished","at":"ISO-8601","status":"completed"}
 ```

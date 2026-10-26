@@ -205,6 +205,48 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["doomed"]["status"], "failed")
         self.assertEqual(finished["doomed"]["attempts"], 3)
 
+    # ---------------------------------------------------------------- step timing
+
+    def test_gives_each_step_and_each_attempt_its_own_time_window(self):
+        mark = self.path("times-mark")
+        relay = self.start([
+            echo(),
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+             "env": {"WF_MARK": mark}},
+        ])
+        status, submitted = relay.request("POST", "/v1/workflows", {"name": "times", "steps": [
+            {"id": "one", "agentId": "echo", "input": "alpha"},
+            {"id": "two", "agentId": "flaky", "needs": ["one"], "input": "beta",
+             "retries": 1},
+        ]})
+        self.assertEqual(status, 202)
+        # Nothing has run yet, so every window is still empty.
+        for step in submitted["steps"]:
+            self.assertIn("startedAt", step)
+            self.assertIn("finishedAt", step)
+            self.assertIsNone(step["startedAt"])
+            self.assertIsNone(step["finishedAt"])
+
+        workflow = wait(relay, submitted["id"])
+        self.assertEqual(workflow["status"], "completed")
+        first, second = steps_of(workflow)["one"], steps_of(workflow)["two"]
+        for step in (first, second):
+            self.assertIsNotNone(step["startedAt"])
+            self.assertIsNotNone(step["finishedAt"])
+            self.assertLessEqual(step["startedAt"], step["finishedAt"])
+        self.assertLessEqual(first["startedAt"], second["startedAt"])
+        self.assertLessEqual(first["finishedAt"], second["startedAt"])
+
+        self.assertEqual(second["attempts"], 2)
+        windows = second["attemptTimes"]
+        self.assertEqual(len(windows), second["attempts"])
+        for window in windows:
+            self.assertIsNotNone(window["startedAt"])
+            self.assertIsNotNone(window["finishedAt"])
+            self.assertLessEqual(window["startedAt"], window["finishedAt"])
+        self.assertLessEqual(windows[0]["startedAt"], windows[1]["startedAt"])
+        self.assertLessEqual(windows[0]["finishedAt"], windows[1]["startedAt"])
+
     # ---------------------------------------------------------- per-step task options
 
     def test_passes_step_options_through_to_the_child_task(self):
@@ -298,7 +340,14 @@ class WorkflowTests(unittest.TestCase):
         workflow_id = submitted["id"]
         failed = wait(relay, workflow_id)
         self.assertEqual(failed["status"], "failed")
-        self.assertEqual(steps_of(failed)["first"]["output"], "kept")
+        kept = steps_of(failed)["first"]
+        self.assertEqual(kept["output"], "kept")
+        # The step that the resume will skip must already carry its window, so the journal
+        # has something to keep.
+        self.assertIsNotNone(kept["startedAt"])
+        self.assertIsNotNone(kept["finishedAt"])
+        self.assertLessEqual(kept["startedAt"], kept["finishedAt"])
+        self.assertEqual(len(kept["attemptTimes"]), kept["attempts"])
         self.stop(relay)
 
         # Restart against the same state directory: the journal is all that survives.
@@ -316,6 +365,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["first"]["output"], "kept")
         self.assertEqual(finished["first"]["attempts"], 1)
         self.assertEqual(finished["first"]["taskIds"], [])
+        self.assertEqual(finished["first"]["startedAt"], kept["startedAt"])
+        self.assertEqual(finished["first"]["finishedAt"], kept["finishedAt"])
+        self.assertEqual(finished["first"]["attemptTimes"], kept["attemptTimes"])
         self.assertEqual(finished["second"]["output"], "recovered")
 
     def test_a_resumed_run_keeps_its_request_id(self):
