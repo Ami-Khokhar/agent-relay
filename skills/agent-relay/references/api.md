@@ -189,9 +189,21 @@ Every step carries `startedAt` and `finishedAt`, null until the step starts and 
 `attemptTimes` is one `{startedAt, finishedAt}` window per attempt, oldest first, so a
 `retries` or `repeat` step reports each try separately.
 
+`?view=summary` returns a small projection for an orchestrator that only needs to know
+which step finished: no `spec`, and each step carries its identity, `needs`, `status`,
+`attempts`, time windows, `error`, plus `outputChars` (the output's length) and `firstLine`
+(its first line) instead of the full `output`, `taskIds`, and `errorDetail`. The summary is
+smaller than the full view whenever an output is long.
+
+`?step=<stepId>` returns that one step alone, with its full `output`, `taskIds`,
+`attemptTimes`, and (for a failed step) `errorDetail`, and no `spec`. A step the run does
+not have is `404 unknown_step`; a `step` that is not a valid step id shape is
+`400 invalid_step`. Both selectors combine with `?waitMs=`.
+
 `?waitMs=<ms>` long-polls until the run is terminal or the wait elapses; a wait that ends
 first adds `waitExpired: true`, `waitedMs` and `hint`, exactly as a task wait does. A
-`waitMs` outside `1..maxWaitMs` returns `400 invalid_wait`.
+`waitMs` outside `1..maxWaitMs` returns `400 invalid_wait`. A `view` other than `summary`
+returns `400 invalid_view`.
 
 A run that has left memory but still has a journal returns `404 unknown_workflow` with a
 `message` pointing at `POST /v1/workflows/:id/resume`.
@@ -338,7 +350,7 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 | `list_tasks` | `{ sessionId?, status?, limit? }` | `{ tasks: [...] }`. |
 | `cancel_task` | `{ taskId }` | Cancelled task. |
 | `run_workflow` | `{ spec \| specPath, waitMs? }` | Submitted run; with `waitMs`, the terminal run, or the current run with `waitExpired: true` if the wait elapses first. `spec` is the workflow document itself, typed with the full step schema in `tools/list`. Pass `specPath` instead for the absolute path of a JSON file holding that document: the MCP server reads the file and submits its content unchanged, exactly as if it had been passed as `spec`. Exactly one of `spec` and `specPath` is required; both, neither, a missing file, a relative path, invalid JSON or a file that is not UTF-8 text is refused with JSON-RPC `-32602` and no run is submitted. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
-| `get_workflow` | `{ workflowId, maxWaitMs? }` | The run with every step and its output; with `maxWaitMs`, the terminal run, or the current run with `waitExpired: true`. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
+| `get_workflow` | `{ workflowId, view?, step?, maxWaitMs? }` | The run with every step and its output; with `maxWaitMs`, the terminal run, or the current run with `waitExpired: true`. A wait above the relay's `A2A_RELAY_MAX_WAIT_MS` is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. `view: "summary"` omits the spec and each step's full output, carrying `outputChars` and `firstLine` instead; `step` returns that one step with its full output and `errorDetail`. Both ride along on the long-poll path. |
 | `wait_workflow_events` | `{ sessionId, after?, maxWaitMs? }` | The session's change feed: `{ events: [ { seq, workflowId, stepId, oldStatus, newStatus } ] }`, oldest first, waiting up to `maxWaitMs` (default 60000) for the next change and returning an empty list when the wait ends. `after` (default 0) is the seq of the last event seen. A `maxWaitMs` above the relay limit is clamped to that limit, never raised, and the result then carries `waitMs` and `waitClamped: true`. |
 | `list_workflows` | `{ sessionId?, status?, limit? }` | `{ workflows: [...] }`. |
 | `cancel_workflow` | `{ workflowId }` | Cancelled run. |

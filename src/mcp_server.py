@@ -11,6 +11,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -23,6 +24,8 @@ from urllib.parse import quote, urlencode, urlsplit
 STATUSES = ("queued", "running", "completed", "failed", "timed_out", "cancelled")
 WORKFLOW_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 FALSE_VALUES = ("0", "false", "no", "off")
+# Mirrors the relay's own step id rule, so a bad selector is refused before the call.
+STEP_ID_RE = re.compile(r"^[A-Za-z0-9_.~-]{1,128}$")
 
 
 def _env(*names, default=None):
@@ -260,12 +263,17 @@ TOOLS = [
     },
     {
         "name": "get_workflow",
-        "description": "Get a workflow run with every step: its status, attempts, startedAt and finishedAt, output, and error. A failed step's error is the short cause — the last non-empty lines the agent printed, with agent_quota in front when they name a quota or rate limit — and errorDetail (this detailed view only) keeps the agent's full stderr. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
+        "description": "Get a workflow run with every step: its status, attempts, startedAt and finishedAt, output, and error. A failed step's error is the short cause — the last non-empty lines the agent printed, with agent_quota in front when they name a quota or rate limit — and errorDetail (this detailed view only) keeps the agent's full stderr. Pass view: \"summary\" to leave out the spec and every full output: each step then carries outputChars and firstLine instead, so an orchestrator can see which step finished without paying for the transcripts. Pass step to get that one step alone, with its full output and errorDetail. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
         "inputSchema": {
             "type": "object", "required": ["workflowId"], "additionalProperties": False,
             "properties": {
                 "workflowId": {"type": "string", "minLength": 1, "maxLength": 128,
                                "description": "Run ID returned by run_workflow."},
+                "view": {"type": "string", "enum": ["summary"],
+                         "description": "Pass \"summary\" for a small view: no spec, and each step carries outputChars (the output's length) and firstLine (its first line) instead of the full output and errorDetail. Combine with step to summarize one step."},
+                "step": {"type": "string", "minLength": 1, "maxLength": 128,
+                         "pattern": "^[A-Za-z0-9_.~-]{1,128}$",
+                         "description": "Return only this step of the run, with its full output and errorDetail. A step the run does not have is unknown_step."},
                 "maxWaitMs": {"type": "integer", "minimum": 1,
                               "description": "Maximum time, in milliseconds, to wait for the run to become terminal before returning its current state. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
@@ -392,16 +400,20 @@ def _is_string_map(value):
         isinstance(name, str) and name and isinstance(item, str) for name, item in value.items())
 
 
-def _wait_workflow(base_url, workflow_id, wait_ms, timeout):
-    """Long-poll a run, clamping the wait to the relay's limit when it refuses the first one."""
-    path = "/v1/workflows/" + quote(workflow_id, safe="") + f"?waitMs={wait_ms}"
+def _wait_workflow(base_url, workflow_id, wait_ms, timeout, query=""):
+    """Long-poll a run, clamping the wait to the relay's limit when it refuses the first one.
+
+    ``query`` is any extra selector string (``"&view=summary"`` and the like) that must
+    survive both the first attempt and the clamped retry.
+    """
+    path = "/v1/workflows/" + quote(workflow_id, safe="") + f"?waitMs={wait_ms}{query}"
     try:
         return _relay_request(base_url, path, timeout=max(timeout, wait_ms / 1000.0 + 5))
     except RelayError as exc:
         limit = _relay_wait_limit(base_url, exc, wait_ms)
         if limit is None:
             raise
-        path = "/v1/workflows/" + quote(workflow_id, safe="") + f"?waitMs={limit}"
+        path = "/v1/workflows/" + quote(workflow_id, safe="") + f"?waitMs={limit}{query}"
         value = _relay_request(base_url, path, timeout=max(timeout, limit / 1000.0 + 5))
         value.update(waitMs=limit, waitClamped=True)
         return value
@@ -731,17 +743,31 @@ def create_http_handler(base_url=None, timeout=None):
                 if wait_ms and value.get("status") in ("queued", "running"):
                     value = _wait_workflow(base_url, value["id"], wait_ms, timeout)
             elif name == "get_workflow":
-                args = _arguments_for(rpc, ["workflowId", "maxWaitMs"])
+                args = _arguments_for(rpc, ["workflowId", "view", "step", "maxWaitMs"])
                 _non_empty(args, "workflowId", 128)
+                params = {}
+                if "view" in args:
+                    if args["view"] != "summary":
+                        _invalid("view must be summary")
+                    params["view"] = "summary"
+                if "step" in args:
+                    _non_empty(args, "step", 128)
+                    if not STEP_ID_RE.fullmatch(args["step"]):
+                        _invalid("step must match [A-Za-z0-9_.~-] and be at most 128 characters")
+                    params["step"] = args["step"]
+                encoded = urlencode(params)
+                query = f"&{encoded}" if encoded else ""
                 wait_ms = args.get("maxWaitMs")
                 if wait_ms is None:
                     value = _relay_request(
-                        base_url, "/v1/workflows/" + quote(args["workflowId"], safe=""),
+                        base_url, "/v1/workflows/" + quote(args["workflowId"], safe="")
+                        + (f"?{encoded}" if encoded else ""),
                         timeout=timeout)
                 elif not _is_positive_int(wait_ms):
                     _invalid("maxWaitMs must be a positive integer")
                 else:
-                    value = _wait_workflow(base_url, args["workflowId"], wait_ms, timeout)
+                    value = _wait_workflow(base_url, args["workflowId"], wait_ms, timeout,
+                                           query)
             elif name == "wait_workflow_events":
                 args = _arguments_for(rpc, ["sessionId", "after", "maxWaitMs"])
                 _non_empty(args, "sessionId", 128)

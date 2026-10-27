@@ -474,12 +474,16 @@ class WorkflowEngine:
             return False
         return self._journal_path(workflow_id).exists()
 
-    def public(self, workflow_id, detail=True):
+    def public(self, workflow_id, detail=True, view=None, step=None):
+        """The run as clients see it. ``view="summary"`` projects each step down to its
+        identity, status, times and output size plus first line; ``step`` narrows the steps
+        to that one id with its full output and errorDetail. Both leave out the spec, and
+        either returns None when the run (or the step) is unknown."""
         if not RUN_ID_RE.fullmatch(workflow_id or ""):
             return None
         with self._lock:
             workflow = self._workflows.get(workflow_id)
-            return self._public(workflow, detail=detail) if workflow else None
+            return self._public(workflow, detail=detail, view=view, step=step) if workflow else None
 
     def list(self, session_id=None, status=None, limit=100):
         with self._lock:
@@ -988,10 +992,16 @@ class WorkflowEngine:
 
     # ------------------------------------------------------------------- presentation
 
-    def _public(self, workflow, detail):
+    def _public(self, workflow, detail, view=None, step=None):
         if workflow is None:
             return None
-        view = {
+        steps = workflow["steps"]
+        if step is not None:
+            steps = [item for item in steps if item["id"] == step]
+            if not steps:
+                return None
+        summary = view == "summary"
+        snapshot = {
             "id": workflow["id"],
             "name": workflow["name"],
             "status": workflow["status"],
@@ -999,18 +1009,20 @@ class WorkflowEngine:
             "createdAt": workflow["createdAt"],
             "startedAt": workflow["startedAt"],
             "finishedAt": workflow["finishedAt"],
-            "steps": [self._public_step(step, detail) for step in workflow["steps"]],
+            "steps": [self._public_step(item, detail, summary) for item in steps],
         }
         if workflow["error"]:
-            view["error"] = workflow["error"]
-        if detail:
+            snapshot["error"] = workflow["error"]
+        if detail and not summary and step is None:
             # The dependency closure is scheduling bookkeeping, not part of the document.
-            view["spec"] = {key: value for key, value in workflow["spec"].items()
-                            if key != "ancestors"}
-        return view
+            # A summary or a step selector is a context-economy request: the spec repeats
+            # every prompt, which is the payload those selectors exist to avoid.
+            snapshot["spec"] = {key: value for key, value in workflow["spec"].items()
+                                if key != "ancestors"}
+        return snapshot
 
     @staticmethod
-    def _public_step(step, detail):
+    def _public_step(step, detail, summary=False):
         view = {
             "id": step["id"],
             "agentId": step["agentId"],
@@ -1022,6 +1034,15 @@ class WorkflowEngine:
         }
         if step["error"]:
             view["error"] = step["error"]
+        if summary:
+            # Size and first line answer "did it finish, and what is it about" without the
+            # transcript; the full output stays one step-selector call away.
+            output = step["output"] or ""
+            view["attemptTimes"] = [dict(window) for window in step["attemptTimes"]]
+            view["outputChars"] = len(output)
+            lines = output.splitlines()
+            view["firstLine"] = lines[0] if lines else None
+            return view
         if detail:
             view["taskIds"] = list(step["taskIds"])
             view["attemptTimes"] = [dict(window) for window in step["attemptTimes"]]

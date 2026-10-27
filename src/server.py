@@ -28,7 +28,7 @@ from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlsplit
 
 import pressure
-from workflows import WORKFLOW_STATUSES, WorkflowEngine
+from workflows import STEP_ID_RE, WORKFLOW_STATUSES, WorkflowEngine
 
 ADAPTER_PROTOCOL = "relay.adapter/v1"
 INHERITED_ENV = (
@@ -1869,9 +1869,18 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"events": WORKFLOW_ENGINE.wait_events(session_id, after, wait_ms)})
 
     def _get_workflow(self, workflow_id, query):
+        view_name = query.get("view", [None])[0]
+        if view_name is not None and view_name != "summary":
+            return self._json(400, {"error": "invalid_view",
+                                    "message": "view must be summary"})
+        step_id = query.get("step", [None])[0]
+        if step_id is not None and not STEP_ID_RE.fullmatch(step_id):
+            return self._json(400, {"error": "invalid_step",
+                                    "message": "step must match [A-Za-z0-9_.~-] and be at "
+                                               "most 128 characters"})
         wait_raw = query.get("waitMs", [None])[0]
         if wait_raw is None:
-            return self._workflow_response(workflow_id)
+            return self._workflow_response(workflow_id, view_name, step_id)
         try:
             wait_ms = int(wait_raw)
         except ValueError:
@@ -1880,9 +1889,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, _invalid_wait())
         if WORKFLOW_ENGINE.wait(workflow_id, wait_ms) is None:
             return self._workflow_not_found(workflow_id)
-        view = WORKFLOW_ENGINE.public(workflow_id, detail=True)
+        view = WORKFLOW_ENGINE.public(workflow_id, detail=True, view=view_name, step=step_id)
         if view is None:
-            return self._workflow_not_found(workflow_id)
+            return self._workflow_missing(workflow_id, step_id)
         if view["status"] in ("queued", "running"):
             # Say that the wait ended, so a caller need not compare status strings.
             view.update(waitExpired=True, waitedMs=wait_ms,
@@ -1890,11 +1899,18 @@ class Handler(BaseHTTPRequestHandler):
                              "with the same workflowId, or repeat this request.")
         return self._json(200, view)
 
-    def _workflow_response(self, workflow_id):
-        view = WORKFLOW_ENGINE.public(workflow_id, detail=True)
+    def _workflow_response(self, workflow_id, view_name=None, step_id=None):
+        view = WORKFLOW_ENGINE.public(workflow_id, detail=True, view=view_name, step=step_id)
         if view is None:
-            return self._workflow_not_found(workflow_id)
+            return self._workflow_missing(workflow_id, step_id)
         return self._json(200, view)
+
+    def _workflow_missing(self, workflow_id, step_id=None):
+        """A view the engine could not build: the run, or the named step of a live run."""
+        if step_id is not None and WORKFLOW_ENGINE.get(workflow_id) is not None:
+            return self._json(404, {"error": "unknown_step",
+                                    "message": f"No step {step_id} in this run"})
+        return self._workflow_not_found(workflow_id)
 
     def _workflow_not_found(self, workflow_id):
         if WORKFLOW_ENGINE.journaled(workflow_id):

@@ -675,6 +675,38 @@ class McpHandlerTests(unittest.TestCase):
         finally:
             upstream.close()
 
+    def test_maps_get_workflow_view_and_step_selectors_onto_the_relay(self):
+        def responder(method, path, body):
+            return 200, {"id": "wf-1", "status": "completed",
+                         "steps": [{"id": "a", "outputChars": 4, "firstLine": "beta"}]}
+
+        upstream = FakeUpstream(responder)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            handle({"method": "tools/call", "params": {
+                "name": "get_workflow",
+                "arguments": {"workflowId": "wf-1", "view": "summary", "step": "a"}}})
+            self.assertEqual(upstream.calls[0][1], "/v1/workflows/wf-1?view=summary&step=a")
+            self.assertEqual(upstream.calls[0][2], None)
+
+            # Both selectors ride along on the long-poll path too.
+            handle({"method": "tools/call", "params": {
+                "name": "get_workflow",
+                "arguments": {"workflowId": "wf-1", "view": "summary", "maxWaitMs": 500}}})
+            self.assertEqual(upstream.calls[1][1], "/v1/workflows/wf-1?waitMs=500&view=summary")
+
+            for arguments in ({"workflowId": "wf-1", "view": "full"},
+                              {"workflowId": "wf-1", "step": "not a step"},
+                              {"workflowId": "wf-1", "step": ""}):
+                with self.subTest(arguments=arguments):
+                    with self.assertRaises(mcp_server.RpcError) as raised:
+                        handle({"method": "tools/call",
+                                "params": {"name": "get_workflow", "arguments": arguments}})
+                    self.assertEqual(raised.exception.code, -32602)
+            self.assertEqual(len(upstream.calls), 2)
+        finally:
+            upstream.close()
+
     def test_maps_wait_workflow_events_onto_the_events_endpoint(self):
         def responder(method, path, body):
             if path.startswith("/v1/workflows/events"):
