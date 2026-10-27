@@ -137,6 +137,12 @@ try:
     PRESSURE_HOLD_MS = pressure.guard_hold_ms()
 except ValueError as error:
     sys.exit(str(error))
+# The verdict at or above which a new workflow is refused; read once, at startup, so a bad value
+# stops the relay before any run can be submitted instead of being noticed on the first one.
+try:
+    pressure.admit_below()
+except ValueError as error:
+    sys.exit(str(error))
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",

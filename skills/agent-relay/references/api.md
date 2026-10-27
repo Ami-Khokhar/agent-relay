@@ -253,6 +253,7 @@ The host reading, with a verdict a caller can act on:
 
 ```json
 { "verdict": "ok", "reasons": [],
+  "admitBelow": "critical",
   "memory": { "pressureLevel": "normal", "freePercent": 47 },
   "swap": { "usedBytes": 955451965, "totalBytes": 2147483648, "usedPercent": 44 },
   "thermal": { "speedLimitPercent": null },
@@ -269,6 +270,10 @@ the softer readings (kernel warning, 12% free, 70% swap, 75% throttled); otherwi
 `reasons` names the reading that decided it. Every signal is `null` when the host cannot report
 it, so a missing probe never fails the call.
 
+`admitBelow` is the owner's admission line: the verdict at or above which the relay refuses a new
+workflow, read from `AGENT_RELAY_ADMIT_BELOW` (default `critical`). The refusal and this field
+come from the same reading, so they cannot disagree.
+
 `guard` says whether the relay stops active runs on its own, at which verdict, and after how long:
 `holdMs` is `A2A_RELAY_PRESSURE_HOLD_MS` (default 30000), the time the verdict must stay
 `critical` before a running workflow is stopped, read at least twice so one spike between normal
@@ -276,8 +281,10 @@ readings costs a run nothing. `holdMs` 0 stops on the first critical reading. A 
 stops is `cancelled` with `error` beginning `device_pressure:`, naming how long pressure stayed
 critical and the readings that decided it.
 
-`POST /v1/workflows` returns `503 device_pressure` with this body while the verdict is
-`critical`. `temperatureC` is null unless the owner allowlists an unprivileged reader in
+`POST /v1/workflows` returns `503 device_pressure` with this body while the verdict is at or
+above `admitBelow` (`AGENT_RELAY_ADMIT_BELOW`, default `critical`), and the message names the
+reading that decided it (or the setting itself when an `ok` line refuses a calm host).
+`temperatureC` is null unless the owner allowlists an unprivileged reader in
 `AGENT_RELAY_TEMP_READER` (for example `macmon`); `AGENT_RELAY_TEMP_WARN_C` adds a `warn` reason
 at or above that many degrees. `thermal.speedLimitPercent` is null when macOS has recorded no
 throttle.
@@ -318,7 +325,7 @@ Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow ste
 | 415 | `unsupported_media_type` | `POST /v1/tasks` or `POST /v1/workflows` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
-| 503 | `task_capacity_reached`, `workflow_capacity_reached`, `device_pressure` | Store full of non-terminal tasks or of runs with none finished; or a workflow submission while the host verdict is `critical`, with the reading attached. |
+| 503 | `task_capacity_reached`, `workflow_capacity_reached`, `device_pressure` | Store full of non-terminal tasks or of runs with none finished; or a workflow submission while the host verdict is at or above the relay's admitBelow line, with the reading attached. |
 
 ### Task errors
 

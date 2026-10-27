@@ -252,9 +252,9 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 - `resume_workflow { workflowId, waitMs? }` → continue a journaled run, keeping the steps
   that already completed.
 - `get_pressure {}` → the host reading: `verdict` (`ok`, `warn`, `critical`), `reasons`,
-  memory, swap, any thermal throttle, and the `guard` section (`enabled`, `stopsAt`, and
-  `holdMs`, how long pressure must stay critical before a running run is stopped). Call it
-  before a long run.
+  `admitBelow` (the level at or above which a new run is refused), memory, swap, any thermal
+  throttle, and the `guard` section (`enabled`, `stopsAt`, `holdMs` — how long pressure must
+  stay critical before a running run is stopped). Call it before a long run.
 
 Task objects leave out `input` and carry `inputChars` (its length) instead, because you
 already hold the prompt you sent. Pass `includeInput: true` to `get_task` (or
@@ -415,9 +415,10 @@ ended with no change.
 
 **Host pressure.** `GET /v1/pressure` reads what this machine can tell you without root: the
 kernel's memory-pressure level, free-memory percentage, swap in use, and any thermal speed limit.
-It returns a `verdict` of `ok`, `warn` or `critical` with the `reasons` behind it, and
+It returns a `verdict` of `ok`, `warn` or `critical` with the `reasons` behind it, plus
+`admitBelow` — `AGENT_RELAY_ADMIT_BELOW`, `critical` unless the owner set it — and
 `temperatureC` is null unless the owner allowlists an unprivileged reader such as `macmon` in
-`AGENT_RELAY_TEMP_READER`. A `critical` verdict refuses a new
+`AGENT_RELAY_TEMP_READER`. A verdict at or above `admitBelow` refuses a new
 workflow with `503 device_pressure`, and while a run is active the relay re-reads the host every
 `AGENT_RELAY_PRESSURE_INTERVAL_MS` (default 5000) and stops every active run once the verdict has
 stayed `critical` for `AGENT_RELAY_PRESSURE_HOLD_MS` milliseconds (default 30000, read at least
