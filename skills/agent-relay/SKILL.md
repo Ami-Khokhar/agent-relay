@@ -238,8 +238,11 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
   server reads it and submits it unchanged, so a workflow kept on disk runs without being retyped.
   Pass exactly one of the two; both, neither, a missing file, a relative path, invalid JSON or a
   file that is not UTF-8 text is refused with `-32602` and nothing runs.
-- `get_workflow { workflowId, maxWaitMs? }` → the run with every step, its output, and its
-  `startedAt` / `finishedAt` window (plus `attemptTimes`, one window per attempt).
+- `get_workflow { workflowId, view?, step?, maxWaitMs? }` → the run with every step, its output,
+  and its `startedAt` / `finishedAt` window (plus `attemptTimes`, one window per attempt).
+  Pass `view: "summary"` to leave out the spec and every full output — each step then carries
+  `outputChars` and `firstLine` instead, so checking which step finished costs almost no
+  context — and pass `step` to get that one step alone with its full output and `errorDetail`.
 - `wait_workflow_events { sessionId, after?, maxWaitMs? }` → the session's ordered change
   feed: each step or run status change with `workflowId`, `stepId`, `oldStatus`, `newStatus`
   and a rising `seq`. Pass the last `seq` seen as `after`; an empty `events` list means the

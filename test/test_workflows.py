@@ -319,6 +319,97 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("errorDetail", listed)
         self.assertNotIn("output", listed)
 
+    # -------------------------------------------------------- summary and step views
+
+    def test_summary_view_reports_size_and_first_line_without_the_spec_or_full_output(self):
+        relay = self.start(echo())
+        _, submitted = relay.request("POST", "/v1/workflows", {"name": "sum", "steps": [
+            {"id": "big", "agentId": "echo", "input": "headline report\n" + "filler " * 2000},
+        ]})
+        workflow = wait(relay, submitted["id"])
+        self.assertEqual(workflow["status"], "completed")
+        status, summary = relay.request("GET", f"/v1/workflows/{submitted['id']}?view=summary")
+        self.assertEqual(status, 200)
+        self.assertNotIn("spec", summary)
+        self.assertEqual(summary["id"], submitted["id"])
+        self.assertEqual(summary["status"], "completed")
+        step = steps_of(summary)["big"]
+        self.assertEqual(step["agentId"], "echo")
+        self.assertEqual(step["status"], "completed")
+        self.assertEqual(step["attempts"], 1)
+        self.assertIsNotNone(step["startedAt"])
+        self.assertIsNotNone(step["finishedAt"])
+        full_step = steps_of(workflow)["big"]
+        self.assertEqual(step["attemptTimes"], full_step["attemptTimes"])
+        self.assertEqual(step["outputChars"], len(full_step["output"]))
+        self.assertEqual(step["firstLine"], full_step["output"].splitlines()[0])
+        self.assertNotIn("output", step)
+        self.assertNotIn("errorDetail", step)
+        self.assertLess(len(json.dumps(summary)), len(json.dumps(workflow)))
+
+    def test_step_view_returns_that_one_steps_full_output(self):
+        relay = self.start(echo())
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "one", "agentId": "echo", "input": "alpha"},
+            {"id": "two", "agentId": "echo", "needs": ["one"], "input": "beta " + "x" * 3000},
+        ]})
+        workflow = wait(relay, submitted["id"])
+        status, view = relay.request("GET", f"/v1/workflows/{submitted['id']}?step=two")
+        self.assertEqual(status, 200)
+        self.assertNotIn("spec", view)
+        self.assertEqual([step["id"] for step in view["steps"]], ["two"])
+        picked = view["steps"][0]
+        full = steps_of(workflow)["two"]
+        self.assertEqual(picked["output"], full["output"])
+        self.assertEqual(picked["taskIds"], full["taskIds"])
+        self.assertGreater(len(picked["output"]), 3000)
+
+    def test_step_view_keeps_a_failed_steps_full_error_detail(self):
+        relay = self.start({"id": "noisy", "command": PYTHON, "args": ["-c", BANNER_THEN_ERROR]})
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "codex", "agentId": "noisy", "input": "go"},
+        ]})
+        wait(relay, submitted["id"])
+        status, view = relay.request("GET", f"/v1/workflows/{submitted['id']}?step=codex")
+        self.assertEqual(status, 200)
+        step = view["steps"][0]
+        self.assertIn("Reading additional input from stdin", step["errorDetail"])
+
+    def test_both_selectors_survive_a_long_poll_and_bad_selectors_are_refused(self):
+        relay = self.start(echo())
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "echo", "input": "fast"},
+        ]})
+        status, summary = relay.request(
+            "GET", f"/v1/workflows/{submitted['id']}?view=summary&waitMs=8000")
+        self.assertEqual(status, 200)
+        self.assertIn(summary["status"], TERMINAL)
+        self.assertNotIn("spec", summary)
+        self.assertEqual(steps_of(summary)["only"]["firstLine"], "fast")
+        self.assertNotIn("output", steps_of(summary)["only"])
+
+        status, picked = relay.request(
+            "GET", f"/v1/workflows/{submitted['id']}?step=only&waitMs=8000")
+        self.assertEqual(status, 200)
+        self.assertEqual(picked["steps"][0]["output"], "fast")
+
+        status, body = relay.request("GET", f"/v1/workflows/{submitted['id']}?view=full")
+        self.assertEqual((status, body["error"]), (400, "invalid_view"))
+        status, body = relay.request("GET", f"/v1/workflows/{submitted['id']}?step=has+space")
+        self.assertEqual((status, body["error"]), (400, "invalid_step"))
+        status, body = relay.request("GET", f"/v1/workflows/{submitted['id']}?step=absent")
+        self.assertEqual((status, body["error"]), (404, "unknown_step"))
+
+    def test_get_workflow_without_selectors_keeps_the_full_view(self):
+        """Guard: the default view still carries the spec and each step's full output."""
+        relay = self.start(echo())
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "echo", "input": "detail"},
+        ]})
+        workflow = wait(relay, submitted["id"])
+        self.assertEqual(workflow["spec"]["steps"][0]["input"], "detail")
+        self.assertEqual(steps_of(workflow)["only"]["output"], "detail")
+
     # ---------------------------------------------------------------- step timing
 
     def test_gives_each_step_and_each_attempt_its_own_time_window(self):
