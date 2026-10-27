@@ -17,6 +17,11 @@ reader, or one that does not answer, ``temperatureC`` is null with the reason at
 rather than guessed. A missing thermal reading from ``pmset`` means the OS has recorded no
 throttle, which is the ordinary state on a cool machine.
 
+Which verdicts refuse a new run is the owner's line, not a constant: ``AGENT_RELAY_ADMIT_BELOW``
+names the level at or above which a submission is refused (default ``critical``, today's rule),
+and the reading reports that line beside the verdict so the refusal and ``GET /v1/pressure``
+cannot disagree.
+
 The probes are macOS-only. On another host every signal is null, the verdict is ``ok``, and the
 guard never stops a run: the reading is absent rather than guessed, and a caller that needs a
 verdict must not read ``ok`` as a measurement.
@@ -34,13 +39,18 @@ from datetime import datetime, timezone
 PROBE_TIMEOUT_S = 2
 # vm.memory_pressure: what the kernel currently says about memory (vm_pageout.h).
 PRESSURE_LEVELS = {0: "normal", 1: "warning", 2: "critical"}
-# Verdict thresholds. Critical is the only level that stops work on its own.
+# Verdict thresholds: these numbers decide the verdict, and the owner's admission line below
+# decides which verdicts refuse a new run.
 CRITICAL_FREE_PERCENT = 4
 CRITICAL_SWAP_PERCENT = 90
 CRITICAL_SPEED_LIMIT = 40
 WARN_FREE_PERCENT = 12
 WARN_SWAP_PERCENT = 70
 WARN_SPEED_LIMIT = 75
+# The admission line for a new workflow: refuse at or above it. Ordered, so "at or above" is a
+# comparison; critical keeps today's rule, where only a critical verdict refuses.
+VERDICT_ORDER = {"ok": 0, "warn": 1, "critical": 2}
+DEFAULT_ADMIT_BELOW = "critical"
 TEMPERATURE_REASON = "macOS exposes no unprivileged CPU temperature; powermetrics needs root"
 READER_SILENT_REASON = "the configured temperature reader did not answer"
 # How long the verdict must stay critical before the guard stops a run. A spike between two
@@ -205,6 +215,23 @@ def guard_hold_ms():
     return DEFAULT_GUARD_HOLD_MS
 
 
+def admit_below():
+    """The verdict at or above which a new workflow is refused, from the relay's own environment.
+
+    The one implementation of the setting: the preflight refusal refuses from this answer and the
+    reading reports it, so the two cannot disagree. No value at all means ``DEFAULT_ADMIT_BELOW``
+    (today's critical-only rule), and a value that is not ``ok``, ``warn`` or ``critical`` raises
+    ``ValueError``, which the relay reports at startup instead of guessing.
+    """
+    value = os.environ.get("AGENT_RELAY_ADMIT_BELOW")
+    if not value:
+        return DEFAULT_ADMIT_BELOW
+    level = value.lower()
+    if level not in VERDICT_ORDER:
+        raise ValueError("AGENT_RELAY_ADMIT_BELOW must be one of ok, warn or critical")
+    return level
+
+
 class CriticalHold:
     """How long critical pressure has held, and the readings that prove it.
 
@@ -297,6 +324,7 @@ def snapshot():
     return {
         "verdict": verdict,
         "reasons": critical or warn,
+        "admitBelow": admit_below(),
         "memory": {"pressureLevel": level, "freePercent": free_percent},
         "swap": {"usedBytes": used, "totalBytes": total, "usedPercent": swap_percent},
         "thermal": {"speedLimitPercent": speed_limit},
@@ -309,13 +337,26 @@ def snapshot():
 
 
 def should_refuse(reading):
-    """The refusal body for a run that must not start, or None."""
-    if reading["verdict"] != "critical":
+    """The refusal body for a run that must not start, or None.
+
+    The run is refused while the verdict is at or above ``admitBelow``, the owner's line in
+    ``AGENT_RELAY_ADMIT_BELOW``. The message names the reading that decided the verdict; a calm
+    host refused only by an ``ok`` line has no reading to name, so that message names the
+    setting instead of telling the owner to free memory on a machine that is not under pressure.
+    """
+    verdict, admit = reading["verdict"], reading["admitBelow"]
+    if VERDICT_ORDER[verdict] < VERDICT_ORDER[admit]:
         return None
+    if reading["reasons"]:
+        message = (f"This machine is under {verdict} pressure, so no workflow was started: "
+                   + "; ".join(reading["reasons"]) + ". Free some memory and retry; "
+                   "GET /v1/pressure shows the current reading.")
+    else:
+        message = (f"The owner set AGENT_RELAY_ADMIT_BELOW={admit}, so no workflow starts "
+                   f"while the verdict is {verdict}; raise it to warn or critical to admit "
+                   "work. GET /v1/pressure shows the current reading.")
     return {
         "error": "device_pressure",
-        "message": "This machine is under critical pressure, so no workflow was started: "
-                   + "; ".join(reading["reasons"]) + ". Free some memory and retry; "
-                   "GET /v1/pressure shows the current reading.",
+        "message": message,
         "pressure": reading,
     }

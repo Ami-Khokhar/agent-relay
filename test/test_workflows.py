@@ -796,6 +796,46 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "cwd_not_allowed")
 
+    # ------------------------------------------------------- the admission line
+
+    def test_admit_below_warn_refuses_a_warn_verdict_and_still_admits_a_calm_one(self):
+        # The owner's gate: no new work while the host reports memory-pressure warning, which
+        # the critical-only rule would have let through. The probe answers from a file, so the
+        # verdict is what the test makes it.
+        level = self.path("level")
+        sysctl = self.path("sysctl")
+        with open(sysctl, "w", encoding="utf-8") as handle:
+            handle.write(
+                '#!/bin/sh\ncase "$2" in\n'
+                f'  vm.memory_pressure) cat "{level}" ;;\n'
+                "  kern.memorystatus_level) echo 60 ;;\n"
+                '  vm.swapusage) echo "total = 2048.00M  used = 100.00M  free = 1948.00M'
+                '  (encrypted)" ;;\n'
+                "  *) exit 1 ;;\nesac\n")
+        os.chmod(sysctl, 0o755)
+        with open(level, "w", encoding="utf-8") as handle:
+            handle.write("1\n")
+        relay = self.start(echo(), env={"AGENT_RELAY_ADMIT_BELOW": "warn",
+                                        "AGENT_RELAY_SYSCTL": sysctl})
+        _, reading = relay.request("GET", "/v1/pressure")
+        self.assertEqual((reading["verdict"], reading["admitBelow"]), ("warn", "warn"))
+
+        status, body = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "only", "agentId": "echo", "input": "never runs"}]})
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"], "device_pressure")
+        self.assertIn("the kernel reports memory pressure warning", body["message"])
+        self.assertEqual(body["pressure"]["admitBelow"], "warn")
+        _, listing = relay.request("GET", "/v1/workflows")
+        self.assertEqual(listing["workflows"], [])
+
+        with open(level, "w", encoding="utf-8") as handle:
+            handle.write("0\n")
+        status, submitted = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "only", "agentId": "echo", "input": "runs"}]})
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, submitted["id"])["status"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

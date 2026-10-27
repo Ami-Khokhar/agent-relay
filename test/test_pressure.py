@@ -147,6 +147,7 @@ class PressureTests(unittest.TestCase):
         status, body = relay.request("GET", "/v1/pressure")
         self.assertEqual(status, 200)
         self.assertEqual(body["verdict"], "ok")
+        self.assertEqual(body["admitBelow"], "critical")
         self.assertEqual(body["memory"], {"pressureLevel": "normal", "freePercent": 60})
         self.assertEqual(body["swap"]["usedPercent"], 5)
         self.assertIsNone(body["thermal"]["speedLimitPercent"])
@@ -301,6 +302,45 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(again["id"], submitted["id"])
         self.assertEqual(again["status"], "completed")
+
+    def test_a_refusal_names_the_reading_and_get_pressure_reports_the_admission_line(self):
+        # The owner refuses work at warn: the refusal must quote what the host reported, and
+        # get_pressure must show the line that refused it, so a caller can see both halves.
+        self.set_signal("level", "1")
+        relay = self.start(echo(), env={"AGENT_RELAY_ADMIT_BELOW": "warn"})
+        status, body = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "only", "agentId": "echo", "input": "never runs"}]})
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"], "device_pressure")
+        self.assertIn("the kernel reports memory pressure warning", body["message"])
+        client = McpClient(relay.base)
+        try:
+            reading = client.call_tool("get_pressure", {})["structuredContent"]
+            self.assertEqual(reading["verdict"], "warn")
+            self.assertEqual(reading["admitBelow"], "warn")
+        finally:
+            client.close()
+
+    def test_an_ok_admission_line_refuses_a_calm_host_and_names_the_setting(self):
+        # A calm host has no reading to name, so the refusal names the setting that refused it
+        # instead of telling the owner to free memory on a machine that is not under pressure.
+        relay = self.start(echo(), env={"AGENT_RELAY_ADMIT_BELOW": "ok"})
+        status, body = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "only", "agentId": "echo", "input": "never runs"}]})
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"], "device_pressure")
+        self.assertEqual(body["pressure"]["verdict"], "ok")
+        self.assertEqual(body["pressure"]["reasons"], [])
+        self.assertIn("The owner set AGENT_RELAY_ADMIT_BELOW=ok", body["message"])
+        self.assertIn("the verdict is ok", body["message"])
+        self.assertIn("raise it to warn or critical to admit work", body["message"])
+        self.assertNotIn("Free some memory", body["message"])
+
+    def test_an_admit_line_that_is_not_ok_warn_or_critical_stops_the_relay(self):
+        with self.assertRaises(RuntimeError) as caught:
+            self.start(echo(), env={"AGENT_RELAY_ADMIT_BELOW": "sometimes"})
+        self.assertIn("AGENT_RELAY_ADMIT_BELOW must be one of ok, warn or critical",
+                      str(caught.exception))
 
     # -------------------------------------------------------------- the kill button
 
