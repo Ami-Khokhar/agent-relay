@@ -40,9 +40,8 @@ Use it when the user wants to:
 - delegate implementation work to pi, Codex, OpenCode, or Claude Code instead of
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
-- give an MCP client the six task tools (`list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`), the six workflow tools, and `get_pressure`; `tools/list` is
-  authoritative.
+- give an MCP client the task tools, workflow tools, `get_pressure`, and `prepare_feedback`;
+  `tools/list` is authoritative.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
 `PATH` and can run the task: the relay adds task IDs, status, timeouts,
@@ -205,6 +204,25 @@ registry did not parse — the relay prints a timestamped `Configuration error: 
 and exits on a bad registry, so check the server log.
 
 ## 5. Delegate work
+
+### Reporting an agent-relay problem
+
+Stay quiet about feedback unless agent-relay itself genuinely blocks a concrete action. Normal
+errors, warnings, retries, recovery, worker-code failures, expected configuration mistakes, and
+provider failures alone are not triggers. First find and use a concrete workaround so the intended
+work resumes. Workers return the blocker and workaround facts to the parent without asking the
+user. At a natural checkpoint after work has resumed, only the user-facing orchestrator may offer
+to prepare a report, at most once per work session. If the user declines, defers, or stays silent,
+stop. Preparing a draft does not approve a repair, retry, update, or other change.
+
+If the user wants to report it, call MCP `prepare_feedback` with the bounded category, operation,
+OS family, version (SemVer, a 7-40 character hexadecimal revision, or `unknown`), the concrete
+blocked action, and the workaround actually used. Missing blocker or workaround evidence produces
+no draft. Do not claim an automated classifier proved the relay was at fault. Show the returned
+title, body, and URL for review. The issue is public if submitted; known credential patterns and
+control or bidirectional characters in free text are rejected, but redaction is not a privacy
+guarantee. Submission happens only when the user opens the fixed GitHub form, reviews its contents,
+and clicks Submit in their own GitHub session. The tool makes no network request and cannot submit.
 
 **Via HTTP** (submit returns `202` immediately; then long-poll):
 

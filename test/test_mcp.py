@@ -98,7 +98,7 @@ class McpHandlerTests(unittest.TestCase):
         try:
             listed = handle({"method": "tools/list"})
             self.assertEqual([tool["name"] for tool in listed["tools"]],
-                             ["list_agents", "delegate", "wait_task", "get_task", "list_tasks",
+                             ["prepare_feedback", "list_agents", "delegate", "wait_task", "get_task", "list_tasks",
                               "cancel_task", "run_workflow", "get_workflow",
                               "wait_workflow_events", "list_workflows", "cancel_workflow",
                               "resume_workflow", "get_pressure"])

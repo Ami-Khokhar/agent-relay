@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """agent-relay MCP stdio interface.
 
-A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the six task tools, the six workflow
-tools, and get_pressure; tools/list is the authoritative list. Set A2A_RELAY_URL to point at a
+A thin JSON-RPC 2.0 proxy over the relay HTTP API, plus a local-only feedback draft tool.
+tools/list is the authoritative list. Set A2A_RELAY_URL to point at a
 non-default relay. When the relay is not reachable and the URL is loopback, the interface
 starts the HTTP service detached on first use.
 """
@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from feedback import prepare_feedback
 from urllib import request as urlrequest
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -151,6 +152,23 @@ WORKFLOW_SPEC = {
 
 
 TOOLS = [
+    {
+        "name": "prepare_feedback",
+        "description": "Prepare only for a genuine agent-relay blocker when a workaround was actually used and work resumed. After work resumes, only the parent orchestrator may offer this once per work session. Workers quietly pass relevant facts to the parent. Declining, deferring, or silence ends the offer. The user reviews the public draft and submits it in their GitHub session; this tool cannot connect or submit. Exclude prompts, outputs, paths, environment values, and task IDs. Ordinary warnings, errors, retries, and recovery, plus provider/configuration issues and worker failures, stay quiet.",
+        "inputSchema": {"type": "object", "additionalProperties": False,
+                "required": ["category", "operation", "system", "version", "blockedAction", "workaround"], "properties": {
+                "category": {"type": "string", "enum": ["crash", "incorrect_behavior", "unavailable", "other"]},
+                "operation": {"type": "string", "enum": ["start", "delegate", "wait", "cancel", "workflow", "mcp", "other"]},
+                "system": {"type": "string", "enum": ["Linux", "macOS", "Windows", "Other"]},
+                "version": {"type": "string", "minLength": 1, "maxLength": 80,
+                    "pattern": "^(unknown|[0-9A-Fa-f]{7,40}|v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?)$",
+                    "description": "SemVer, a 7-40 character hex revision, or unknown."},
+                "blockedAction": {"type": "string", "minLength": 1, "maxLength": 1000,
+                    "description": "Concrete action genuinely blocked by agent-relay itself. Required evidence; never infer from a normal error."},
+                "workaround": {"type": "string", "minLength": 1, "maxLength": 1000,
+                    "description": "Concrete workaround actually used so the work resumed. Required evidence; never invent one."}}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
     {
         "name": "list_agents",
         "description": "List the agents registered with the relay, with their adapter, capabilities, timeout, the per-task options each one allows (option names and allowed values), and whether it supports readOnly tasks. Call this first to get valid agentId values. The result also has `revision`: the commit (`commit`, `short`) and commit date (`date`) the relay runs, each \"unknown\" when the relay cannot read its checkout. A `date` weeks old means the install is stale; `revision` is absent on a relay that predates this field.",
@@ -623,7 +641,18 @@ def create_http_handler(base_url=None, timeout=None):
             raise RpcError(-32601, "Method not found")
         name = (rpc.get("params") or {}).get("name")
         try:
-            if name == "list_agents":
+            if name == "prepare_feedback":
+                args = _arguments_for(rpc, ["category", "operation", "system", "version", "blockedAction", "workaround"])
+                if not args.get("blockedAction") or not args.get("workaround"):
+                    _invalid("a concrete blocked action and workaround actually used are required")
+                for key in ("category", "operation", "system", "version", "blockedAction", "workaround"):
+                    _non_empty(args, key, 80 if key == "version" else 1000)
+                try:
+                    value = prepare_feedback(args["category"], args["operation"], args["system"],
+                                             args["version"], args["blockedAction"], args["workaround"])
+                except ValueError as exc:
+                    _invalid(str(exc))
+            elif name == "list_agents":
                 _arguments_for(rpc, [])
                 value = _relay_request(base_url, "/v1/agents", timeout=timeout)
             elif name == "delegate":

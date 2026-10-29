@@ -16,7 +16,7 @@ The HTTP API listens on `http://127.0.0.1:43124` by default. Every `/v1/` reques
 python3 src/mcp_server.py
 ```
 
-Configure that command as a local stdio MCP server in the client. It provides `list_agents`, `delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`, `list_workflows`, `cancel_workflow`, `resume_workflow`, and `get_pressure`. `A2A_RELAY_URL` overrides the HTTP address it calls. When the relay is unreachable and the URL is loopback, the MCP process starts the HTTP service detached on first use and logs it to `~/.local/state/agent-relay/relay.log`; disable that with `A2A_RELAY_AUTOSTART=0`.
+Configure that command as a local stdio MCP server in the client. It provides `prepare_feedback`, `list_agents`, `delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`, `run_workflow`, `get_workflow`, `list_workflows`, `cancel_workflow`, `resume_workflow`, and `get_pressure`. `A2A_RELAY_URL` overrides the HTTP address it calls. When the relay is unreachable and the URL is loopback, the MCP process starts the HTTP service detached on first use and logs it to `~/.local/state/agent-relay/relay.log`; disable that with `A2A_RELAY_AUTOSTART=0`.
 
 Register the MCP server once with copy-paste commands (use absolute paths; `bash skills/agent-relay/scripts/setup.sh` prints these for your checkout):
 
@@ -210,6 +210,24 @@ Example registry entries for Codex and Pi (flags checked against codex-cli 0.162
 ```
 
 Codex rejects a repeated `--sandbox`/`-s` (`the argument '--sandbox <SANDBOX_MODE>' cannot be used multiple times`), so a Codex entry with a read-only profile cannot also have `-s workspace-write` in its base `args`. The example leaves `-s` out of `args` (`codex exec` then runs read-only) and offers it as the `access` option: a task that needs to edit files passes `"options": {"access": "write"}`. A task that asks for both `readOnly` and `access: write` fails with Codex's error instead of running writable. Codex enforces `readOnly` through its own sandbox (`--sandbox read-only`), so the entry does not set `"sandbox": true`.
+
+## Report a relay problem
+
+Feedback stays quiet unless agent-relay itself blocks a concrete action. First use a concrete
+workaround and resume work; only the user-facing orchestrator may offer a report at a natural
+checkpoint, at most once per work session. Normal errors, warnings, retries, worker-code failures,
+and provider/configuration issues alone are not triggers. Decline, defer, or silence ends the flow.
+
+If wanted, MCP `prepare_feedback` creates a small local draft and a prefilled canonical GitHub
+issue page. It requires both the blocked action and workaround actually used. Missing either yields
+no draft. The tool does not contact GitHub or submit anything. A user must open the page, review
+the public contents, and click Submit in their own GitHub session.
+
+Use only the bounded error category, operation, OS family, version, blocked action, and workaround.
+The version must be SemVer, a 7-40 character hexadecimal revision, or `unknown`. The draft omits
+task prompts, outputs, paths, environment values, and IDs by default. Credential-shaped values
+and control or bidirectional characters in free text are refused, but that check cannot guarantee
+arbitrary prose is private. A report does not authorize repairs or updates.
 
 ## Submit and inspect work
 
