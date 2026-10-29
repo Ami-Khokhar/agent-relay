@@ -55,8 +55,9 @@ if [ "$UNINSTALL" = "1" ]; then
     rm -f "$PLIST"
     echo "removed $PLIST"
     UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
+    launchctl bootout "gui/$(id -u)/$UPDATE_LABEL" 2>/dev/null \
+      || launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
     if [ -f "$UPDATE_PLIST" ]; then
-      launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
       rm -f "$UPDATE_PLIST"
       echo "removed $UPDATE_PLIST"
     fi
@@ -165,8 +166,12 @@ elif [ "$WITH_UPDATE_TIMER" = "0" ]; then
   REMOVED_TIMER=0
   if [ "$(uname -s)" = "Darwin" ]; then
     UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
+    if launchctl bootout "gui/$(id -u)/$UPDATE_LABEL" 2>/dev/null; then
+      REMOVED_TIMER=1
+    elif launchctl unload "$UPDATE_PLIST" 2>/dev/null; then
+      REMOVED_TIMER=1
+    fi
     if [ -f "$UPDATE_PLIST" ]; then
-      launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
       rm -f "$UPDATE_PLIST"
       REMOVED_TIMER=1
     fi

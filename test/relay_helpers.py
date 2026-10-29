@@ -56,7 +56,7 @@ def free_port():
 
 
 class Relay:
-    """Spawns src/server.py with the given agent (or list of agents) as its registry and talks to it over HTTP."""
+    """Spawns the given server.py (default src/server.py) with an agent registry and talks over HTTP."""
 
     def __init__(self, agent, env=None, server=SERVER):
         self.dir = tempfile.mkdtemp(prefix="a2a-relay-")
