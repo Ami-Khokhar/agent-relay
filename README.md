@@ -52,6 +52,10 @@ bash scripts/install-service.sh --uninstall
 
 A service does not inherit your login shell `PATH`. The installer writes a `PATH` that includes `~/.local/bin`, `~/bin`, `/opt/homebrew/bin`, and `/usr/local/bin` so agent CLIs resolve; override with `AGENT_RELAY_PATH`.
 
+## Check for a release
+
+From a source checkout, run `python3 src/release_discovery.py` to compare its installed version with published stable GitHub releases. Add `--include-prereleases` to include prereleases, or `--notify` to show each offered version once using a private device-local cache. The check reads only canonical GitHub release metadata over HTTPS; it does not download release content or restart the relay. With `--notify`, it writes only the private notice cache under `~/.cache/agent-relay` (or the absolute `XDG_CACHE_HOME` directory). It prints bounded release notes and the canonical release page. An empty release list is a normal no-update result. This project currently publishes no releases or tags. Package-managed installs should use their package manager for installation and updates.
+
 ## Register an agent
 
 The relay reads, in order: `A2A_AGENTS_FILE` (or `AGENT_RELAY_AGENTS_FILE`) when set, then `~/.config/agent-relay/agents.json` when it exists, then `config/agents.json` in the checkout. Copy `config/agents.example.json`, edit it, and reload (see below). Use a `stdio` or `http` adapter for harness-independent integration. A `command` adapter remains available as a convenience for CLIs that accept a prompt as their final argument and print the result.
