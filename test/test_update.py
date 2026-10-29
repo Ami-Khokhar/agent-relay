@@ -354,8 +354,19 @@ class UpdateTimerTests(unittest.TestCase):
         stubs = os.path.join(tmp, "stubs")
         os.makedirs(stubs)
         log = os.path.join(tmp, "service-manager.log")
+        launchctl = f'''echo "launchctl $*" >> "{log}"
+case "$1" in
+  bootout)
+    [ "${{AGENT_RELAY_LAUNCHCTL_UPDATE_LOADED:-0}}" = 1 ] && exit 0
+    exit 1 ;;
+  unload)
+    [ -f "$2" ] && exit 0
+    exit 1 ;;
+esac
+exit 0
+'''
         for name, body in (("uname", f"echo {system}\n"),
-                           ("launchctl", f'echo "launchctl $*" >> "{log}"\n'),
+                           ("launchctl", launchctl),
                            ("systemctl", f'echo "systemctl $*" >> "{log}"\n')):
             stub = os.path.join(stubs, name)
             with open(stub, "w", encoding="utf-8") as handle:
@@ -462,8 +473,10 @@ class UpdateTimerTests(unittest.TestCase):
             self.assertEqual(os.listdir(agents), ["com.agent-relay.plist"])
             self.assertIn("no update timer installed", result.stdout)
             self.assertNotIn("removed", result.stdout)
-            # Nothing existed, so nothing is unloaded for the update timer.
-            self.assertFalse([line for line in self._take_log(tmp) if "update" in line])
+            # Both label-based and plist-based unload attempts fail when neither exists.
+            calls = self._take_log(tmp)
+            self.assertIn("launchctl bootout gui/", "\n".join(calls))
+            self.assertIn("com.agent-relay.update.plist", "\n".join(calls))
 
     def test_no_update_timer_removes_an_update_timer_from_an_earlier_install(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -487,6 +500,38 @@ class UpdateTimerTests(unittest.TestCase):
             self.assertIn(f"launchctl unload {update_plist}", self._take_log(tmp))
             self.assertIn("removed the existing update timer", result.stdout)
             self.assertNotIn("no update timer installed", result.stdout)
+
+    def test_no_update_timer_unloads_a_loaded_job_when_its_plist_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            env = {**self._env(tmp, checkout),
+                   "AGENT_RELAY_LAUNCHCTL_UPDATE_LOADED": "1"}
+            self._fake_checkout(checkout)
+            agents = os.path.join(tmp, "Library", "LaunchAgents")
+
+            result = self._install(env, "--no-update-timer")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.exists(os.path.join(agents, "com.agent-relay.plist")))
+            self.assertFalse(os.path.exists(os.path.join(agents, "com.agent-relay.update.plist")))
+            calls = self._take_log(tmp)
+            self.assertIn("launchctl bootout gui/", "\n".join(calls))
+            self.assertIn("/com.agent-relay.update", "\n".join(calls))
+            self.assertIn("removed the existing update timer", result.stdout)
+            self.assertNotIn("no update timer installed", result.stdout)
+
+    def test_uninstall_unloads_a_loaded_job_when_its_plist_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            env = {**self._env(tmp, checkout),
+                   "AGENT_RELAY_LAUNCHCTL_UPDATE_LOADED": "1"}
+            self._fake_checkout(checkout)
+            result = self._install(env, "--uninstall")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self._take_log(tmp)
+            self.assertIn("launchctl bootout gui/", "\n".join(calls))
+            self.assertIn("/com.agent-relay.update", "\n".join(calls))
 
     def test_no_update_timer_removes_the_systemd_update_units_but_keeps_the_service(self):
         with tempfile.TemporaryDirectory() as tmp:

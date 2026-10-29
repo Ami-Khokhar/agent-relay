@@ -200,7 +200,8 @@ bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints
 `/healthz`, `/v1/agents`, and the `list_agents` tool also report `revision`: the commit
 (`commit`, `short`) and commit `date` of the checkout the relay started from. A `date` weeks
 old means the running relay is stale: run `scripts/update.sh`. A field is `"unknown"` when
-the relay does not run from a git checkout. If the list is empty, the registry did not parse — the relay prints a timestamped `Configuration error: ...` line
+the relay does not run from a git checkout or git cannot answer. If the list is empty, the
+registry did not parse — the relay prints a timestamped `Configuration error: ...` line
 and exits on a bad registry, so check the server log.
 
 ## 5. Delegate work
