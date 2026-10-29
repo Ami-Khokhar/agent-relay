@@ -1,15 +1,20 @@
 import io
+import http.client
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+import sys
 import unittest
 from unittest.mock import patch
 from urllib.error import URLError
 
-from src import release_discovery as discovery
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+import release_discovery as discovery
 
 
 def release(tag, *, prerelease=False, draft=False, url=None, notes="release notes"):
@@ -73,10 +78,10 @@ class ReleaseDiscoveryTests(unittest.TestCase):
         releases = [release("1.0.0"), release("0.9.9"), release("1.1.0-rc.1", prerelease=True)]
         self.assertIsNone(discovery.discover("1.0.0", releases=releases))
         self.assertEqual(discovery.discover("1.0.0", True, releases)["version"], "1.1.0-rc.1")
-        self.assertTrue(discovery._newer("1.0.0", "1.0.0-rc.1"))
-        self.assertFalse(discovery._newer("1.0.0-rc.1", "1.0.0"))
-        self.assertTrue(discovery._newer("1.0.0-alpha.1", "1.0.0-alpha"))
-        self.assertFalse(discovery._newer("1.0.0-1", "1.0.0-alpha"))
+        self.assertGreater(discovery._compare_versions("1.0.0", "1.0.0-rc.1"), 0)
+        self.assertLess(discovery._compare_versions("1.0.0-rc.1", "1.0.0"), 0)
+        self.assertGreater(discovery._compare_versions("1.0.0-alpha.1", "1.0.0-alpha"), 0)
+        self.assertLess(discovery._compare_versions("1.0.0-1", "1.0.0-alpha"), 0)
 
     def test_selects_prerelease_versions_with_semver_precedence(self):
         candidates = [release("1.2.0-rc.2", prerelease=True),
@@ -109,6 +114,13 @@ class ReleaseDiscoveryTests(unittest.TestCase):
             with patch.object(discovery, "build_opener", return_value=FakeOpener(error=error)):
                 with self.assertRaisesRegex(discovery.DiscoveryError, "(unavailable|timed out)"):
                     discovery.fetch_releases()
+
+    def test_fetch_maps_malformed_http_response(self):
+        opener = FakeOpener(FakeResponse(b"[]"))
+        opener.response.read = lambda limit: (_ for _ in ()).throw(http.client.IncompleteRead(b"", 10))
+        with patch.object(discovery, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(discovery.DiscoveryError, "incomplete response"):
+                discovery.fetch_releases()
 
     def test_real_redirect_response_is_refused_without_requesting_target(self):
         requested = []
@@ -153,14 +165,44 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 output.seek(0)
                 output.truncate()
                 self.assertEqual(discovery.main(["--notify"]), 0)
-            self.assertIn("Installed version: 0.3.0 (source checkout)", first)
+            version_text = (Path(discovery.__file__).parent.parent / "pyproject.toml").read_text()
+            installed = re.search(r'^version\s*=\s*"([^"]+)"', version_text, re.M).group(1)
+            install_kind = ("source checkout" if (Path(discovery.__file__).parent.parent / ".git").exists()
+                            else "non-git installation; update method unknown")
+            installed_line = "Installed version: %s (%s)" % (installed, install_kind)
+            self.assertIn(installed_line, first)
             self.assertIn("Available version: 0.4.0", first)
             self.assertIn("hello", first)
-            self.assertEqual(output.getvalue(), "Installed version: 0.3.0 (source checkout)\n")
+            self.assertEqual(output.getvalue(), installed_line + "\n")
             cache = Path(temp) / "agent-relay" / "release-notices.json"
             self.assertEqual(json.loads(cache.read_text()), {"version": "0.4.0"})
-            self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(cache.parent.stat().st_mode & 0o777, 0o700)
+            if os.name == "posix":
+                self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(cache.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_cache_path_ignores_empty_and_relative_xdg_values(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            for value in ("", "relative-cache"):
+                with self.subTest(value=value), patch.dict(os.environ, {"XDG_CACHE_HOME": value}), \
+                        patch.object(Path, "home", return_value=home):
+                    self.assertEqual(discovery._cache_path(), home / ".cache" / "agent-relay" / "release-notices.json")
+
+    def test_notice_write_skips_posix_modes_on_non_posix(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(discovery, "_IS_POSIX", False), \
+                patch.object(discovery.os, "chmod", side_effect=AssertionError("chmod called")), \
+                patch.object(discovery.os, "fchmod", side_effect=AssertionError("fchmod called"), create=True), \
+                patch.object(Path, "home", return_value=Path(temp)), \
+                patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            self.assertTrue(discovery._notify_once({"version": "1.2.3"}))
+
+    def test_cli_reports_non_semver_installed_version_actionably(self):
+        output, error = io.StringIO(), io.StringIO()
+        with patch.object(Path, "read_text", return_value='version = "0.3.0.dev1"'), \
+                patch("sys.stdout", output), patch("sys.stderr", error):
+            self.assertEqual(discovery.main([]), 1)
+        self.assertIn("installed version is not semantic versioning", error.getvalue())
 
     def test_malformed_cache_is_replaced_and_cache_write_errors_are_actionable(self):
         with tempfile.TemporaryDirectory() as temp:

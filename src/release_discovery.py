@@ -2,6 +2,7 @@
 """Read-only discovery of published agent-relay releases."""
 
 import argparse
+import http.client
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ RELEASE_URL = "https://github.com/Ami-Khokhar/agent-relay/releases/tag/"
 MAX_RESPONSE = 512 * 1024
 MAX_NOTES = 2000
 TIMEOUT = 5
+_IS_POSIX = os.name == "posix"
 VERSION_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
 
 
@@ -37,12 +39,11 @@ def _version(value):
     return (int(major), int(minor), int(patch), identifiers)
 
 
-def _newer(candidate, installed):
-    return _compare_versions(candidate, installed) > 0
-
-
 def _compare_versions(left_version, right_version):
-    a, b = _version(left_version), _version(right_version)
+    return _compare_parsed(_version(left_version), _version(right_version))
+
+
+def _compare_parsed(a, b):
     if a[:3] != b[:3]:
         return (a[:3] > b[:3]) - (a[:3] < b[:3])
     x, y = a[3], b[3]
@@ -88,6 +89,8 @@ def fetch_releases():
         raise DiscoveryError("release service unavailable (HTTP %d); try again later" % exc.code) from exc
     except TimeoutError as exc:
         raise DiscoveryError("release service timed out; check connectivity and try again") from exc
+    except http.client.HTTPException as exc:
+        raise DiscoveryError("release service returned an incomplete response; try again later") from exc
     except (URLError, OSError) as exc:
         raise DiscoveryError("release service unavailable; check connectivity and try again") from exc
     if len(data) > MAX_RESPONSE:
@@ -102,7 +105,7 @@ def fetch_releases():
 
 
 def discover(installed, include_prereleases=False, releases=None):
-    _version(installed)
+    installed_version = _version(installed)
     candidates = []
     for release in (fetch_releases() if releases is None else releases):
         if not isinstance(release, dict) or not isinstance(release.get("draft"), bool) \
@@ -123,7 +126,7 @@ def discover(installed, include_prereleases=False, releases=None):
         expected_url = RELEASE_URL + tag
         if release.get("html_url") != expected_url:
             continue
-        if _newer(tag, installed):
+        if _compare_parsed(version, installed_version) > 0:
             raw_notes = release.get("body") if isinstance(release.get("body"), str) else ""
             notes = "".join(char for char in raw_notes
                             if char in "\n\t" or unicodedata.category(char) not in ("Cc", "Cf"))
@@ -131,12 +134,14 @@ def discover(installed, include_prereleases=False, releases=None):
                                         "notes": notes[:MAX_NOTES]}))
     if not candidates:
         return None
-    return max(candidates, key=cmp_to_key(
-        lambda a, b: _compare_versions(a[1]["version"], b[1]["version"])))[1]
+    return max(candidates, key=cmp_to_key(lambda a, b: _compare_parsed(a[0], b[0])))[1]
 
 
 def _cache_path():
-    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "agent-relay" / "release-notices.json"
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    if not cache_home.is_absolute():
+        cache_home = Path.home() / ".cache"
+    return cache_home / "agent-relay" / "release-notices.json"
 
 
 def _notify_once(offer):
@@ -151,9 +156,11 @@ def _notify_once(offer):
     temp_path = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(path.parent, 0o700)
+        if _IS_POSIX:
+            os.chmod(path.parent, 0o700)
         fd, temp_path = tempfile.mkstemp(prefix="release-notice-", dir=str(path.parent))
-        os.fchmod(fd, 0o600)
+        if _IS_POSIX:
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = None
             json.dump({"version": offer["version"]}, handle)
@@ -192,6 +199,9 @@ def main(argv=None):
     source = (root / ".git").exists()
     try:
         offer = discover(installed, args.include_prereleases)
+    except ValueError:
+        print("error: installed version is not semantic versioning; fix the version in pyproject.toml", file=sys.stderr)
+        return 1
     except (DiscoveryError, OSError) as exc:
         print("Release check failed: %s" % exc, file=sys.stderr)
         return 1
@@ -210,7 +220,7 @@ def main(argv=None):
     print("Available version: %s" % offer["version"])
     print("Release: %s" % offer["url"])
     if offer["notes"]:
-        print("Release notes:\n%s%s" % (offer["notes"], "…" if len(offer["notes"]) == MAX_NOTES else ""))
+        print("Release notes:\n%s" % offer["notes"])
     return 0
 
 
