@@ -40,7 +40,7 @@ Use it when the user wants to:
 - delegate implementation work to pi, Codex, OpenCode, or Claude Code instead of
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
-- give an MCP client the task tools, workflow tools, `get_pressure`, and `prepare_feedback`;
+- give an MCP client the task tools, workflow tools, `get_pressure`, `prepare_feedback`, and `check_updates`;
   `tools/list` is authoritative.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
@@ -157,15 +157,17 @@ detached (log: `~/.local/state/agent-relay/relay.log`). To keep it up across reb
 `bash scripts/install-service.sh`. `SIGTERM` or `SIGINT` cancels running tasks and waits
 briefly for adapters to stop.
 
-To pick up new features merged on the project's `main`, run `bash
+To update a source checkout, run `bash
 ~/.local/share/agent-relay/scripts/update.sh` (or `scripts/update.sh` from the checkout):
 it fast-forwards the checkout and restarts the service only when the code changed. The
 first restart is deferred while tasks are in flight (or while the relay cannot report
-counts), and the next run escalates — restarting unless tasks are visibly busy — so an
-update lands at most one cycle late. `install-service.sh` also schedules that update every
-6 hours when the install directory is a git clone; pass `--no-update-timer` to opt out
-(`--with-update-timer` is still accepted and does nothing). MCP clients need no
-reconfiguration — the tool list refreshes on each client's next session start.
+counts), and the next run restarts unless tasks are visibly busy. The installer schedules
+a metadata-only release check every 6 hours. It stores a bounded offer in the private local
+cache; an MCP session may show its version and canonical release link once, at a convenient
+checkpoint. `check_updates` fetches bounded release notes only when explicitly called. These
+checks do not install releases or restart the service. Older installed timers still run the
+legacy updater until you rerun `install-service.sh` to replace their definitions. Pass
+`--no-update-timer` to remove the timer (`--with-update-timer` remains accepted).
 
 Register the MCP server in the orchestrating client (point `args` at the absolute path).
 The setup script prints these for your checkout:

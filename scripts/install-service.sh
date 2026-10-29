@@ -6,9 +6,8 @@
 #
 # Usage:
 #   scripts/install-service.sh            install and start the service, and a
-#                                   scheduled update that runs scripts/update.sh
-#                                   every 6 hours so the checkout cannot fall
-#                                   behind unnoticed
+#                                   scheduled metadata-only release check every
+#                                   6 hours; it never installs or restarts
 #   scripts/install-service.sh --no-update-timer
 #                                   install the service only and remove an
 #                                   update timer left by an earlier install;
@@ -154,13 +153,9 @@ fi
 
 echo "verify: curl -sS http://127.0.0.1:$PORT/healthz"
 
-# Scheduled update (on unless --no-update-timer): keep the checkout current and restart
-# the service when the code changed. See scripts/update.sh. It updates only a git clone,
-# so a timer for any other directory would fail on every run.
-if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -d "$TARGET_DIR/.git" ]; then
-  echo "warning: $TARGET_DIR is not a git checkout, so scripts/update.sh cannot update it; no update timer installed" >&2
-  WITH_UPDATE_TIMER=0
-elif [ "$WITH_UPDATE_TIMER" = "0" ]; then
+# Scheduled release metadata check (on unless --no-update-timer). The check can
+# run from a source checkout or packaged install and never changes installed files.
+if [ "$WITH_UPDATE_TIMER" = "0" ]; then
   # --no-update-timer also removes a timer that an earlier install left behind. Only the
   # update timer goes: the relay service installed above stays as it is.
   REMOVED_TIMER=0
@@ -202,8 +197,9 @@ if [ "$WITH_UPDATE_TIMER" = "1" ]; then
   <key>Label</key><string>$UPDATE_LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>$TARGET_DIR/scripts/update.sh</string>
+    <string>$PYTHON</string>
+    <string>$TARGET_DIR/src/release_discovery.py</string>
+    <string>--cache-offer</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -235,7 +231,7 @@ Type=oneshot
 Environment=PATH=$SERVICE_PATH
 Environment=A2A_RELAY_PORT=$PORT
 Environment=AGENT_RELAY_DIR=$TARGET_DIR
-ExecStart=/bin/bash $TARGET_DIR/scripts/update.sh
+ExecStart=$PYTHON $TARGET_DIR/src/release_discovery.py --cache-offer
 UNIT_EOF
     cat > "$UPDATE_TIMER" <<UNIT_EOF
 [Unit]

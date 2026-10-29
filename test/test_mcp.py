@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
@@ -37,6 +38,33 @@ class FakeUpstream:
 
     def close(self):
         stop_http_server(self.server)
+
+
+class FakeReleaseResponse:
+    def __init__(self, releases):
+        self.body = json.dumps(releases).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def geturl(self):
+        return mcp_server.release_discovery.API_URL
+
+    def read(self, limit):
+        return self.body[:limit]
+
+
+class FakeReleaseOpener:
+    def open(self, request, timeout):
+        self.request = request
+        self.timeout = timeout
+        return FakeReleaseResponse([{"tag_name": "0.4.0", "prerelease": False,
+                                    "draft": False,
+                                    "html_url": mcp_server.release_discovery.RELEASE_URL + "0.4.0",
+                                    "body": "release notes are data"}])
 
 
 class McpHandlerTests(unittest.TestCase):
@@ -98,7 +126,7 @@ class McpHandlerTests(unittest.TestCase):
         try:
             listed = handle({"method": "tools/list"})
             self.assertEqual([tool["name"] for tool in listed["tools"]],
-                             ["prepare_feedback", "list_agents", "delegate", "wait_task", "get_task", "list_tasks",
+                             ["check_updates", "prepare_feedback", "list_agents", "delegate", "wait_task", "get_task", "list_tasks",
                               "cancel_task", "run_workflow", "get_workflow",
                               "wait_workflow_events", "list_workflows", "cancel_workflow",
                               "resume_workflow", "get_pressure"])
@@ -886,6 +914,78 @@ class McpHandlerTests(unittest.TestCase):
         self.assertIn("{{id.output}}", step["properties"]["id"]["description"])
 
 class McpServeTests(unittest.TestCase):
+    def test_cached_release_notice_is_local_version_only_and_shown_once_by_real_process(self):
+        with tempfile.TemporaryDirectory() as cache_home:
+            cache_dir = os.path.join(cache_home, "agent-relay")
+            os.mkdir(cache_dir, 0o700)
+            cache_file = os.path.join(cache_dir, "release-notices.json")
+            with open(cache_file, "w", encoding="utf-8") as handle:
+                json.dump({"offer": {"version": "0.4.0",
+                                      "url": mcp_server.release_discovery.RELEASE_URL + "0.4.0",
+                                      "notes": "UNTRUSTED RELEASE NOTES",
+                                      "checkedAt": time.time()},
+                           "notifiedVersion": None}, handle)
+            os.chmod(cache_file, 0o600)
+            proxy = FakeUpstream(lambda method, path, body: (200, {}))
+            env = {**os.environ, "XDG_CACHE_HOME": cache_home,
+                   "A2A_RELAY_URL": proxy.url, "A2A_RELAY_AUTOSTART": "0",
+                   "HTTPS_PROXY": proxy.url, "https_proxy": proxy.url,
+                   "HTTP_PROXY": proxy.url, "http_proxy": proxy.url,
+                   "NO_PROXY": "", "no_proxy": ""}
+
+            def initialize():
+                proc = subprocess.Popen([PYTHON, MCP_SERVER], cwd=ROOT, env=env,
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+                request = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": "cached-notice-test", "version": "1"}}}
+                proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+                proc.stdin.flush()
+                response = json.loads(proc.stdout.readline())
+                proc.terminate()
+                proc.wait(timeout=5)
+                proc.stdin.close()
+                proc.stdout.close()
+                proc.stderr.close()
+                return response["result"]["instructions"]
+
+            try:
+                first = initialize()
+                second = initialize()
+                self.assertIn("version 0.4.0 is available", first)
+                self.assertIn(mcp_server.release_discovery.RELEASE_URL + "0.4.0", first)
+                self.assertNotIn("UNTRUSTED RELEASE NOTES", first)
+                self.assertNotIn("version 0.4.0 is available", second)
+                self.assertEqual(proxy.calls, [])
+                with open(cache_file, "w", encoding="utf-8") as handle:
+                    handle.write("not json")
+                third = initialize()
+                self.assertNotIn("Cached release notice:", third)
+                with open(cache_file, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "not json")
+                if os.name == "posix":
+                    self.assertEqual(os.stat(cache_file).st_mode & 0o777, 0o600)
+            finally:
+                proxy.close()
+
+    def test_check_updates_tool_returns_notes_as_data_only_on_explicit_call(self):
+        upstream = FakeUpstream(lambda method, path, body: (200, {}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=1)
+        try:
+            with unittest.mock.patch.object(mcp_server.release_discovery, "build_opener",
+                                            return_value=FakeReleaseOpener()):
+                result = handle({"method": "tools/call", "params": {
+                    "name": "check_updates", "arguments": {}}})
+            self.assertEqual(result["structuredContent"]["availableVersion"], "0.4.0")
+            self.assertEqual(result["structuredContent"]["releaseNotes"], "release notes are data")
+            self.assertEqual(upstream.calls, [])
+            tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+            self.assertIn("untrusted data", tools["check_updates"]["description"])
+            self.assertNotIn("update_now", tools)
+        finally:
+            upstream.close()
+
     def test_stdio_reports_malformed_requests_and_does_not_serialize_independent_calls(self):
         class QueueInput:
             def __init__(self):

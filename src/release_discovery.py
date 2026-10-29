@@ -4,11 +4,13 @@
 import argparse
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 import unicodedata
 from functools import cmp_to_key
 from urllib.error import HTTPError, URLError
@@ -18,6 +20,8 @@ API_URL = "https://api.github.com/repos/Ami-Khokhar/agent-relay/releases?per_pag
 RELEASE_URL = "https://github.com/Ami-Khokhar/agent-relay/releases/tag/"
 MAX_RESPONSE = 512 * 1024
 MAX_NOTES = 2000
+MAX_CACHE = 16 * 1024
+OFFER_MAX_AGE = 14 * 24 * 60 * 60
 TIMEOUT = 5
 _IS_POSIX = os.name == "posix"
 VERSION_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
@@ -140,26 +144,80 @@ def _cache_path():
     return cache_home / "agent-relay" / "release-notices.json"
 
 
-def _notify_once(offer):
+def installed_version():
+    root = Path(__file__).resolve().parent.parent
+    try:
+        text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DiscoveryError("cannot read installed version from pyproject.toml") from exc
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    if not match:
+        raise DiscoveryError("cannot determine installed version")
+    try:
+        _version(match.group(1))
+    except ValueError as exc:
+        raise DiscoveryError("installed version is not semantic versioning; fix the version in pyproject.toml") from exc
+    return match.group(1)
+
+
+def _private_cache():
     path = _cache_path()
     try:
-        previous = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, AttributeError):
-        previous = {}
-    if isinstance(previous, dict) and previous.get("version") == offer["version"]:
-        return False
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent = path.parent.lstat()
+        owner = getattr(os, "geteuid", lambda: None)()
+        if (not path.parent.is_dir() or path.parent.is_symlink()
+                or (owner is not None and parent.st_uid != owner)):
+            raise OSError("cache directory is not owned by this user")
+        if _IS_POSIX:
+            os.chmod(path.parent, 0o700)
+    except OSError as exc:
+        raise DiscoveryError("cannot create the private release cache; check cache directory permissions") from exc
+    return path
+
+
+def _read_cache():
+    path = _cache_path()
+    try:
+        parent = path.parent.lstat()
+        info = path.lstat()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
+    owner = getattr(os, "geteuid", lambda: None)()
+    if (not path.parent.is_dir() or path.parent.is_symlink()
+            or (owner is not None and parent.st_uid != owner)
+            or (_IS_POSIX and parent.st_mode & 0o077)
+            or not path.is_file() or path.is_symlink()
+            or (owner is not None and info.st_uid != owner)
+            or (_IS_POSIX and info.st_mode & 0o077)
+            or info.st_size > MAX_CACHE):
+        return {}
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    return cache if isinstance(cache, dict) else {}
+
+
+def _write_cache(offer, notified_version=None):
+    previous = _read_cache()
+    if notified_version is None:
+        notified_version = previous.get("notifiedVersion")
+        if notified_version is None and isinstance(previous.get("version"), str):
+            notified_version = previous["version"]
+    value = {"offer": offer, "notifiedVersion": notified_version}
+    path = _private_cache()
     fd = None
     temp_path = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if _IS_POSIX:
-            os.chmod(path.parent, 0o700)
         fd, temp_path = tempfile.mkstemp(prefix="release-notice-", dir=str(path.parent))
         if _IS_POSIX:
             os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = None
-            json.dump({"version": offer["version"]}, handle)
+            json.dump(value, handle, separators=(",", ":"))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
@@ -173,6 +231,59 @@ def _notify_once(offer):
                 os.unlink(temp_path)
         except OSError as exc:
             raise DiscoveryError("cannot clean up the private notice cache; check cache directory permissions") from exc
+    return value
+
+
+def _valid_offer(offer, installed):
+    if not isinstance(offer, dict):
+        return None
+    version, url, notes, checked = (offer.get(key) for key in
+                                    ("version", "url", "notes", "checkedAt"))
+    try:
+        parsed = _version(version)
+    except (ValueError, TypeError):
+        return None
+    if (url != RELEASE_URL + version or not isinstance(notes, str) or len(notes) > MAX_NOTES
+            or not isinstance(checked, (int, float)) or isinstance(checked, bool)
+            or not math.isfinite(checked)
+            or checked > time.time() + 300 or time.time() - checked > OFFER_MAX_AGE
+            or _compare_parsed(parsed, _version(installed)) <= 0):
+        return None
+    cleaned = "".join(char for char in notes
+                      if char in "\n\t" or unicodedata.category(char) not in ("Cc", "Cf"))
+    if cleaned != notes:
+        return None
+    return {"version": version, "url": url, "notes": notes, "checkedAt": checked}
+
+
+def cached_notice(installed=None):
+    """Return one validated, version/link-only notice from the private local cache."""
+    try:
+        installed = installed or installed_version()
+        cache = _read_cache()
+        offer = _valid_offer(cache.get("offer"), installed)
+        if offer is None or cache.get("notifiedVersion") == offer["version"]:
+            return None
+        _write_cache(offer, offer["version"])
+        return {"version": offer["version"], "url": offer["url"]}
+    except (DiscoveryError, OSError, TypeError, ValueError):
+        return None
+
+
+def cache_latest_offer(include_prereleases=False, installed=None):
+    """Fetch and cache a bounded offer without recording that a user saw it."""
+    installed = installed or installed_version()
+    offer = discover(installed, include_prereleases)
+    value = None if offer is None else {**offer, "checkedAt": time.time()}
+    _write_cache(value)
+    return installed, offer
+
+
+def _notify_once(offer):
+    cache = _read_cache()
+    if cache.get("notifiedVersion") == offer["version"] or cache.get("version") == offer["version"]:
+        return False
+    _write_cache({**offer, "checkedAt": time.time()}, offer["version"])
     return True
 
 
@@ -180,31 +291,35 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Check for published agent-relay releases; this command never installs or restarts.")
     parser.add_argument("--include-prereleases", action="store_true", help="include explicitly published prereleases")
     parser.add_argument("--notify", action="store_true", help="show a new offer only once per version on this device")
+    parser.add_argument("--cache-offer", action="store_true",
+                        help="cache release metadata for the MCP client without marking it shown")
     args = parser.parse_args(argv)
-    root = Path(__file__).resolve().parent.parent
+    if args.notify and args.cache_offer:
+        parser.error("--notify and --cache-offer cannot be used together")
     try:
-        text = (root / "pyproject.toml").read_text(encoding="utf-8")
-    except OSError:
-        print("error: cannot read installed version from pyproject.toml", file=sys.stderr)
+        installed = installed_version()
+    except DiscoveryError as exc:
+        print("error: %s" % exc, file=sys.stderr)
         return 1
-    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
-    if not match:
-        print("error: cannot determine installed version", file=sys.stderr)
-        return 1
-    installed = match.group(1)
-    source = (root / ".git").exists()
     try:
-        offer = discover(installed, args.include_prereleases)
-    except ValueError:
-        print("error: installed version is not semantic versioning; fix the version in pyproject.toml", file=sys.stderr)
-        return 1
+        if args.cache_offer:
+            installed, offer = cache_latest_offer(args.include_prereleases, installed)
+        else:
+            offer = discover(installed, args.include_prereleases)
     except (DiscoveryError, OSError) as exc:
         print("Release check failed: %s" % exc, file=sys.stderr)
         return 1
+    root = Path(__file__).resolve().parent.parent
+    source = (root / ".git").exists()
     install_kind = "source checkout" if source else "non-git installation; update method unknown"
     print("Installed version: %s (%s)" % (installed, install_kind))
     if offer is None:
+        if args.cache_offer:
+            print("Cached release check: no newer release is available.")
         print("No newer published %srelease is available." % ("prerelease or stable " if args.include_prereleases else "stable "))
+        return 0
+    if args.cache_offer:
+        print("Cached release offer: %s" % offer["version"])
         return 0
     if args.notify:
         try:

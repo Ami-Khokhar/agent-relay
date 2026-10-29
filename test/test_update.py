@@ -347,6 +347,7 @@ class UpdateTimerTests(unittest.TestCase):
         """install-service.sh only checks the layout, not a real checkout."""
         os.makedirs(os.path.join(checkout, "src"), exist_ok=True)
         open(os.path.join(checkout, "src", "server.py"), "w").close()
+        open(os.path.join(checkout, "src", "release_discovery.py"), "w").close()
 
     def _env(self, tmp, checkout, system="Darwin"):
         """Stub uname, launchctl and systemctl; each service-manager call is
@@ -409,7 +410,9 @@ exit 0
             with open(update_plist, encoding="utf-8") as handle:
                 body = handle.read()
             self.assertIn("<key>StartInterval</key><integer>21600</integer>", body)
-            self.assertIn(f"<string>{checkout}/scripts/update.sh</string>", body)
+            self.assertIn(f"<string>{checkout}/src/release_discovery.py</string>", body)
+            self.assertIn("<string>--cache-offer</string>", body)
+            self.assertNotIn("scripts/update.sh", body)
             self.assertIn("<key>A2A_RELAY_PORT</key>", body)
             self.assertIn("<key>AGENT_RELAY_DIR</key>", body)
 
@@ -571,19 +574,18 @@ exit 0
             self.assertFalse([line for line in self._take_log(tmp)
                               if "update.timer" in line])
 
-    def test_update_timer_is_skipped_with_a_warning_outside_a_git_checkout(self):
-        """update.sh cannot update a directory that is not a git clone, so a
-        timer for it would only fail every interval."""
+    def test_timer_uses_metadata_only_checker_on_linux(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkout = os.path.join(tmp, "copy")
-            env = self._env(tmp, checkout)
+            env = self._env(tmp, checkout, system="Linux")
             self._fake_checkout(checkout)
-            agents = os.path.join(tmp, "Library", "LaunchAgents")
-
             result = self._install(env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(os.listdir(agents), ["com.agent-relay.plist"])
-            self.assertIn("not a git checkout", result.stderr)
+            unit = os.path.join(tmp, ".config", "systemd", "user", "agent-relay-update.service")
+            with open(unit, encoding="utf-8") as handle:
+                body = handle.read()
+            self.assertIn(f"ExecStart={PYTHON} {checkout}/src/release_discovery.py --cache-offer", body)
+            self.assertNotIn("scripts/update.sh", body)
 
 
 class DeployedRevisionTests(unittest.TestCase):

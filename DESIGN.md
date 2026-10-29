@@ -9,12 +9,25 @@ A coding agent can delegate a **new** task to another registered agent, inspect 
 | Method | Best fit | Result of the experiment |
 | --- | --- | --- |
 | HTTP task API | Shared relay on one host or across machines; asynchronous jobs | Chosen as the core. Submission returns a task ID; clients poll or cancel. |
-| MCP over stdio | Coding agents that can discover and call tools | Chosen as a thin interface over the HTTP API. It uses the six task tools, the six workflow tools, and `get_pressure`. |
+| MCP over stdio | Coding agents that can discover and call tools | Chosen as a thin interface over the HTTP API. It uses the six task tools, the six workflow tools, `get_pressure`, `prepare_feedback`, and `check_updates`. |
 | A2A over HTTP | Interoperability with clients that require the A2A standard | Keep as a future edge adapter. A prototype showed the Agent Card and JSON-RPC surface require their own versioning and task semantics. |
 | Direct CLI / stdio | One orchestrator and one local child agent | Simplest for a single call, but gives no shared task registry or remote access. |
 | Unix socket | Local transport with no TCP port | Could replace the HTTP listener locally; it does not change the task API or adapter model. |
 
 HTTP is a transport, while MCP and A2A are protocols. They can coexist around one task service. WebSockets are useful for live, two-way steering; the first release needs task submission, polling, and cancellation. Server-Sent Events can later provide output events while preserving polling as the baseline.
+
+## Release notices (issue #118, part of #113)
+
+The installed timer runs only the bounded canonical release metadata checker. It stores the
+validated offer in a local cache without marking it as offered. On POSIX, the cache uses
+restrictive directory and file permissions; elsewhere it relies on the operating system's
+user-cache defaults. MCP initialization reads and
+validates that cache without network access, then offers at most one version and canonical
+release URL notice per version to the client. Release notes are returned only by an explicit
+`check_updates` call as bounded data. Neither path installs a release, pulls source, restarts
+the relay, or implies an update-now capability. Older timer definitions keep running the
+legacy pull/restart script until the owner reruns the installer; the manual script remains a
+separate operation pending a safe activation and consent design.
 
 ## Shape
 

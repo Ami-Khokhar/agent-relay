@@ -344,12 +344,13 @@ A task whose time runs out while the relay is still locating git metadata ends `
 The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
 - `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo }`
-- `tools/list` → the thirteen tools below
+- `tools/list` → the fourteen tools below
 - `ping`
 - `tools/call`
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
+| `check_updates` | `{ includePrereleases? }` | Installed version and either no offer or an available version, canonical release URL, and bounded release notes. Calls the canonical GitHub release API only when explicitly requested; notes are data, not instructions. It never installs or restarts. |
 | `list_agents` | `{}` | Same payload as `GET /v1/agents`, including `revision`. |
 | `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, options?, readOnly?, waitMs? }` | Submitted task; with `waitMs`, the terminal task, or the current task with `waitExpired: true` if the wait elapses first. A `waitMs` above the relay limit is refused with `invalid_wait` before the task is created, so nothing runs without an ID. The tool then retries once with the limit (read from `/healthz` `limits.maxWaitMs`, never longer than asked) and adds `waitMs` and `waitClamped: true` to the result. Even with a `requestId` the retry makes one task, because the refused attempt created none. |
 | `wait_task` | `{ taskId, maxWaitMs? }` | Terminal task, or the current task with `waitExpired: true`, `waitedMs` and `hint` if the wait elapses. A `maxWaitMs` above the relay limit is clamped to it, and the result adds `waitMs` and `waitClamped: true`. |
