@@ -224,9 +224,10 @@ no draft. The tool does not contact GitHub or submit anything. A user must open 
 the public contents, and click Submit in their own GitHub session.
 
 Use only the bounded error category, operation, OS family, version, blocked action, and workaround.
-The draft omits task prompts, outputs, paths, environment values, and IDs by default. Known
-credential patterns are refused, but that check cannot guarantee arbitrary prose is private. A
-report does not authorize repairs or updates.
+The version must be SemVer, a 7-40 character hexadecimal revision, or `unknown`. The draft omits
+task prompts, outputs, paths, environment values, and IDs by default. Credential-shaped values
+and control or bidirectional characters in free text are refused, but that check cannot guarantee
+arbitrary prose is private. A report does not authorize repairs or updates.
 
 ## Submit and inspect work
 

@@ -55,6 +55,46 @@ class FeedbackTests(unittest.TestCase):
             prepare_feedback("other", "other", "Other", "0.3.0", "token=ghp_" + "A" * 30,
                              "Used a workaround")
 
+    def test_credential_shapes_are_rejected_from_all_narrative_fields(self):
+        secrets = ("AKIA" + "A" * 16, "-----BEGIN RSA PRIVATE KEY-----",
+                   "https://user:password@example.invalid/path", "AWS_SECRET_ACCESS_KEY=synthetic",
+                   "secret_key: synthetic", "access_token_v2=synthetic")
+        for secret in secrets:
+            for field in ("blocked", "workaround"):
+                values = {"blocked": "Relay blocked operation", "workaround": "Used local fallback"}
+                values[field] = secret
+                with self.subTest(secret=secret, field=field), self.assertRaisesRegex(ValueError, "credential-like"):
+                    prepare_feedback("other", "other", "Other", "0.3.0", values["blocked"], values["workaround"])
+            with self.subTest(secret=secret, field="version"), self.assertRaisesRegex(ValueError, "credential-like"):
+                prepare_feedback("other", "other", "Other", secret, "Relay blocked operation", "Used local fallback")
+        self.assertEqual(prepare_feedback("other", "other", "Other", "0.3.0",
+                                          "Relay could not open its socket", "Used the direct local interface")
+                         ["title"], "[Relay problem] other")
+
+    def test_cli_and_mcp_reject_credentials_without_returning_a_draft(self):
+        cli = subprocess.run([sys.executable, os.path.join(ROOT, "src", "feedback.py"),
+                              "--category", "other", "--operation", "mcp", "--system", "Linux",
+                              "--version", "0.3.0", "--blocked-action", "AWS_SECRET_ACCESS_KEY=synthetic",
+                              "--workaround", "Used local fallback"], capture_output=True, text=True)
+        self.assertNotEqual(cli.returncode, 0)
+        self.assertEqual(cli.stdout, "")
+        handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+        with self.assertRaisesRegex(mcp_server.RpcError, "credential-like"):
+            handle({"method": "tools/call", "params": {"name": "prepare_feedback", "arguments": {
+                "category": "other", "operation": "mcp", "system": "Linux", "version": "0.3.0",
+                "blockedAction": "Relay blocked operation", "workaround": "https://user:pass@example.invalid/"}}})
+
+    def test_version_is_bounded_semver_revision_or_unknown_and_free_text_rejects_controls(self):
+        for version in ("v0.3.0-rc.1+build.2", "abcdef0", "unknown"):
+            self.assertIn("formUrl", prepare_feedback("other", "mcp", "Linux", version,
+                                                       "Relay blocked operation", "Used fallback"))
+        for version in ("x" * 81, "main", "0.3.0\u202e"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                prepare_feedback("other", "mcp", "Linux", version, "Relay blocked operation", "Used fallback")
+        for value in ("Relay\u202e blocked operation", "Relay\x00 blocked operation"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "control or bidirectional"):
+                prepare_feedback("other", "mcp", "Linux", "0.3.0", value, "Used fallback")
+
     def test_missing_blocker_or_workaround_produces_no_draft_or_form(self):
         for blocker, workaround in (("", "Used a workaround"), ("Relay blocked operation", "")):
             with self.assertRaises(ValueError):

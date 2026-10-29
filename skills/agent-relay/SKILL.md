@@ -215,12 +215,13 @@ to prepare a report, at most once per work session. If the user declines, defers
 stop. Preparing a draft does not approve a repair, retry, update, or other change.
 
 If the user wants to report it, call MCP `prepare_feedback` with the bounded category, operation,
-OS family, version, the concrete blocked action, and the workaround actually used. Missing blocker
-or workaround evidence produces no draft. Do not claim an automated classifier proved the relay
-was at fault. Show the returned title, body, and URL for review. The issue is public if submitted;
-known credential patterns are rejected, but redaction is not a privacy guarantee. Submission
-happens only when the user opens the fixed GitHub form, reviews its contents, and clicks Submit in
-their own GitHub session. The tool makes no network request and cannot submit.
+OS family, version (SemVer, a 7-40 character hexadecimal revision, or `unknown`), the concrete
+blocked action, and the workaround actually used. Missing blocker or workaround evidence produces
+no draft. Do not claim an automated classifier proved the relay was at fault. Show the returned
+title, body, and URL for review. The issue is public if submitted; known credential patterns and
+control or bidirectional characters in free text are rejected, but redaction is not a privacy
+guarantee. Submission happens only when the user opens the fixed GitHub form, reviews its contents,
+and clicks Submit in their own GitHub session. The tool makes no network request and cannot submit.
 
 **Via HTTP** (submit returns `202` immediately; then long-poll):
 

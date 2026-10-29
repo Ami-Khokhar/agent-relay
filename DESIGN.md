@@ -81,7 +81,9 @@ The first reporting flow is local draft preparation plus a prefilled fixed GitHu
 `prepare_feedback` performs no HTTP request and has no submit or consent flag; the user reviews
 the public draft and submits in their own GitHub session. Inputs are bounded and limited to an
 allowlisted category, operation, OS family, version, concrete blocked action, and workaround
-actually used. Missing either evidence field yields no draft.
+actually used. Version accepts bounded SemVer, a 7-40 character hexadecimal revision, or `unknown`;
+all free text rejects credential-shaped values and control/bidirectional characters. Missing either
+evidence field yields no draft.
 Prompts, outputs, paths, environment values, and task IDs are not accepted as fields. Known
 credential patterns are rejected as an extra guard, not treated as proof that prose is private.
 No report archive or telemetry is retained. The skill stays quiet until a concrete relay blocker

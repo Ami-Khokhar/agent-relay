@@ -160,7 +160,9 @@ TOOLS = [
                 "category": {"type": "string", "enum": ["crash", "incorrect_behavior", "unavailable", "other"]},
                 "operation": {"type": "string", "enum": ["start", "delegate", "wait", "cancel", "workflow", "mcp", "other"]},
                 "system": {"type": "string", "enum": ["Linux", "macOS", "Windows", "Other"]},
-                "version": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "version": {"type": "string", "minLength": 1, "maxLength": 80,
+                    "pattern": "^(unknown|[0-9A-Fa-f]{7,40}|v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?)$",
+                    "description": "SemVer, a 7-40 character hex revision, or unknown."},
                 "blockedAction": {"type": "string", "minLength": 1, "maxLength": 1000,
                     "description": "Concrete action genuinely blocked by agent-relay itself. Required evidence; never infer from a normal error."},
                 "workaround": {"type": "string", "minLength": 1, "maxLength": 1000,
@@ -644,7 +646,7 @@ def create_http_handler(base_url=None, timeout=None):
                 if not args.get("blockedAction") or not args.get("workaround"):
                     _invalid("a concrete blocked action and workaround actually used are required")
                 for key in ("category", "operation", "system", "version", "blockedAction", "workaround"):
-                    _non_empty(args, key, 1000)
+                    _non_empty(args, key, 80 if key == "version" else 1000)
                 try:
                     value = prepare_feedback(args["category"], args["operation"], args["system"],
                                              args["version"], args["blockedAction"], args["workaround"])
