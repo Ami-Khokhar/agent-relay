@@ -39,10 +39,6 @@ def _version(value):
     return (int(major), int(minor), int(patch), identifiers)
 
 
-def _compare_versions(left_version, right_version):
-    return _compare_parsed(_version(left_version), _version(right_version))
-
-
 def _compare_parsed(a, b):
     if a[:3] != b[:3]:
         return (a[:3] > b[:3]) - (a[:3] < b[:3])

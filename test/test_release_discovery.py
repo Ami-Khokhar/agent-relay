@@ -78,10 +78,13 @@ class ReleaseDiscoveryTests(unittest.TestCase):
         releases = [release("1.0.0"), release("0.9.9"), release("1.1.0-rc.1", prerelease=True)]
         self.assertIsNone(discovery.discover("1.0.0", releases=releases))
         self.assertEqual(discovery.discover("1.0.0", True, releases)["version"], "1.1.0-rc.1")
-        self.assertGreater(discovery._compare_versions("1.0.0", "1.0.0-rc.1"), 0)
-        self.assertLess(discovery._compare_versions("1.0.0-rc.1", "1.0.0"), 0)
-        self.assertGreater(discovery._compare_versions("1.0.0-alpha.1", "1.0.0-alpha"), 0)
-        self.assertLess(discovery._compare_versions("1.0.0-1", "1.0.0-alpha"), 0)
+        self.assertEqual(discovery.discover("1.0.0-rc.1", releases=[release("1.0.0")])["version"], "1.0.0")
+        self.assertIsNone(discovery.discover("1.0.0", releases=[release("1.0.0-rc.1", prerelease=True)]))
+        self.assertEqual(discovery.discover("1.0.0-alpha", True,
+                                            [release("1.0.0-alpha.1", prerelease=True)])["version"],
+                         "1.0.0-alpha.1")
+        self.assertIsNone(discovery.discover("1.0.0-alpha", True,
+                                             [release("1.0.0-1", prerelease=True)]))
 
     def test_selects_prerelease_versions_with_semver_precedence(self):
         candidates = [release("1.2.0-rc.2", prerelease=True),
