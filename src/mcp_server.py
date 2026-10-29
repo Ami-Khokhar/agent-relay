@@ -154,7 +154,7 @@ WORKFLOW_SPEC = {
 TOOLS = [
     {
         "name": "prepare_feedback",
-        "description": "Prepare a bounded local draft only after agent-relay itself blocked a concrete action and a concrete workaround was actually used so work resumed. The user reviews it and submits in their own GitHub session; this tool never contacts GitHub or submits. Do not include prompts, outputs, paths, environment values, or task IDs. Normal errors, retries, warnings, provider/configuration issues, and worker-code failures are not report triggers.",
+        "description": "Prepare only for a genuine agent-relay blocker when a workaround was actually used and work resumed. After work resumes, only the parent orchestrator may offer this once per work session. Workers quietly pass relevant facts to the parent. Declining, deferring, or silence ends the offer. The user reviews the public draft and submits it in their GitHub session; this tool cannot connect or submit. Exclude prompts, outputs, paths, environment values, and task IDs. Ordinary warnings, errors, retries, and recovery, plus provider/configuration issues and worker failures, stay quiet.",
         "inputSchema": {"type": "object", "additionalProperties": False,
                 "required": ["category", "operation", "system", "version", "blockedAction", "workaround"], "properties": {
                 "category": {"type": "string", "enum": ["crash", "incorrect_behavior", "unavailable", "other"]},

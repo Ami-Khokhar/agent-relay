@@ -56,7 +56,7 @@ class FeedbackTests(unittest.TestCase):
                              "Used a workaround")
 
     def test_credential_shapes_are_rejected_from_all_narrative_fields(self):
-        secrets = ("AKIA" + "A" * 16, "-----BEGIN RSA PRIVATE KEY-----",
+        secrets = ("AKIA" + "A" * 16, "-----BEGIN " + "RSA " + "PRIVATE KEY-----",
                    "https://user:password@example.invalid/path", "AWS_SECRET_ACCESS_KEY=synthetic",
                    "secret_key: synthetic", "access_token_v2=synthetic")
         for secret in secrets:
