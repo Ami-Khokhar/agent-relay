@@ -179,6 +179,9 @@ def start_http_server(handler):
         def do_PATCH(self):
             handler(self)
 
+        def do_CONNECT(self):
+            handler(self)
+
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     port = server.server_address[1]

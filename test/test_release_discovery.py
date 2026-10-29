@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import sys
@@ -178,7 +179,9 @@ class ReleaseDiscoveryTests(unittest.TestCase):
             self.assertIn("hello", first)
             self.assertEqual(output.getvalue(), installed_line + "\n")
             cache = Path(temp) / "agent-relay" / "release-notices.json"
-            self.assertEqual(json.loads(cache.read_text()), {"version": "0.4.0"})
+            cached = json.loads(cache.read_text())
+            self.assertEqual(cached["notifiedVersion"], "0.4.0")
+            self.assertEqual(cached["offer"]["version"], "0.4.0")
             if os.name == "posix":
                 self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(cache.parent.stat().st_mode & 0o777, 0o700)
@@ -215,7 +218,7 @@ class ReleaseDiscoveryTests(unittest.TestCase):
             offer = {"version": "0.4.0"}
             with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
                 self.assertTrue(discovery._notify_once(offer))
-                self.assertEqual(json.loads(cache.read_text()), {"version": "0.4.0"})
+                self.assertEqual(json.loads(cache.read_text())["notifiedVersion"], "0.4.0")
                 output, error = io.StringIO(), io.StringIO()
                 opener = fake_api([release("0.5.0")])
                 with patch.object(discovery, "build_opener", return_value=opener), \
@@ -251,6 +254,62 @@ class ReleaseDiscoveryTests(unittest.TestCase):
             self.assertNotIn("password", error.getvalue())
             self.assertEqual(output.getvalue(), "")
             self.assertFalse((Path(temp) / "agent-relay").exists())
+
+    def test_cached_notice_validates_fresh_canonical_offer_and_marks_only_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+                offer = {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+                         "notes": "notes are not included in the notice", "checkedAt": time.time()}
+                discovery._write_cache(offer)
+                self.assertEqual(discovery.cached_notice("0.3.0"),
+                                 {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0"})
+                cache_path = Path(temp) / "agent-relay" / "release-notices.json"
+                self.assertEqual(json.loads(cache_path.read_text())["notifiedVersion"], "0.4.0")
+                self.assertIsNone(discovery.cached_notice("0.3.0"))
+                cache = json.loads(cache_path.read_text())
+                self.assertEqual(cache["notifiedVersion"], "0.4.0")
+                self.assertEqual(cache["offer"]["notes"], "notes are not included in the notice")
+
+    def test_cached_notice_ignores_untrusted_or_expired_cache_data(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "agent-relay" / "release-notices.json"
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+                path.parent.mkdir(mode=0o700)
+                offer = {"version": "0.4.0", "url": "https://attacker.invalid/release",
+                         "notes": "x", "checkedAt": time.time()}
+                path.write_text(json.dumps({"offer": offer, "notifiedVersion": None}))
+                os.chmod(path, 0o600)
+                self.assertIsNone(discovery.cached_notice("0.3.0"))
+                offer["url"] = discovery.RELEASE_URL + "0.4.0"
+                offer["checkedAt"] = time.time() - discovery.OFFER_MAX_AGE - 1
+                path.write_text(json.dumps({"offer": offer, "notifiedVersion": None}))
+                self.assertIsNone(discovery.cached_notice("0.3.0"))
+                if os.name == "posix":
+                    os.chmod(path, 0o644)
+                    self.assertIsNone(discovery.cached_notice("0.3.0"))
+
+    def test_scheduled_refresh_preserves_notice_history_and_caches_no_offer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+                first = {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+                         "notes": "old", "checkedAt": time.time()}
+                discovery._write_cache(first)
+                self.assertEqual(discovery.cached_notice("0.3.0")["version"], "0.4.0")
+                with patch.object(discovery, "build_opener",
+                                  return_value=fake_api([release("0.5.0")])):
+                    installed, offer = discovery.cache_latest_offer()
+                self.assertEqual(installed, "0.3.0")
+                self.assertEqual(offer["version"], "0.5.0")
+                cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
+                self.assertEqual(cache["notifiedVersion"], "0.4.0")
+                self.assertEqual(discovery.cached_notice(installed)["version"], "0.5.0")
+                with patch.object(discovery, "build_opener", return_value=fake_api([])):
+                    installed, offer = discovery.cache_latest_offer()
+                self.assertEqual(installed, "0.3.0")
+                self.assertIsNone(offer)
+                cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
+                self.assertIsNone(cache["offer"])
+                self.assertEqual(cache["notifiedVersion"], "0.5.0")
 
 
 if __name__ == "__main__":
