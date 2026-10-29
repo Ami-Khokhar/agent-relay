@@ -77,14 +77,17 @@ These are adapter entry points, not a claim that each agent has been invoked end
 
 ### Feedback draft (issue #116, part of #114)
 
-The first reporting flow is local draft preparation plus a prefilled fixed GitHub issue form.
+The first reporting flow is local draft preparation plus a prefilled fixed GitHub issue page.
 `prepare_feedback` performs no HTTP request and has no submit or consent flag; the user reviews
 the public draft and submits in their own GitHub session. Inputs are bounded and limited to an
-allowlisted category, operation, OS family, version, and optional user-reviewed description.
+allowlisted category, operation, OS family, version, concrete blocked action, and workaround
+actually used. Missing either evidence field yields no draft.
 Prompts, outputs, paths, environment values, and task IDs are not accepted as fields. Known
 credential patterns are rejected as an extra guard, not treated as proof that prose is private.
-No report archive or telemetry is retained. Skill guidance prompts once per actual distinct relay
-incident and skips expected worker, configuration, and provider failures.
+No report archive or telemetry is retained. The skill stays quiet until a concrete relay blocker
+has been worked around and the task has resumed; only the user-facing orchestrator may offer a
+report at a natural checkpoint, at most once per work session. Workers hand facts to the parent.
+Normal errors, warnings, retries, and worker/configuration/provider failures alone are not triggers.
 
 1. Add SQLite task storage before depending on task IDs across relay restarts.
 2. Add native adapters only where needed for session continuation, event streams, and agent-specific cancellation. Keep capability flags truthful.

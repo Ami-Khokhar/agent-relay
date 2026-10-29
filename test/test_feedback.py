@@ -17,7 +17,8 @@ class FeedbackTests(unittest.TestCase):
         result = subprocess.run([sys.executable, os.path.join(ROOT, "src", "feedback.py"),
                                  "--category", "unavailable", "--operation", "mcp",
                                  "--system", "Linux", "--version", "0.3.0",
-                                 "--description", "Relay stopped responding"],
+                                 "--blocked-action", "MCP request could not reach relay",
+                                 "--workaround", "Completed the operation directly after switching clients"],
                                 capture_output=True, text=True, check=True)
         draft = json.loads(result.stdout)
         self.assertLessEqual(len(draft["body"]), 4096)
@@ -25,8 +26,10 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(parsed.scheme, "https")
         self.assertEqual(parsed.netloc, "github.com")
         self.assertEqual(parsed.path, "/Ami-Khokhar/agent-relay/issues/new")
+        self.assertLessEqual(len(draft["formUrl"]), 2000)
         self.assertEqual(parse_qs(parsed.query)["body"], [draft["body"]])
-        self.assertIn("Relay stopped responding", draft["body"])
+        self.assertIn("MCP request could not reach relay", draft["body"])
+        self.assertIn("switching clients", draft["body"])
 
     def test_mcp_prepares_draft_without_relay_or_submission_call(self):
         calls = []
@@ -35,27 +38,40 @@ class FeedbackTests(unittest.TestCase):
         try:
             handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
             result = handle({"method": "tools/call", "params": {"name": "prepare_feedback", "arguments": {
-                "category": "crash", "operation": "delegate", "system": "Other", "version": "0.3.0"}}})
+                "category": "crash", "operation": "delegate", "system": "Other", "version": "0.3.0",
+                "blockedAction": "Relay blocked this operation", "workaround": "Used another client"}}})
             self.assertIn("formUrl", result["structuredContent"])
             self.assertEqual(calls, [])
         finally:
             mcp_server._relay_request = original
 
-    def test_draft_omits_private_context_by_default_and_refuses_known_secret(self):
-        draft = prepare_feedback("other", "other", "Other", "0.3.0")
+    def test_draft_omits_private_context_and_refuses_known_secret(self):
+        draft = prepare_feedback("other", "other", "Other", "0.3.0", "Relay blocked operation",
+                                 "Used a workaround")
         text = draft["body"] + draft["formUrl"]
         for private in ("taskId", "prompt", "output", "cwd", "environment"):
             self.assertNotIn(private, text)
         with self.assertRaisesRegex(ValueError, "credential-like"):
-            prepare_feedback("other", "other", "Other", "0.3.0", "token=ghp_" + "A" * 30)
+            prepare_feedback("other", "other", "Other", "0.3.0", "token=ghp_" + "A" * 30,
+                             "Used a workaround")
+
+    def test_missing_blocker_or_workaround_produces_no_draft_or_form(self):
+        for blocker, workaround in (("", "Used a workaround"), ("Relay blocked operation", "")):
+            with self.assertRaises(ValueError):
+                prepare_feedback("other", "other", "Other", "0.3.0", blocker, workaround)
+        handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+        with self.assertRaisesRegex(mcp_server.RpcError, "blocked action and workaround"):
+            handle({"method": "tools/call", "params": {"name": "prepare_feedback", "arguments": {
+                "category": "crash", "operation": "delegate", "system": "Other", "version": "0.3.0",
+                "blockedAction": "Relay blocked operation"}}})
 
     def test_bounds_and_categories_are_enforced(self):
         with self.assertRaisesRegex(ValueError, "1000 characters"):
-            prepare_feedback("other", "other", "Other", "0.3.0", "x" * 1001)
+            prepare_feedback("other", "other", "Other", "0.3.0", "x" * 1001, "Used workaround")
         with self.assertRaisesRegex(ValueError, "supported"):
-            prepare_feedback("task_failed", "other", "Other", "0.3.0")
+            prepare_feedback("task_failed", "other", "Other", "0.3.0", "Blocked", "Used workaround")
         with self.assertRaisesRegex(ValueError, "URL too long"):
-            prepare_feedback("other", "other", "Other", "0.3.0", "&" * 1000)
+            prepare_feedback("other", "other", "Other", "0.3.0", "&" * 1000, "Used workaround")
 
 
 if __name__ == "__main__":

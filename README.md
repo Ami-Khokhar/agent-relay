@@ -213,15 +213,20 @@ Codex rejects a repeated `--sandbox`/`-s` (`the argument '--sandbox <SANDBOX_MOD
 
 ## Report a relay problem
 
-After an actual agent-relay problem, MCP `prepare_feedback` creates a small local draft and a
-prefilled canonical GitHub issue form. It does not contact GitHub or submit anything. A user must
-open the form, review the public contents, and click Submit in their own GitHub session.
+Feedback stays quiet unless agent-relay itself blocks a concrete action. First use a concrete
+workaround and resume work; only the user-facing orchestrator may offer a report at a natural
+checkpoint, at most once per work session. Normal errors, warnings, retries, worker-code failures,
+and provider/configuration issues alone are not triggers. Decline, defer, or silence ends the flow.
 
-Use only the bounded error category, operation, OS family, version, and optional user-reviewed
-reproduction text. The draft omits task prompts, outputs, paths, environment values, and IDs by
-default. Known credential patterns are refused, but that check cannot guarantee arbitrary prose
-is private. Ask once per distinct incident; skip ordinary worker-code failures and expected
-configuration or provider problems. A report does not authorize repairs or updates.
+If wanted, MCP `prepare_feedback` creates a small local draft and a prefilled canonical GitHub
+issue page. It requires both the blocked action and workaround actually used. Missing either yields
+no draft. The tool does not contact GitHub or submit anything. A user must open the page, review
+the public contents, and click Submit in their own GitHub session.
+
+Use only the bounded error category, operation, OS family, version, blocked action, and workaround.
+The draft omits task prompts, outputs, paths, environment values, and IDs by default. Known
+credential patterns are refused, but that check cannot guarantee arbitrary prose is private. A
+report does not authorize repairs or updates.
 
 ## Submit and inspect work
 

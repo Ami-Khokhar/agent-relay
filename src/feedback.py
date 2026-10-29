@@ -23,22 +23,27 @@ def _field(value, name, choices=None, required=True):
     return value
 
 
-def prepare_feedback(category, operation, system, version, description=""):
+def prepare_feedback(category, operation, system, version, blocked_action="", workaround=""):
     """Return a draft and canonical issue-form link; performs no I/O."""
+    if (not isinstance(blocked_action, str) or not blocked_action.strip() or
+            not isinstance(workaround, str) or not workaround.strip()):
+        raise ValueError("a concrete blocked action and workaround actually used are required")
     category = _field(category, "category", _CATEGORIES)
     operation = _field(operation, "operation", _OPERATIONS)
     system = _field(system, "system", _SYSTEMS)
     version = _field(version, "version")
-    description = _field(description, "description", required=False)
-    if any(_SECRET.search(value) for value in (version, description)):
+    blocked_action = _field(blocked_action, "blocked action", required=True)
+    workaround = _field(workaround, "workaround", required=True)
+    if any(_SECRET.search(value) for value in (version, blocked_action, workaround)):
         raise ValueError("draft contains a credential-like value; remove it before preparing a report")
-    if any(ord(char) < 32 and char not in "\n\t" for char in description):
-        raise ValueError("description contains unsupported control characters")
+    if any(ord(char) < 32 and char not in "\n\t" for value in (blocked_action, workaround)
+           for char in value):
+        raise ValueError("evidence contains unsupported control characters")
     title = "[Relay problem] " + category.replace("_", " ")
     body = ("## Error category\n" + category + "\n\n## Operation\n" + operation +
             "\n\n## Agent-relay version\n" + version + "\n\n## OS family\n" + system +
-            "\n\n## Reproduction and expected/actual behavior (review before submitting)\n" +
-            (description or "(Add a user-reviewed description, or leave blank.)") +
+            "\n\n## Blocked action\n" + blocked_action +
+            "\n\n## Workaround used\n" + workaround +
             "\n\nReview all public contents in GitHub before clicking Submit.\n")
     if len(body) > 4096:
         raise ValueError("draft is too long")
@@ -54,11 +59,13 @@ def main(argv=None):
     parser.add_argument("--operation", required=True)
     parser.add_argument("--system", required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--description", default="")
+    parser.add_argument("--blocked-action", required=True)
+    parser.add_argument("--workaround", required=True)
     args = parser.parse_args(argv)
     try:
         print(json.dumps(prepare_feedback(args.category, args.operation, args.system,
-                                          args.version, args.description), ensure_ascii=False))
+                                          args.version, args.blocked_action,
+                                          args.workaround), ensure_ascii=False))
     except ValueError as exc:
         parser.error(str(exc))
 

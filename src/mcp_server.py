@@ -154,15 +154,17 @@ WORKFLOW_SPEC = {
 TOOLS = [
     {
         "name": "prepare_feedback",
-        "description": "Prepare a bounded local draft and prefilled public GitHub issue form after an actual agent-relay problem. The user reviews it and submits in their own GitHub session; this tool never contacts GitHub or submits. Do not include prompts, outputs, paths, environment values, or task IDs. Ask once per distinct relay incident, and skip ordinary task-code failures and expected configuration/provider issues.",
+        "description": "Prepare a bounded local draft only after agent-relay itself blocked a concrete action and a concrete workaround was actually used so work resumed. The user reviews it and submits in their own GitHub session; this tool never contacts GitHub or submits. Do not include prompts, outputs, paths, environment values, or task IDs. Normal errors, retries, warnings, provider/configuration issues, and worker-code failures are not report triggers.",
         "inputSchema": {"type": "object", "additionalProperties": False,
-            "required": ["category", "operation", "system", "version"], "properties": {
+                "required": ["category", "operation", "system", "version", "blockedAction", "workaround"], "properties": {
                 "category": {"type": "string", "enum": ["crash", "incorrect_behavior", "unavailable", "other"]},
                 "operation": {"type": "string", "enum": ["start", "delegate", "wait", "cancel", "workflow", "mcp", "other"]},
                 "system": {"type": "string", "enum": ["Linux", "macOS", "Windows", "Other"]},
                 "version": {"type": "string", "minLength": 1, "maxLength": 1000},
-                "description": {"type": "string", "maxLength": 1000,
-                    "description": "Optional user-reviewed reproduction/expected/actual text. Public if submitted; avoid private data. Known credential shapes are refused, but this is not a guarantee of privacy."}}},
+                "blockedAction": {"type": "string", "minLength": 1, "maxLength": 1000,
+                    "description": "Concrete action genuinely blocked by agent-relay itself. Required evidence; never infer from a normal error."},
+                "workaround": {"type": "string", "minLength": 1, "maxLength": 1000,
+                    "description": "Concrete workaround actually used so the work resumed. Required evidence; never invent one."}}},
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     {
@@ -638,14 +640,14 @@ def create_http_handler(base_url=None, timeout=None):
         name = (rpc.get("params") or {}).get("name")
         try:
             if name == "prepare_feedback":
-                args = _arguments_for(rpc, ["category", "operation", "system", "version", "description"])
-                for key in ("category", "operation", "system", "version"):
+                args = _arguments_for(rpc, ["category", "operation", "system", "version", "blockedAction", "workaround"])
+                if not args.get("blockedAction") or not args.get("workaround"):
+                    _invalid("a concrete blocked action and workaround actually used are required")
+                for key in ("category", "operation", "system", "version", "blockedAction", "workaround"):
                     _non_empty(args, key, 1000)
-                if "description" in args and (not isinstance(args["description"], str) or len(args["description"]) > 1000):
-                    _invalid("description must be text up to 1000 characters")
                 try:
                     value = prepare_feedback(args["category"], args["operation"], args["system"],
-                                             args["version"], args.get("description", ""))
+                                             args["version"], args["blockedAction"], args["workaround"])
                 except ValueError as exc:
                     _invalid(str(exc))
             elif name == "list_agents":
