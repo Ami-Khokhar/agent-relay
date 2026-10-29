@@ -1,0 +1,62 @@
+"""Draft preparation through the CLI and MCP public interfaces."""
+import json
+import os
+import subprocess
+import sys
+import unittest
+from urllib.parse import parse_qs, urlsplit
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+from feedback import prepare_feedback
+import mcp_server
+
+
+class FeedbackTests(unittest.TestCase):
+    def test_cli_produces_bounded_prefilled_form_without_submission(self):
+        result = subprocess.run([sys.executable, os.path.join(ROOT, "src", "feedback.py"),
+                                 "--category", "unavailable", "--operation", "mcp",
+                                 "--system", "Linux", "--version", "0.3.0",
+                                 "--description", "Relay stopped responding"],
+                                capture_output=True, text=True, check=True)
+        draft = json.loads(result.stdout)
+        self.assertLessEqual(len(draft["body"]), 4096)
+        parsed = urlsplit(draft["formUrl"])
+        self.assertEqual(parsed.scheme, "https")
+        self.assertEqual(parsed.netloc, "github.com")
+        self.assertEqual(parsed.path, "/Ami-Khokhar/agent-relay/issues/new")
+        self.assertEqual(parse_qs(parsed.query)["body"], [draft["body"]])
+        self.assertIn("Relay stopped responding", draft["body"])
+
+    def test_mcp_prepares_draft_without_relay_or_submission_call(self):
+        calls = []
+        original = mcp_server._relay_request
+        mcp_server._relay_request = lambda *args, **kwargs: calls.append(args)
+        try:
+            handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+            result = handle({"method": "tools/call", "params": {"name": "prepare_feedback", "arguments": {
+                "category": "crash", "operation": "delegate", "system": "Other", "version": "0.3.0"}}})
+            self.assertIn("formUrl", result["structuredContent"])
+            self.assertEqual(calls, [])
+        finally:
+            mcp_server._relay_request = original
+
+    def test_draft_omits_private_context_by_default_and_refuses_known_secret(self):
+        draft = prepare_feedback("other", "other", "Other", "0.3.0")
+        text = draft["body"] + draft["formUrl"]
+        for private in ("taskId", "prompt", "output", "cwd", "environment"):
+            self.assertNotIn(private, text)
+        with self.assertRaisesRegex(ValueError, "credential-like"):
+            prepare_feedback("other", "other", "Other", "0.3.0", "token=ghp_" + "A" * 30)
+
+    def test_bounds_and_categories_are_enforced(self):
+        with self.assertRaisesRegex(ValueError, "1000 characters"):
+            prepare_feedback("other", "other", "Other", "0.3.0", "x" * 1001)
+        with self.assertRaisesRegex(ValueError, "supported"):
+            prepare_feedback("task_failed", "other", "Other", "0.3.0")
+        with self.assertRaisesRegex(ValueError, "URL too long"):
+            prepare_feedback("other", "other", "Other", "0.3.0", "&" * 1000)
+
+
+if __name__ == "__main__":
+    unittest.main()

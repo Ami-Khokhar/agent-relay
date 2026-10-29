@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """agent-relay MCP stdio interface.
 
-A thin JSON-RPC 2.0 proxy over the relay HTTP API. Exposes the six task tools, the six workflow
-tools, and get_pressure; tools/list is the authoritative list. Set A2A_RELAY_URL to point at a
+A thin JSON-RPC 2.0 proxy over the relay HTTP API, plus a local-only feedback draft tool.
+tools/list is the authoritative list. Set A2A_RELAY_URL to point at a
 non-default relay. When the relay is not reachable and the URL is loopback, the interface
 starts the HTTP service detached on first use.
 """
@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from feedback import prepare_feedback
 from urllib import request as urlrequest
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -151,6 +152,19 @@ WORKFLOW_SPEC = {
 
 
 TOOLS = [
+    {
+        "name": "prepare_feedback",
+        "description": "Prepare a bounded local draft and prefilled public GitHub issue form after an actual agent-relay problem. The user reviews it and submits in their own GitHub session; this tool never contacts GitHub or submits. Do not include prompts, outputs, paths, environment values, or task IDs. Ask once per distinct relay incident, and skip ordinary task-code failures and expected configuration/provider issues.",
+        "inputSchema": {"type": "object", "additionalProperties": False,
+            "required": ["category", "operation", "system", "version"], "properties": {
+                "category": {"type": "string", "enum": ["crash", "incorrect_behavior", "unavailable", "other"]},
+                "operation": {"type": "string", "enum": ["start", "delegate", "wait", "cancel", "workflow", "mcp", "other"]},
+                "system": {"type": "string", "enum": ["Linux", "macOS", "Windows", "Other"]},
+                "version": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "description": {"type": "string", "maxLength": 1000,
+                    "description": "Optional user-reviewed reproduction/expected/actual text. Public if submitted; avoid private data. Known credential shapes are refused, but this is not a guarantee of privacy."}}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
     {
         "name": "list_agents",
         "description": "List the agents registered with the relay, with their adapter, capabilities, timeout, the per-task options each one allows (option names and allowed values), and whether it supports readOnly tasks. Call this first to get valid agentId values. The result also has `revision`: the commit (`commit`, `short`) and commit date (`date`) the relay runs, each \"unknown\" when the relay cannot read its checkout. A `date` weeks old means the install is stale; `revision` is absent on a relay that predates this field.",
@@ -623,7 +637,18 @@ def create_http_handler(base_url=None, timeout=None):
             raise RpcError(-32601, "Method not found")
         name = (rpc.get("params") or {}).get("name")
         try:
-            if name == "list_agents":
+            if name == "prepare_feedback":
+                args = _arguments_for(rpc, ["category", "operation", "system", "version", "description"])
+                for key in ("category", "operation", "system", "version"):
+                    _non_empty(args, key, 1000)
+                if "description" in args and (not isinstance(args["description"], str) or len(args["description"]) > 1000):
+                    _invalid("description must be text up to 1000 characters")
+                try:
+                    value = prepare_feedback(args["category"], args["operation"], args["system"],
+                                             args["version"], args.get("description", ""))
+                except ValueError as exc:
+                    _invalid(str(exc))
+            elif name == "list_agents":
                 _arguments_for(rpc, [])
                 value = _relay_request(base_url, "/v1/agents", timeout=timeout)
             elif name == "delegate":

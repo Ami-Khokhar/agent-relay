@@ -75,6 +75,17 @@ These are adapter entry points, not a claim that each agent has been invoked end
 
 ## Next increments
 
+### Feedback draft (issue #116, part of #114)
+
+The first reporting flow is local draft preparation plus a prefilled fixed GitHub issue form.
+`prepare_feedback` performs no HTTP request and has no submit or consent flag; the user reviews
+the public draft and submits in their own GitHub session. Inputs are bounded and limited to an
+allowlisted category, operation, OS family, version, and optional user-reviewed description.
+Prompts, outputs, paths, environment values, and task IDs are not accepted as fields. Known
+credential patterns are rejected as an extra guard, not treated as proof that prose is private.
+No report archive or telemetry is retained. Skill guidance prompts once per actual distinct relay
+incident and skips expected worker, configuration, and provider failures.
+
 1. Add SQLite task storage before depending on task IDs across relay restarts.
 2. Add native adapters only where needed for session continuation, event streams, and agent-specific cancellation. Keep capability flags truthful.
 3. Add TLS (or document a supported HTTPS proxy setup) for non-loopback use. A bearer token now protects the API, and binding outside loopback requires `AGENT_RELAY_UNSAFE_ALLOW_NON_LOOPBACK=1`.

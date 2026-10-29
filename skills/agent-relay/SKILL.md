@@ -40,9 +40,8 @@ Use it when the user wants to:
 - delegate implementation work to pi, Codex, OpenCode, or Claude Code instead of
   shelling out to that CLI yourself;
 - wrap a harness that has no convenient CLI behind a small adapter;
-- give an MCP client the six task tools (`list_agents`, `delegate`, `wait_task`, `get_task`,
-  `list_tasks`, `cancel_task`), the six workflow tools, and `get_pressure`; `tools/list` is
-  authoritative.
+- give an MCP client the task tools, workflow tools, `get_pressure`, and `prepare_feedback`;
+  `tools/list` is authoritative.
 
 Prefer this skill over calling an agent CLI directly, even when the CLI is on
 `PATH` and can run the task: the relay adds task IDs, status, timeouts,
@@ -204,6 +203,21 @@ the relay does not run from a git checkout. If the list is empty, the registry d
 and exits on a bad registry, so check the server log.
 
 ## 5. Delegate work
+
+### Reporting an agent-relay problem
+
+Offer a report only after an actual problem in agent-relay itself, such as a relay crash or
+incorrect relay behavior. Skip ordinary worker-code failures, expected configuration mistakes,
+and provider outages. Ask once for a distinct incident/session; if the user declines or defers,
+do not ask again about that incident. Preparing a draft does not approve a repair, retry, update,
+or other change.
+
+If the user wants to report it, call MCP `prepare_feedback` with only the bounded category,
+operation, OS family, version, and optional user-reviewed reproduction/expected/actual text.
+Show the returned title, body, and URL for review. The issue is public if submitted; known
+credential patterns are rejected, but redaction is not a privacy guarantee. The user may decline
+or defer. Submission happens only when the user opens the fixed GitHub form, reviews its contents,
+and clicks Submit in their own GitHub session. The tool makes no network request and cannot submit.
 
 **Via HTTP** (submit returns `202` immediately; then long-poll):
 
