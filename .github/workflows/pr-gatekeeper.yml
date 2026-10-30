@@ -81,7 +81,7 @@ jobs:
     with:
       pr: ${{ github.event.pull_request.number || inputs.pr }}
       base_sha: ${{ needs.resolve.outputs.base_sha || github.event.pull_request.base.sha || '' }}
-      gatekeeper_ref: e9f2380fbb040a962ab3d888df578d0625415a70
+      gatekeeper_ref: 2a53e2c369baf88e63f993e27ada45bae0faeedb
     secrets:
       OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
       GATEKEEPER_READ_TOKEN: ${{ secrets.GATEKEEPER_READ_TOKEN }}
