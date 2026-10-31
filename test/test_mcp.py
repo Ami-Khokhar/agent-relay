@@ -313,6 +313,13 @@ class McpHandlerTests(unittest.TestCase):
         self.assertEqual(step["retries"]["maximum"], workflows.MAX_RETRIES)
         self.assertEqual(step["repeat"]["properties"]["max"]["maximum"], workflows.MAX_REPEAT_ROUNDS)
 
+    def test_the_fail_pattern_description_says_each_foreach_item_is_matched_on_its_own(self):
+        tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "run_workflow")
+        step = tool["inputSchema"]["properties"]["spec"]["properties"]["steps"]["items"]
+        description = step["properties"]["failIfOutputMatches"]["description"]
+        self.assertIn("each completed task's own output", description)
+        self.assertIn("never the JSON array", description)
+
     def test_wait_task_returns_the_relay_error_when_it_cannot_clamp_the_wait(self):
         rejected = {"error": "invalid_wait", "message": "invalid_wait"}
 

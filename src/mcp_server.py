@@ -111,8 +111,11 @@ WORKFLOW_SPEC = {
                                 "description": "Extra attempts after the task fails or times out."},
                     "failIfOutputMatches": {"type": "string", "minLength": 1,
                                             "description": "Python regular expression tested "
-                                                           "against the step's output; a match "
-                                                           "fails the step with "
+                                                           "against each completed task's own "
+                                                           "output — on a foreach step every "
+                                                           "item is matched separately, never "
+                                                           "the JSON array; a match fails the "
+                                                           "step with "
                                                            "output_matched_fail_pattern and "
                                                            "skips its dependents."},
                     "repeat": {

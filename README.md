@@ -283,7 +283,7 @@ Step fields:
 | `foreach` | Fans the step out over an array of strings. The step completes when every item does, and `{{stepId.output}}` then reads as a JSON array of the item outputs. |
 | `retries` | Extra attempts after the task fails or times out, `0` to `5`. |
 | `repeat` | `{"max": 1..10, "untilOutputMatches": "regex"}` re-runs the step until its output matches. Spending `max` without matching fails the step with `repeat_limit_reached`. |
-| `failIfOutputMatches` | A Python regular expression. When a completed task's output matches it, the step fails with `output_matched_fail_pattern` and its dependents are skipped — an agent that reports `BLOCKED: ...` while exiting 0 cannot feed a later step. A malformed pattern is refused at submit time. |
+| `failIfOutputMatches` | A Python regular expression. When a completed task's output matches it, the step fails with `output_matched_fail_pattern` and its dependents are skipped — an agent that reports `BLOCKED: ...` while exiting 0 cannot feed a later step. Each task's own output is tested: on a `foreach` step every item is matched separately, never the JSON array the step aggregates, so `^BLOCKED` fails the step for one blocked item and `^\[` cannot fail a fan-out on the serialization alone. A malformed pattern is refused at submit time. |
 | `timeoutMs` / `cwd` | Per step, checked exactly like a task submission, including `allowedRoots`. |
 | `options` | `{"<name>": "<value>"}` for that agent, exactly as for a task submission. An option the agent does not declare fails the step with `unknown_option` or `invalid_option_value`. |
 | `readOnly` | `true` runs that step read-only, exactly as for a task submission. An agent with no read-only profile fails the step with `read_only_unsupported`. |

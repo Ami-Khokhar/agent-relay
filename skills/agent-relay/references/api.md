@@ -151,7 +151,7 @@ Step fields:
 | `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
 | `retries` | no | `0` to `5`; extra attempts after a task fails or times out. |
 | `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
-| `failIfOutputMatches` | no | Python regular expression. A match on the output of a completed task fails the step with `output_matched_fail_pattern` and skips its dependents. |
+| `failIfOutputMatches` | no | Python regular expression. A match on the output of a completed task fails the step with `output_matched_fail_pattern` and skips its dependents. The pattern is tested against each task's own output, so on a `foreach` step every item is matched separately and never the JSON array the step aggregates: one item reading `^BLOCKED` fails the whole step, while `^\[` does not fire on the serialization alone. |
 | `timeoutMs` | no | Positive integer, same cap as a task. |
 | `cwd` | no | Same `allowedRoots` check as a task. |
 | `options` | no | `{"<name>": "<value>"}`, exactly as for a task submission. The agent decides which names and values it allows. |

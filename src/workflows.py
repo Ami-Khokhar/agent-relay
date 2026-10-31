@@ -14,8 +14,9 @@ steps that follow::
 Input strings are templates. ``{{stepId.output}}`` resolves against a completed
 dependency, ``{{item}}`` and ``{{index}}`` against a ``foreach`` expansion. Steps may fan
 out with ``foreach``, re-run on a task failure with ``retries``, loop until their
-output matches a regular expression with ``repeat``, and fail when their own output
-matches a regular expression with ``failIfOutputMatches``.
+output matches a regular expression with ``repeat``, and fail when a task's own output
+matches a regular expression with ``failIfOutputMatches`` — each item of a ``foreach``
+step is matched on its own raw output, so one blocked item fails the whole step.
 
 Every run is journaled to ``<state dir>/workflows/<id>.jsonl``. Completed steps therefore
 survive a relay restart with their output and their ``startedAt`` / ``finishedAt`` window,
@@ -857,10 +858,13 @@ class WorkflowEngine:
         step["error"] = None
 
         # The CLI exited 0 but the agent's own report says it failed; a dependent would
-        # otherwise run on a blocked result. A journal written before this field existed
-        # resumes with the check absent, not with a KeyError.
+        # otherwise run on a blocked result. Every task's raw output is matched on its own,
+        # so a foreach step fails for one blocked item while a pattern only the JSON array
+        # could satisfy (``^\[``) never fires on the serialization alone. A journal written
+        # before this field existed resumes with the check absent, not with a KeyError.
         fail_pattern = spec.get("failIfOutputMatches")
-        if fail_pattern is not None and re.search(fail_pattern, step["output"]):
+        if fail_pattern is not None and any(re.search(fail_pattern, output)
+                                            for output in outputs):
             step["status"] = "failed"
             step["error"] = "output_matched_fail_pattern"
             self._settle(step)
