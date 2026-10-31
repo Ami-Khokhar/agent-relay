@@ -45,8 +45,8 @@ STEP_TERMINAL = frozenset(("completed", "failed", "skipped", "cancelled"))
 TASK_TERMINAL = frozenset(("completed", "failed", "timed_out", "cancelled"))
 
 WORKFLOW_FIELDS = frozenset(("name", "sessionId", "requestId", "steps"))
-STEP_FIELDS = frozenset(("id", "agentId", "input", "needs", "foreach", "timeoutMs", "cwd",
-                         "options", "readOnly", "retries", "repeat", "failIfOutputMatches"))
+STEP_FIELDS = frozenset(("id", "agentId", "input", "needs", "needsPolicy", "foreach", "timeoutMs",
+                         "cwd", "options", "readOnly", "retries", "repeat", "failIfOutputMatches"))
 REPEAT_FIELDS = frozenset(("max", "untilOutputMatches"))
 
 MAX_REPEAT_ROUNDS = 10
@@ -214,6 +214,13 @@ def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_in
             return bad("invalid_needs", f"Step {step_id}.needs repeats a step id")
         if step_id in needs:
             return bad("cyclic_dependency", f"Step {step_id} cannot depend on itself")
+        needs_policy = raw.get("needsPolicy")
+        if needs_policy is not None and needs_policy not in ("any", "all"):
+            return bad("invalid_needs_policy",
+                       f"Step {step_id}.needsPolicy must be \"any\" or \"all\"")
+        if needs_policy == "any" and not needs:
+            return bad("invalid_needs_policy",
+                       f"Step {step_id} cannot set needsPolicy \"any\" without needs")
 
         foreach = raw.get("foreach")
         if foreach is not None:
@@ -311,6 +318,7 @@ def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_in
             "agentId": agent_id,
             "input": text,
             "needs": list(needs),
+            "needsPolicy": needs_policy,
             "foreach": list(foreach) if foreach is not None else None,
             "timeoutMs": timeout,
             "cwd": cwd,
@@ -727,12 +735,26 @@ class WorkflowEngine:
     def _release(self, workflow, step, by_id):
         """Move a step from pending to ready, or skip it when a dependency failed."""
         dependencies = [by_id[dep] for dep in step["_spec"]["needs"]]
-        if any(dep["status"] in ("failed", "skipped", "cancelled") for dep in dependencies):
+        required = "any" if step["_spec"].get("needsPolicy") == "any" else "all"
+        if required == "any":
+            # A fan-in that tolerates a failed branch: wait until every dependency is
+            # terminal, then run when at least one completed and skip only when none did.
+            if not all(dep["status"] in STEP_TERMINAL for dep in dependencies):
+                return False
+            if any(dep["status"] == "completed" for dep in dependencies):
+                step["status"] = "ready"
+                return True
+        else:
+            if any(dep["status"] in ("failed", "skipped", "cancelled") for dep in dependencies):
+                step["status"] = "skipped"
+                step["error"] = "dependency_not_completed"
+                return True
+            if all(dep["status"] == "completed" for dep in dependencies):
+                step["status"] = "ready"
+                return True
+        if all(dep["status"] in STEP_TERMINAL for dep in dependencies):
             step["status"] = "skipped"
             step["error"] = "dependency_not_completed"
-            return True
-        if all(dep["status"] == "completed" for dep in dependencies):
-            step["status"] = "ready"
             return True
         return False
 
@@ -740,8 +762,17 @@ class WorkflowEngine:
         outputs = {other["id"]: other["output"] for other in workflow["steps"]
                    if other["status"] == "completed"}
         context = {}
+        tolerate = step["_spec"].get("needsPolicy") == "any"
         for dep in workflow["_ancestors"][step["id"]]:
             value = outputs.get(dep) or ""
+            if tolerate and not value:
+                # A dependency that did not complete still has one thing worth telling the
+                # agent: what became of it, so the prompt names the failure, not silence.
+                other = workflow["steps"][next(i for i, s in enumerate(workflow["steps"])
+                                               if s["id"] == dep)]
+                if other["status"] in ("failed", "timed_out", "skipped", "cancelled"):
+                    error = (other.get("error") or other["status"])[:200]
+                    value = f"[{dep} did not complete: status={other['status']} error={error}]"
             context[dep] = value
             context[f"{dep}.output"] = value
         if step["_spec"]["foreach"] is not None:
@@ -1032,6 +1063,7 @@ class WorkflowEngine:
             "agentId": step["agentId"],
             "needs": step["needs"],
             "status": "pending" if step["status"] == "ready" else step["status"],
+            "needsPolicy": step["_spec"].get("needsPolicy"),
             "attempts": step["attempts"],
             "startedAt": step["startedAt"],
             "finishedAt": step["finishedAt"],
