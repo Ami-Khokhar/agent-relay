@@ -746,16 +746,33 @@ def create_http_handler(base_url=None, timeout=None):
                             base_url, f"/v1/tasks/{quote(created_id, safe='')}?waitMs={wait_ms}",
                             timeout=max(timeout, wait_ms / 1000.0 + 5))
                     except RelayError as exc:
-                        # The submission created the task, so it runs on with an ID the caller must
-                        # keep: an ID-less error would hide it and invite a duplicate submit. Return
-                        # the created task with the wait failure and recovery named instead; nothing
-                        # is retried after a successful POST.
-                        clamped = False
-                        value.update(waitFailed=True, waitError={
-                            "error": (exc.data or {}).get("error") or "wait_failed",
-                            "message": (f"the task was created as {created_id} and its wait failed: "
-                                        f"{exc.message}. Do not submit it again; call wait_task with "
-                                        "this taskId (or get_task) to check on it.")})
+                        # A replay above the relay's limit returns 200 without re-checking the
+                        # wait, so the refusal lands here: clamp to the limit like wait_task and
+                        # wait once more at it, rather than reporting waitFailed for a wait the
+                        # relay can honour.
+                        limit = _relay_wait_limit(base_url, exc, wait_ms)
+                        if limit is not None:
+                            try:
+                                value = _relay_request(
+                                    base_url,
+                                    f"/v1/tasks/{quote(created_id, safe='')}?waitMs={limit}",
+                                    timeout=max(timeout, limit / 1000.0 + 5))
+                                wait_ms, clamped = limit, True
+                            except RelayError as again:
+                                exc = again  # even the clamped wait failed: report that one
+                                limit = None
+                        if limit is None:
+                            # The submission created the task, so it runs on with an ID the caller
+                            # must keep: an ID-less error would hide it and invite a duplicate
+                            # submit. Return the created task with the wait failure and recovery
+                            # named instead; nothing is retried after a successful POST.
+                            clamped = False
+                            value.update(waitFailed=True, waitError={
+                                "error": (exc.data or {}).get("error") or "wait_failed",
+                                "message": (f"the task was created as {created_id} and its wait "
+                                            f"failed: {exc.message}. Do not submit it again; call "
+                                            "wait_task with this taskId (or get_task) to check "
+                                            "on it.")})
                 if clamped:
                     value.update(waitMs=wait_ms, waitClamped=True)
             elif name == "wait_task":
