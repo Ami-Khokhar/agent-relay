@@ -338,18 +338,39 @@ def ensure_device_id(state_dir):
     return device
 
 
+def _fsync_dir(path):
+    """Best-effort directory fsync so the rename survives a crash; some file
+    systems do not support fsyncing a directory, which is not an error here."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _atomic_write(path, payload):
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, payload)
-        os.fsync(fd)
+        try:
+            os.fchmod(fd, 0o600)
+            while payload:
+                payload = payload[os.write(fd, payload):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.replace(str(tmp), str(path))
+        except OSError as exc:
+            raise UpdateError("cannot save the consent record; check state directory "
+                              "permissions and free space") from exc
+        _fsync_dir(path.parent)
     finally:
-        os.close(fd)
-    try:
-        os.replace(str(tmp), str(path))
-    except OSError:
         tmp.unlink(missing_ok=True)
 
 

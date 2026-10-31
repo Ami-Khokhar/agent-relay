@@ -17,40 +17,83 @@ import sys
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import build_opener
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, build_opener
 
 import release_identity
 from release_identity import UpdateError
 
 STATE_LABEL = "release update consent"
+JSON_ACCEPT = "application/vnd.github+json"
+# The manifest asset is file content: GitHub answers the JSON Accept header with
+# asset metadata, so it must be requested with the octet-stream Accept header.
+ASSET_ACCEPT = "application/octet-stream"
+# GitHub serves release assets by 302ing to one of these signed download hosts;
+# any other redirect target is an uncanonical identity and refused.
+ASSET_REDIRECT_HOSTS = frozenset(("github.com", "objects.githubusercontent.com",
+                                  "release-assets.githubusercontent.com"))
+
+
+class _Redirected(Exception):
+    """Carries an un-followed redirect target out of the opener for inspection."""
+
+    def __init__(self, location):
+        super().__init__(location)
+        self.location = location
+
+
+class _CaptureRedirect(HTTPRedirectHandler):
+    """Raise with the redirect target instead of following it automatically."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib's 30x handlers already make newurl absolute for this request.
+        raise _Redirected(newurl)
 
 
 def _fetch(url):
-    """One bounded, redirect-free HTTPS request against the canonical API host."""
+    """One bounded HTTPS request against the canonical GitHub API host.
+
+    Release and tag metadata must stay on the canonical API host with no
+    redirect at all. The manifest asset is requested with the octet-stream
+    Accept header, and GitHub answers it with one redirect to a signed download
+    host: exactly one redirect there is followed, and only to a canonical
+    GitHub download host; every other redirect is refused.
+    """
     if not url.startswith(release_identity.API_BASE + "/"):
         raise UpdateError("refusing a non-canonical release identity request")
-    request = release_identity.Request(
-        url, headers={"Accept": "application/vnd.github+json",
-                      "User-Agent": "agent-relay-release-update"})
-    opener = build_opener(release_identity._NoRedirect())
-    try:
-        with opener.open(request, timeout=5) as response:
-            if response.geturl() != url:
-                raise UpdateError("release service returned a non-canonical URL")
-            data = response.read(release_identity.release_discovery.MAX_RESPONSE + 1)
-    except UpdateError:
-        raise
-    except HTTPError as exc:
-        if exc.code == 404:
-            raise UpdateError("no published stable release matches this tag; check the tag name") from exc
-        if exc.code in (301, 302, 303, 307, 308):
-            raise UpdateError("release service redirected; refusing non-canonical identity") from exc
-        raise UpdateError("release service unavailable (HTTP %d); try again later" % exc.code) from exc
-    except (http.client.HTTPException, TimeoutError) as exc:
-        raise UpdateError("release service timed out or hung up; try again later") from exc
-    except (URLError, OSError) as exc:
-        raise UpdateError("release service unavailable; check connectivity and try again") from exc
-    return data
+    asset = url.startswith(release_identity.ASSET_URL)
+    accept = ASSET_ACCEPT if asset else JSON_ACCEPT
+    current, redirects_left = url, 1 if asset else 0
+    while True:
+        request = release_identity.Request(
+            current, headers={"Accept": accept,
+                              "User-Agent": "agent-relay-release-update"})
+        handler = _CaptureRedirect() if redirects_left else release_identity._NoRedirect()
+        try:
+            with build_opener(handler).open(request, timeout=5) as response:
+                if response.geturl() != current:
+                    raise UpdateError("release service returned a non-canonical URL")
+                data = response.read(release_identity.release_discovery.MAX_RESPONSE + 1)
+        except _Redirected as redirected:
+            if not redirects_left:
+                raise UpdateError("release service redirected; refusing non-canonical identity") from None
+            redirects_left -= 1
+            target = urlsplit(redirected.location)
+            if target.scheme != "https" or (target.hostname or "") not in ASSET_REDIRECT_HOSTS:
+                raise UpdateError("release asset redirected to a non-canonical host; "
+                                  "refusing uncanonical identity") from None
+            current = redirected.location
+            continue
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise UpdateError("no published stable release matches this tag; check the tag name") from exc
+            if exc.code in (301, 302, 303, 307, 308):
+                raise UpdateError("release service redirected; refusing non-canonical identity") from exc
+            raise UpdateError("release service unavailable (HTTP %d); try again later" % exc.code) from exc
+        except (http.client.HTTPException, TimeoutError) as exc:
+            raise UpdateError("release service timed out or hung up; try again later") from exc
+        except (URLError, OSError) as exc:
+            raise UpdateError("release service unavailable; check connectivity and try again") from exc
+        return data
 
 
 def _resolve(tag):
