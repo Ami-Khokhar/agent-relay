@@ -9,15 +9,15 @@
 #                                   scheduled metadata-only release check every
 #                                   6 hours; it never installs or restarts
 #   scripts/install-service.sh --no-update-timer
-#                                   install the service only and remove an
-#                                   update timer left by an earlier install;
-#                                   update the checkout yourself with
+#                                   install the service only and remove a
+#                                   release-check timer left by an earlier
+#                                   install; update the checkout yourself with
 #                                   scripts/update.sh
 #   scripts/install-service.sh --with-update-timer
 #                                   accepted for old callers; the timer is now
 #                                   the default
 #   scripts/install-service.sh --uninstall   (removes the service and the
-#                                   update timer if one is installed)
+#                                   release-check timer if one is installed)
 #
 # Env:
 #   AGENT_RELAY_DIR      source checkout (default ~/.local/share/agent-relay)
@@ -25,7 +25,7 @@
 #   A2A_AGENTS_FILE      registry path (default: the checkout's config/agents.json)
 #   A2A_RELAY_PORT       listen port (default 43124)
 #   AGENT_RELAY_PATH     extra PATH entries for the service (colon separated)
-#   AGENT_RELAY_UPDATE_INTERVAL_SECS  timer period (default 21600 = 6 h)
+#   AGENT_RELAY_UPDATE_INTERVAL_SECS  release-check timer period (default 21600 = 6 h)
 set -euo pipefail
 
 TARGET_DIR="${AGENT_RELAY_DIR:-$HOME/.local/share/agent-relay}"
@@ -165,7 +165,7 @@ echo "verify: curl -sS http://127.0.0.1:$PORT/healthz"
 # run from a source checkout or packaged install and never changes installed files.
 if [ "$WITH_UPDATE_TIMER" = "0" ]; then
   # --no-update-timer also removes a timer that an earlier install left behind. Only the
-  # update timer goes: the relay service installed above stays as it is.
+  # release-check timer goes: the relay service installed above stays as it is.
   REMOVED_TIMER=0
   if [ "$(uname -s)" = "Darwin" ]; then
     UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
@@ -188,9 +188,9 @@ if [ "$WITH_UPDATE_TIMER" = "0" ]; then
     fi
   fi
   if [ "$REMOVED_TIMER" = "1" ]; then
-    echo "removed the existing update timer (--no-update-timer): this checkout changes only when you run scripts/update.sh"
+    echo "removed the existing release-check timer (--no-update-timer): this checkout changes only when you run scripts/update.sh"
   else
-    echo "no update timer installed (--no-update-timer): this checkout changes only when you run scripts/update.sh"
+    echo "no release-check timer installed (--no-update-timer): this checkout changes only when you run scripts/update.sh"
   fi
 fi
 if [ "$WITH_UPDATE_TIMER" = "1" ]; then
@@ -212,8 +212,6 @@ if [ "$WITH_UPDATE_TIMER" = "1" ]; then
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>$SERVICE_PATH</string>
-    <key>A2A_RELAY_PORT</key><string>$PORT</string>
-    <key>AGENT_RELAY_DIR</key><string>$TARGET_DIR</string>
   </dict>
   <key>StartInterval</key><integer>$UPDATE_INTERVAL</integer>
   <key>RunAtLoad</key><false/>
@@ -224,26 +222,24 @@ if [ "$WITH_UPDATE_TIMER" = "1" ]; then
 PLIST_EOF
     launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
     launchctl load "$UPDATE_PLIST"
-    echo "update timer installed: $UPDATE_PLIST (every ${UPDATE_INTERVAL}s)"
-    echo "update log: $HOME/Library/Logs/agent-relay/update.log"
+    echo "release-check timer installed: $UPDATE_PLIST (every ${UPDATE_INTERVAL}s)"
+    echo "release-check log: $HOME/Library/Logs/agent-relay/update.log"
   else
     UPDATE_SERVICE="$HOME/.config/systemd/user/agent-relay-update.service"
     UPDATE_TIMER="$HOME/.config/systemd/user/agent-relay-update.timer"
     mkdir -p "$(dirname "$UPDATE_SERVICE")"
     cat > "$UPDATE_SERVICE" <<UNIT_EOF
 [Unit]
-Description=agent-relay scheduled update
+Description=agent-relay metadata-only release check
 
 [Service]
 Type=oneshot
 Environment=PATH=$SERVICE_PATH
-Environment=A2A_RELAY_PORT=$PORT
-Environment=AGENT_RELAY_DIR=$TARGET_DIR
 ExecStart=$PYTHON $TARGET_DIR/src/release_discovery.py --cache-offer
 UNIT_EOF
     cat > "$UPDATE_TIMER" <<UNIT_EOF
 [Unit]
-Description=Run agent-relay update periodically
+Description=Run the agent-relay release check periodically
 
 [Timer]
 OnBootSec=10min
@@ -254,6 +250,6 @@ WantedBy=timers.target
 UNIT_EOF
     systemctl --user daemon-reload
     systemctl --user enable --now agent-relay-update.timer
-    echo "update timer installed: $UPDATE_TIMER (every ${UPDATE_INTERVAL}s)"
+    echo "release-check timer installed: $UPDATE_TIMER (every ${UPDATE_INTERVAL}s)"
   fi
 fi

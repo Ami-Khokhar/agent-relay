@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -379,6 +380,28 @@ exit 0
                 "AGENT_RELAY_PYTHON": PYTHON}
 
     @staticmethod
+    def _read_update_plist(tmp):
+        """Parse the generated checker plist after verifying launchd accepts its syntax."""
+        with open(os.path.join(tmp, "Library", "LaunchAgents",
+                               "com.agent-relay.update.plist"), "rb") as handle:
+            return plistlib.load(handle)
+
+    @staticmethod
+    def _systemd_section(body, section):
+        """Return the directive names of a generated systemd unit section."""
+        directives = {}
+        current = None
+        for line in body.splitlines():
+            if line.startswith("[") and line.endswith("]"):
+                current = line[1:-1]
+                directives.setdefault(current, [])
+            elif current and "=" in line:
+                name, _, value = line.partition("=")
+                directives[current].append((name, value))
+        return {name: values for name, values in directives.items()
+                if name == section or section is None}
+
+    @staticmethod
     def _take_log(tmp):
         """Return the service-manager calls since the last call, then clear the log."""
         log = os.path.join(tmp, "service-manager.log")
@@ -408,14 +431,21 @@ exit 0
                 tmp, "Library", "LaunchAgents", "com.agent-relay.update.plist")
             self.assertTrue(os.path.exists(service_plist))
             self.assertTrue(os.path.exists(update_plist))
-            with open(update_plist, encoding="utf-8") as handle:
-                body = handle.read()
-            self.assertIn("<key>StartInterval</key><integer>21600</integer>", body)
-            self.assertIn(f"<string>{checkout}/src/release_discovery.py</string>", body)
-            self.assertIn("<string>--cache-offer</string>", body)
-            self.assertNotIn("scripts/update.sh", body)
-            self.assertIn("<key>A2A_RELAY_PORT</key>", body)
-            self.assertIn("<key>AGENT_RELAY_DIR</key>", body)
+            timer = self._read_update_plist(tmp)
+            self.assertEqual(timer["StartInterval"], 21600)
+            self.assertEqual(timer["ProgramArguments"],
+                             [PYTHON, f"{checkout}/src/release_discovery.py",
+                              "--cache-offer"])
+            self.assertNotIn("scripts/update.sh", " ".join(timer["ProgramArguments"]))
+            self.assertEqual(timer["Label"], "com.agent-relay.update")
+            self.assertEqual(timer["EnvironmentVariables"],
+                             {"PATH": mock.ANY})
+            self.assertNotIn("A2A_RELAY_PORT", timer["EnvironmentVariables"])
+            self.assertNotIn("AGENT_RELAY_DIR", timer["EnvironmentVariables"])
+            with open(service_plist, "rb") as handle:
+                relay = plistlib.load(handle)
+            self.assertEqual(relay["EnvironmentVariables"]["A2A_RELAY_PORT"], "43124")
+            self.assertEqual(relay["WorkingDirectory"], checkout)
 
             result = subprocess.run(
                 ["bash", install_service, "--uninstall"], env=env,
@@ -435,11 +465,7 @@ exit 0
                 ["bash", install_service, "--with-update-timer"], env=env,
                 cwd=ROOT, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
-            with open(os.path.join(
-                    tmp, "Library", "LaunchAgents",
-                    "com.agent-relay.update.plist"), encoding="utf-8") as handle:
-                self.assertIn("<key>StartInterval</key><integer>60</integer>",
-                              handle.read())
+            self.assertEqual(self._read_update_plist(tmp)["StartInterval"], 60)
 
     def _install(self, env, *args):
         return subprocess.run(["bash", INSTALL_SERVICE, *args], env=env, cwd=ROOT,
@@ -457,7 +483,7 @@ exit 0
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(os.path.exists(os.path.join(agents, "com.agent-relay.plist")))
             self.assertTrue(os.path.exists(os.path.join(agents, "com.agent-relay.update.plist")))
-            self.assertIn("update timer installed", result.stdout)
+            self.assertIn("release-check timer installed", result.stdout)
 
             result = self._install(env, "--uninstall")
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -475,7 +501,7 @@ exit 0
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("unknown argument", result.stderr)
             self.assertEqual(os.listdir(agents), ["com.agent-relay.plist"])
-            self.assertIn("no update timer installed", result.stdout)
+            self.assertIn("no release-check timer installed", result.stdout)
             self.assertNotIn("removed", result.stdout)
             # Both label-based and plist-based unload attempts fail when neither exists.
             calls = self._take_log(tmp)
@@ -502,8 +528,8 @@ exit 0
             self.assertTrue(os.path.exists(service_plist))
             self.assertEqual(os.listdir(agents), ["com.agent-relay.plist"])
             self.assertIn(f"launchctl unload {update_plist}", self._take_log(tmp))
-            self.assertIn("removed the existing update timer", result.stdout)
-            self.assertNotIn("no update timer installed", result.stdout)
+            self.assertIn("removed the existing release-check timer", result.stdout)
+            self.assertNotIn("no release-check timer installed", result.stdout)
 
     def test_no_update_timer_unloads_a_loaded_job_when_its_plist_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -521,8 +547,8 @@ exit 0
             calls = self._take_log(tmp)
             self.assertIn("launchctl bootout gui/", "\n".join(calls))
             self.assertIn("/com.agent-relay.update", "\n".join(calls))
-            self.assertIn("removed the existing update timer", result.stdout)
-            self.assertNotIn("no update timer installed", result.stdout)
+            self.assertIn("removed the existing release-check timer", result.stdout)
+            self.assertNotIn("no release-check timer installed", result.stdout)
 
     def test_uninstall_unloads_a_loaded_job_when_its_plist_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -556,8 +582,8 @@ exit 0
             self.assertEqual(os.listdir(units), ["agent-relay.service"])
             self.assertIn("systemctl --user disable --now agent-relay-update.timer",
                           self._take_log(tmp))
-            self.assertIn("removed the existing update timer", result.stdout)
-            self.assertNotIn("no update timer installed", result.stdout)
+            self.assertIn("removed the existing release-check timer", result.stdout)
+            self.assertNotIn("no release-check timer installed", result.stdout)
 
     def test_no_update_timer_on_linux_without_an_earlier_timer_says_so(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -570,7 +596,7 @@ exit 0
             result = self._install(env, "--no-update-timer")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(os.listdir(units), ["agent-relay.service"])
-            self.assertIn("no update timer installed", result.stdout)
+            self.assertIn("no release-check timer installed", result.stdout)
             self.assertNotIn("removed", result.stdout)
             self.assertFalse([line for line in self._take_log(tmp)
                               if "update.timer" in line])
@@ -629,7 +655,7 @@ exit 0
 
                     result = self._install(env, "--no-update-timer")
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn("no update timer installed", result.stdout)
+                    self.assertIn("no release-check timer installed", result.stdout)
                     if system == "Darwin":
                         agents = os.path.join(tmp, "Library", "LaunchAgents")
                         self.assertEqual(os.listdir(agents),
@@ -658,8 +684,55 @@ exit 0
             unit = os.path.join(tmp, ".config", "systemd", "user", "agent-relay-update.service")
             with open(unit, encoding="utf-8") as handle:
                 body = handle.read()
-            self.assertIn(f"ExecStart={PYTHON} {checkout}/src/release_discovery.py --cache-offer", body)
+            service = self._systemd_section(body, "Service")["Service"]
+            self.assertIn(("ExecStart",
+                           f"{PYTHON} {checkout}/src/release_discovery.py --cache-offer"),
+                          service)
             self.assertNotIn("scripts/update.sh", body)
+            # The description says what the oneshot really does: a release check
+            # that only caches metadata.
+            self.assertIn("Description=agent-relay metadata-only release check", body)
+
+    def test_checker_units_carry_no_relay_environment_while_the_relay_keeps_its_configuration(self):
+        """The release-check units get only PATH: no A2A_RELAY_PORT and no
+        AGENT_RELAY_DIR, on both service managers, while the relay service's own
+        units keep the port and the checkout as before."""
+        for system in ("Darwin", "Linux"):
+            with self.subTest(system=system):
+                with tempfile.TemporaryDirectory() as tmp:
+                    checkout = os.path.join(tmp, "checkout")
+                    env = self._env(tmp, checkout, system=system)
+                    self._fake_checkout(checkout)
+                    self.assertEqual(self._install(env, "--with-update-timer").returncode, 0,
+                                     "install failed")
+                    if system == "Darwin":
+                        with open(os.path.join(
+                                tmp, "Library", "LaunchAgents", "com.agent-relay.plist"),
+                                  "rb") as handle:
+                            relay = plistlib.load(handle)
+                        self.assertEqual(relay["EnvironmentVariables"]["A2A_RELAY_PORT"],
+                                         "43124")
+                        self.assertEqual(relay["WorkingDirectory"], checkout)
+                        checker = [("Environment", f"{name}={value}") for name, value
+                                   in self._read_update_plist(tmp)["EnvironmentVariables"].items()]
+                    else:
+                        units = os.path.join(tmp, ".config", "systemd", "user")
+                        with open(os.path.join(units, "agent-relay.service"),
+                                  encoding="utf-8") as handle:
+                            relay = self._systemd_section(handle.read(), "Service")["Service"]
+                        self.assertIn(("Environment", "A2A_RELAY_PORT=43124"), relay)
+                        with open(os.path.join(units, "agent-relay-update.service"),
+                                  encoding="utf-8") as handle:
+                            checker = self._systemd_section(handle.read(), "Service")["Service"]
+                    self.assertEqual([name for name, _ in checker
+                                      if name == "Environment"], ["Environment"])
+                    self.assertTrue([value for name, value in checker
+                                     if name == "Environment" and value.startswith("PATH=")],
+                                    "checker unit must set PATH")
+                    self.assertFalse([value for name, value in checker
+                                      if name == "Environment"
+                                      and ("A2A_RELAY_PORT" in value
+                                           or "AGENT_RELAY_DIR" in value)])
 
 
 class DeployedRevisionTests(unittest.TestCase):
