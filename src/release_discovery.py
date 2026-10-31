@@ -2,6 +2,7 @@
 """Read-only discovery of published agent-relay releases."""
 
 import argparse
+import contextlib
 import http.client
 import json
 import math
@@ -10,18 +11,28 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from functools import cmp_to_key
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 API_URL = "https://api.github.com/repos/Ami-Khokhar/agent-relay/releases?per_page=20"
 RELEASE_URL = "https://github.com/Ami-Khokhar/agent-relay/releases/tag/"
 MAX_RESPONSE = 512 * 1024
 MAX_NOTES = 2000
-MAX_CACHE = 16 * 1024
+MAX_VERSION = 256
+# An astral notes character serializes as a 12-character JSON surrogate escape,
+# so the read cap must cover the worst-case escaping of a maximum-size offer.
+MAX_CACHE = 32 * 1024
 OFFER_MAX_AGE = 14 * 24 * 60 * 60
+LOCK_TIMEOUT = 5.0
 TIMEOUT = 5
 _IS_POSIX = os.name == "posix"
 VERSION_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
@@ -118,6 +129,8 @@ def discover(installed, include_prereleases=False, releases=None):
             version = _version(tag)
         except (ValueError, TypeError):
             continue
+        if len(tag) > MAX_VERSION:
+            continue
         if version[3] and not include_prereleases:
             continue
         if release.get("prerelease") is True and not include_prereleases:
@@ -176,6 +189,63 @@ def _private_cache():
     return path
 
 
+_transaction = threading.local()
+
+
+def _acquire_cache_lock():
+    """Hold an exclusive lock on the stable sibling lock file for one transaction."""
+    if not _IS_POSIX or fcntl is None:
+        return None
+    path = _private_cache().with_suffix(".lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = None
+    try:
+        fd = os.open(path, flags, 0o600)
+        info = path.lstat()
+        owner = getattr(os, "geteuid", lambda: None)()
+        if (path.is_symlink() or not path.is_file()
+                or (owner is not None and info.st_uid != owner)):
+            raise DiscoveryError("notice cache lock is not a private regular file; check cache directory permissions")
+        os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise DiscoveryError("timed out waiting for the private notice cache lock")
+                time.sleep(0.05)
+    except DiscoveryError:
+        if fd is not None:
+            os.close(fd)
+        raise
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        raise DiscoveryError("cannot lock the private notice cache; check cache directory permissions") from exc
+
+
+def _release_cache_lock(fd):
+    if fd is not None:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _cache_transaction():
+    """Serialize one read/decision/write cache transaction across processes."""
+    if getattr(_transaction, "active", False):
+        yield
+        return
+    fd = _acquire_cache_lock()
+    _transaction.active = True
+    try:
+        yield
+    finally:
+        _transaction.active = False
+        _release_cache_lock(fd)
+
+
 def _read_cache():
     path = _cache_path()
     try:
@@ -202,35 +272,36 @@ def _read_cache():
 
 
 def _write_cache(offer, notified_version=None):
-    previous = _read_cache()
-    if notified_version is None:
-        notified_version = previous.get("notifiedVersion")
-        if notified_version is None and isinstance(previous.get("version"), str):
-            notified_version = previous["version"]
-    value = {"offer": offer, "notifiedVersion": notified_version}
-    path = _private_cache()
-    fd = None
-    temp_path = None
-    try:
-        fd, temp_path = tempfile.mkstemp(prefix="release-notice-", dir=str(path.parent))
-        if _IS_POSIX:
-            os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = None
-            json.dump(value, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    except OSError as exc:
-        raise DiscoveryError("cannot save the private notice cache; check cache directory permissions") from exc
-    finally:
+    with _cache_transaction():
+        previous = _read_cache()
+        if notified_version is None:
+            notified_version = previous.get("notifiedVersion")
+            if notified_version is None and isinstance(previous.get("version"), str):
+                notified_version = previous["version"]
+        value = {"offer": offer, "notifiedVersion": notified_version}
+        path = _private_cache()
+        fd = None
+        temp_path = None
         try:
-            if fd is not None:
-                os.close(fd)
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
+            fd, temp_path = tempfile.mkstemp(prefix="release-notice-", dir=str(path.parent))
+            if _IS_POSIX:
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = None
+                json.dump(value, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
         except OSError as exc:
-            raise DiscoveryError("cannot clean up the private notice cache; check cache directory permissions") from exc
+            raise DiscoveryError("cannot save the private notice cache; check cache directory permissions") from exc
+        finally:
+            try:
+                if fd is not None:
+                    os.close(fd)
+                if temp_path and os.path.exists(temp_path):
+                    os.unlink(temp_path)
+            except OSError as exc:
+                raise DiscoveryError("cannot clean up the private notice cache; check cache directory permissions") from exc
     return value
 
 
@@ -244,6 +315,7 @@ def _valid_offer(offer, installed):
     except (ValueError, TypeError):
         return None
     if (url != RELEASE_URL + version or not isinstance(notes, str) or len(notes) > MAX_NOTES
+            or len(version) > MAX_VERSION
             or not isinstance(checked, (int, float)) or isinstance(checked, bool)
             or not math.isfinite(checked)
             or checked > time.time() + 300 or time.time() - checked > OFFER_MAX_AGE
@@ -260,11 +332,12 @@ def cached_notice(installed=None):
     """Return one validated, version/link-only notice from the private local cache."""
     try:
         installed = installed or installed_version()
-        cache = _read_cache()
-        offer = _valid_offer(cache.get("offer"), installed)
-        if offer is None or cache.get("notifiedVersion") == offer["version"]:
-            return None
-        _write_cache(offer, offer["version"])
+        with _cache_transaction():
+            cache = _read_cache()
+            offer = _valid_offer(cache.get("offer"), installed)
+            if offer is None or cache.get("notifiedVersion") == offer["version"]:
+                return None
+            _write_cache(offer, offer["version"])
         return {"version": offer["version"], "url": offer["url"]}
     except (DiscoveryError, OSError, TypeError, ValueError):
         return None
@@ -280,10 +353,11 @@ def cache_latest_offer(include_prereleases=False, installed=None):
 
 
 def _notify_once(offer):
-    cache = _read_cache()
-    if cache.get("notifiedVersion") == offer["version"] or cache.get("version") == offer["version"]:
-        return False
-    _write_cache({**offer, "checkedAt": time.time()}, offer["version"])
+    with _cache_transaction():
+        cache = _read_cache()
+        if cache.get("notifiedVersion") == offer["version"] or cache.get("version") == offer["version"]:
+            return False
+        _write_cache({**offer, "checkedAt": time.time()}, offer["version"])
     return True
 
 

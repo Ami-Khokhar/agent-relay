@@ -1,6 +1,7 @@
 import io
 import http.client
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -54,6 +55,44 @@ class FakeOpener:
 
 def fake_api(releases):
     return FakeOpener(FakeResponse(json.dumps(releases).encode("utf-8")))
+
+
+def _contending_notice_worker(start, results, write_delay):
+    start.wait(20)
+    if write_delay:
+        slowed = discovery._write_cache
+
+        def delayed(*args, **kwargs):
+            time.sleep(write_delay)
+            return slowed(*args, **kwargs)
+
+        discovery._write_cache = delayed
+    results.put(discovery.cached_notice("0.3.0"))
+
+
+def _refresh_worker(start, results):
+    slowed = discovery._read_cache
+
+    def delayed():
+        cache = slowed()
+        time.sleep(0.9)
+        return cache
+
+    discovery._read_cache = delayed
+    start.wait(20)
+    results.put(discovery.cache_latest_offer())
+
+
+def _client_worker(start, results):
+    slowed = discovery._write_cache
+
+    def delayed(*args, **kwargs):
+        time.sleep(0.3)
+        return slowed(*args, **kwargs)
+
+    discovery._write_cache = delayed
+    start.wait(20)
+    results.put(discovery.cached_notice("0.3.0"))
 
 
 class ReleaseDiscoveryTests(unittest.TestCase):
@@ -310,6 +349,166 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
                 self.assertIsNone(cache["offer"])
                 self.assertEqual(cache["notifiedVersion"], "0.5.0")
+
+    def test_maximum_astral_notes_survive_cache_round_trip_and_deliver_once(self):
+        notes = "\U0001F680" * discovery.MAX_NOTES
+        offer = discovery.discover("0.3.0", releases=[release("0.4.0", notes=notes)])
+        self.assertEqual(offer["notes"], notes)
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            with patch.object(discovery, "build_opener",
+                              return_value=fake_api([release("0.4.0", notes=notes)])):
+                installed, fetched = discovery.cache_latest_offer()
+            self.assertEqual(installed, "0.3.0")
+            self.assertEqual(fetched["notes"], notes)
+            cache_path = Path(temp) / "agent-relay" / "release-notices.json"
+            self.assertLessEqual(cache_path.stat().st_size, discovery.MAX_CACHE)
+            self.assertEqual(discovery.cached_notice("0.3.0"),
+                             {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0"})
+            self.assertIsNone(discovery.cached_notice("0.3.0"))
+            saved = json.loads(cache_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["offer"]["notes"], notes)
+            self.assertEqual(len(saved["offer"]["notes"]), discovery.MAX_NOTES)
+            self.assertEqual(saved["notifiedVersion"], "0.4.0")
+
+    @unittest.skipUnless(os.name == "posix", "cross-process cache locking is a POSIX guarantee")
+    def test_concurrent_cached_notice_calls_deliver_exactly_one_notice(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            discovery._write_cache({"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+                                    "notes": "notes", "checkedAt": time.time()})
+            workers = 4
+            context = multiprocessing.get_context("fork")
+            start = context.Barrier(workers)
+            results = context.Queue()
+            processes = [context.Process(target=_contending_notice_worker,
+                                         args=(start, results, 0.2)) for _ in range(workers)]
+            try:
+                for process in processes:
+                    process.start()
+                for process in processes:
+                    process.join(30)
+                self.assertEqual([process.exitcode for process in processes], [0] * workers)
+                notices = [results.get(timeout=5) for _ in range(workers)]
+            finally:
+                for process in processes:
+                    if process.exitcode is None:
+                        process.terminate()
+                        process.join(5)
+            self.assertEqual(sum(1 for notice in notices if notice is not None), 1)
+            cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
+            self.assertEqual(cache["notifiedVersion"], "0.4.0")
+
+    @unittest.skipUnless(os.name == "posix", "cross-process cache locking is a POSIX guarantee")
+    def test_scheduled_refresh_cannot_redeliver_a_delivered_version(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            discovery._write_cache({"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+                                    "notes": "first", "checkedAt": time.time()})
+            context = multiprocessing.get_context("fork")
+            start = context.Barrier(2)
+            client_results = context.Queue()
+            refresh_results = context.Queue()
+            with patch.object(discovery, "build_opener",
+                              return_value=fake_api([release("0.4.0", notes="refreshed")])):
+                client = context.Process(target=_client_worker, args=(start, client_results))
+                refresh = context.Process(target=_refresh_worker, args=(start, refresh_results))
+                try:
+                    client.start()
+                    refresh.start()
+                    client.join(30)
+                    refresh.join(30)
+                    self.assertEqual(client.exitcode, 0)
+                    self.assertEqual(refresh.exitcode, 0)
+                    notice = client_results.get(timeout=5)
+                    installed, offer = refresh_results.get(timeout=5)
+                finally:
+                    for process in (client, refresh):
+                        if process.exitcode is None:
+                            process.terminate()
+                            process.join(5)
+            self.assertEqual(notice["version"], "0.4.0")
+            self.assertEqual(installed, "0.3.0")
+            self.assertEqual(offer["version"], "0.4.0")
+            self.assertIsNone(discovery.cached_notice("0.3.0"))
+            cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
+            self.assertEqual(cache["offer"]["notes"], "refreshed")
+            self.assertEqual(cache["notifiedVersion"], "0.4.0")
+            self.assertFalse(discovery._notify_once(
+                {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+                 "notes": "again", "checkedAt": time.time()}))
+
+    @unittest.skipUnless(os.name == "posix", "the notice cache lock is a POSIX flock")
+    def test_lock_failure_is_reported_instead_of_claiming_delivery(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            offer = {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+                     "notes": "notes", "checkedAt": time.time()}
+            discovery._write_cache(offer)
+            blocked = patch.object(discovery.fcntl, "flock",
+                                   side_effect=BlockingIOError(11, "Resource temporarily unavailable"))
+            with patch.object(discovery, "LOCK_TIMEOUT", 0.05), blocked, \
+                    patch.object(discovery, "build_opener", return_value=fake_api([release("0.4.0")])):
+                self.assertIsNone(discovery.cached_notice("0.3.0"))
+                with self.assertRaisesRegex(discovery.DiscoveryError, "lock"):
+                    discovery._notify_once(offer)
+                error = io.StringIO()
+                with patch("sys.stderr", error), patch("sys.stdout", io.StringIO()):
+                    self.assertEqual(discovery.main(["--notify"]), 1)
+                self.assertIn("Release notice failed", error.getvalue())
+                self.assertIn("lock", error.getvalue())
+            self.assertEqual(discovery.cached_notice("0.3.0")["version"], "0.4.0")
+            self.assertIsNone(discovery.cached_notice("0.3.0"))
+
+    @unittest.skipUnless(os.name == "posix", "the notice cache lock is a POSIX flock")
+    def test_untrusted_cache_lock_is_refused_not_followed(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            directory = Path(temp) / "agent-relay"
+            directory.mkdir(mode=0o700)
+            decoy = Path(temp) / "elsewhere"
+            decoy.write_text("untouched")
+            (directory / "release-notices.lock").symlink_to(decoy)
+            offer = {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+                     "notes": "notes", "checkedAt": time.time()}
+            with self.assertRaisesRegex(discovery.DiscoveryError, "lock"):
+                discovery._write_cache(offer)
+            self.assertIsNone(discovery.cached_notice("0.3.0"))
+            self.assertEqual(decoy.read_text(), "untouched")
+            (directory / "release-notices.lock").unlink()
+            (directory / "release-notices.lock").mkdir()
+            with self.assertRaisesRegex(discovery.DiscoveryError, "lock"):
+                discovery._write_cache(offer)
+            self.assertIsNone(discovery.cached_notice("0.3.0"))
+
+    def test_oversize_and_symlinked_cache_files_stay_untrusted(self):
+        """Guard: oversize and symlinked cache reads stay untrusted on every write policy."""
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            path = Path(temp) / "agent-relay" / "release-notices.json"
+            path.parent.mkdir(mode=0o700)
+            payload = json.dumps({"offer": {"version": "0.4.0",
+                                            "url": discovery.RELEASE_URL + "0.4.0",
+                                            "notes": "x", "checkedAt": time.time()},
+                                  "notifiedVersion": None}).encode("utf-8")
+            path.write_bytes(b" " * (discovery.MAX_CACHE + 1 - len(payload)) + payload)
+            path.chmod(0o600)
+            self.assertIsNone(discovery.cached_notice("0.3.0"))
+            path.unlink()
+            decoy = path.parent / "decoy"
+            decoy.write_text("untouched")
+            decoy.chmod(0o600)
+            path.symlink_to(decoy)
+            self.assertIsNone(discovery.cached_notice("0.3.0"))
+            self.assertEqual(decoy.read_text(), "untouched")
+
+    def test_cached_notice_reads_only_the_local_cache(self):
+        """Guard: a cached notice never fetches release metadata over the network."""
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            discovery._write_cache({"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+                                    "notes": "notes", "checkedAt": time.time()})
+
+            def no_network(*args, **kwargs):
+                raise AssertionError("cached_notice must not touch the network")
+
+            with patch.object(discovery, "build_opener", side_effect=no_network), \
+                    patch.object(discovery, "fetch_releases", side_effect=no_network), \
+                    patch.object(discovery, "discover", side_effect=no_network):
+                self.assertEqual(discovery.cached_notice("0.3.0")["version"], "0.4.0")
 
 
 if __name__ == "__main__":
