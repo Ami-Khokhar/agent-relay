@@ -84,6 +84,14 @@ if [ ! -f "$TARGET_DIR/src/server.py" ]; then
   echo "       set AGENT_RELAY_DIR or run scripts/setup.sh first" >&2
   exit 1
 fi
+# The scheduled release check runs the checkout's checker; validate it before
+# anything is created or scheduled so a partial checkout still installs with
+# --no-update-timer.
+if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -f "$TARGET_DIR/src/release_discovery.py" ]; then
+  echo "error: $TARGET_DIR/src/release_discovery.py not found; the scheduled release check runs it" >&2
+  echo "       rerun scripts/setup.sh to refresh the checkout, or pass --no-update-timer to install the service only" >&2
+  exit 1
+fi
 
 # Services do not inherit the login shell PATH. Include the usual per-user tool dirs so
 # agent CLIs (codex, claude, pi, opencode, dsh) resolve.

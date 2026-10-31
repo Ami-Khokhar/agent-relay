@@ -343,11 +343,12 @@ class UpdateTimerTests(unittest.TestCase):
     both files."""
 
     @staticmethod
-    def _fake_checkout(checkout):
+    def _fake_checkout(checkout, release_check=True):
         """install-service.sh only checks the layout, not a real checkout."""
         os.makedirs(os.path.join(checkout, "src"), exist_ok=True)
         open(os.path.join(checkout, "src", "server.py"), "w").close()
-        open(os.path.join(checkout, "src", "release_discovery.py"), "w").close()
+        if release_check:
+            open(os.path.join(checkout, "src", "release_discovery.py"), "w").close()
 
     def _env(self, tmp, checkout, system="Darwin"):
         """Stub uname, launchctl and systemctl; each service-manager call is
@@ -573,6 +574,79 @@ exit 0
             self.assertNotIn("removed", result.stdout)
             self.assertFalse([line for line in self._take_log(tmp)
                               if "update.timer" in line])
+
+    def test_missing_checker_fails_before_scheduling_on_darwin(self):
+        """A checkout without the release checker is rejected before any timer
+        file is created or any service-manager scheduling call is made."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(tmp, "checkout")
+            env = self._env(tmp, checkout)
+            self._fake_checkout(checkout, release_check=False)
+            agents = os.path.join(tmp, "Library", "LaunchAgents")
+
+            result = self._install(env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("release_discovery.py not found", result.stderr)
+            self.assertIn("rerun scripts/setup.sh", result.stderr)
+            self.assertIn("--no-update-timer", result.stderr)
+            self.assertFalse(os.path.exists(
+                os.path.join(agents, "com.agent-relay.update.plist")))
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, "Library", "Logs", "agent-relay",
+                             "update.log")))
+            calls = "".join(self._take_log(tmp))
+            self.assertNotIn("load", calls)
+            self.assertNotIn("enable", calls)
+
+    def test_missing_checker_fails_before_scheduling_on_linux(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(tmp, "checkout")
+            env = self._env(tmp, checkout, system="Linux")
+            self._fake_checkout(checkout, release_check=False)
+            units = os.path.join(tmp, ".config", "systemd", "user")
+
+            result = self._install(env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("release_discovery.py not found", result.stderr)
+            self.assertIn("rerun scripts/setup.sh", result.stderr)
+            self.assertFalse(os.path.exists(
+                os.path.join(units, "agent-relay-update.timer")))
+            self.assertFalse(os.path.exists(
+                os.path.join(units, "agent-relay-update.service")))
+            calls = "".join(self._take_log(tmp))
+            self.assertNotIn("enable", calls)
+            self.assertNotIn("daemon-reload", calls)
+
+    def test_server_only_checkout_installs_the_service_without_a_timer(self):
+        """--no-update-timer is the opt-out for checkouts without the release
+        checker on both service managers; only the relay service is installed."""
+        for system in ("Darwin", "Linux"):
+            with self.subTest(system=system):
+                with tempfile.TemporaryDirectory() as tmp:
+                    checkout = os.path.join(tmp, "checkout")
+                    env = self._env(tmp, checkout, system=system)
+                    self._fake_checkout(checkout, release_check=False)
+
+                    result = self._install(env, "--no-update-timer")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("no update timer installed", result.stdout)
+                    if system == "Darwin":
+                        agents = os.path.join(tmp, "Library", "LaunchAgents")
+                        self.assertEqual(os.listdir(agents),
+                                         ["com.agent-relay.plist"])
+                    else:
+                        units = os.path.join(tmp, ".config", "systemd", "user")
+                        self.assertEqual(os.listdir(units),
+                                         ["agent-relay.service"])
+
+    def test_uninstall_works_from_a_server_only_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(tmp, "checkout")
+            env = self._env(tmp, checkout)
+            self._fake_checkout(checkout, release_check=False)
+
+            result = self._install(env, "--uninstall")
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_timer_uses_metadata_only_checker_on_linux(self):
         with tempfile.TemporaryDirectory() as tmp:
