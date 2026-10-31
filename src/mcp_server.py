@@ -207,7 +207,7 @@ TOOLS = [
                 "readOnly": {"type": "boolean",
                              "description": "Set true to require that the agent cannot change files: the relay adds the agent's read-only arguments and, where the owner enabled it on macOS, runs it in a sandbox that blocks writes under the task's cwd, the agent's allowedRoots and the cwd's git metadata, reading the relay token, and calling the relay (so that agent cannot delegate). It does not block reads or other network access. An agent that does not list readOnly: supported in list_agents refuses the task (read_only_unsupported) and nothing runs. If the cwd is in a git repository whose metadata git cannot locate, the task fails (read_only_git_unknown) instead of running with less protection. An input that starts with \"-\" is refused (invalid_input) when the agent takes its input as a command-line argument and the owner declared no input separator for it, because it could be read as an option that overrides the read-only arguments; start the input with another character. Omit or false for a normal run."},
                 "waitMs": {"type": "integer", "minimum": 1,
-                           "description": "Maximum time, in milliseconds, that this call waits for the task to finish. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. The relay checks the wait before it creates the task, so a refused wait leaves no task and a retry with the same requestId cannot duplicate it. If the task is still running when the wait ends, the call returns its current state with waitExpired: true; then call wait_task again with the same taskId. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+                           "description": "Maximum time, in milliseconds, that this call waits for the task to finish. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. The relay checks the wait before it creates the task, so a refused wait leaves no task and a retry with the same requestId cannot duplicate it. If the task is still running when the wait ends, the call returns its current state with waitExpired: true; then call wait_task again with the same taskId. If the submission created the task but that follow-up wait then fails, the call returns the created task with waitFailed: true and a waitError naming the failure and pointing at wait_task with the same taskId; a successful submission is never resubmitted. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
@@ -740,9 +740,22 @@ def create_http_handler(base_url=None, timeout=None):
                     # Nothing was created, so the retry cannot duplicate the task, even with a requestId.
                     value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
                 if wait_ms and value.get("status") in ("queued", "running"):
-                    value = _relay_request(
-                        base_url, f"/v1/tasks/{quote(value['id'], safe='')}?waitMs={wait_ms}",
-                        timeout=max(timeout, wait_ms / 1000.0 + 5))
+                    created_id = value["id"]
+                    try:
+                        value = _relay_request(
+                            base_url, f"/v1/tasks/{quote(created_id, safe='')}?waitMs={wait_ms}",
+                            timeout=max(timeout, wait_ms / 1000.0 + 5))
+                    except RelayError as exc:
+                        # The submission created the task, so it runs on with an ID the caller must
+                        # keep: an ID-less error would hide it and invite a duplicate submit. Return
+                        # the created task with the wait failure and recovery named instead; nothing
+                        # is retried after a successful POST.
+                        clamped = False
+                        value.update(waitFailed=True, waitError={
+                            "error": (exc.data or {}).get("error") or "wait_failed",
+                            "message": (f"the task was created as {created_id} and its wait failed: "
+                                        f"{exc.message}. Do not submit it again; call wait_task with "
+                                        "this taskId (or get_task) to check on it.")})
                 if clamped:
                     value.update(waitMs=wait_ms, waitClamped=True)
             elif name == "wait_task":

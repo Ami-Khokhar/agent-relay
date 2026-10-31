@@ -442,6 +442,25 @@ class RelayTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_a_stored_replay_ignores_an_invalid_advisory_wait(self):
+        relay = Relay({"id": "quick", "command": PYTHON, "args": ["-c", "print('done')"]},
+                      env={"A2A_RELAY_MAX_WAIT_MS": "2000"})
+        try:
+            status, task = relay.submit(agentId="quick", input="x", requestId="r-1", waitMs=2000)
+            self.assertEqual(status, 202)
+            # The wait is advisory and never stored, so a replay that repeats every stored field
+            # answers with the stored task even when its wait alone would be refused for one.
+            status, replay = relay.submit(agentId="quick", input="x", requestId="r-1", waitMs=900000)
+            self.assertEqual((status, replay["id"]), (200, task["id"]))
+            # Identity still decides a changed replay: the invalid wait does not mask the conflict.
+            status, conflict = relay.submit(agentId="quick", input="changed",
+                                            requestId="r-1", waitMs=900000)
+            self.assertEqual((status, conflict["error"]), (409, "idempotency_conflict"))
+            status, listed = relay.request("GET", "/v1/tasks")
+            self.assertEqual([item["id"] for item in listed["tasks"]], [task["id"]])
+        finally:
+            relay.close()
+
     def test_lists_tasks_by_session_and_rejects_a_bad_status(self):
         relay = Relay({"id": "echo", "command": PYTHON,
                        "args": ["-c", "import sys; print(sys.argv[1])"]})
