@@ -579,6 +579,51 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["collect"]["status"], "completed")
         self.assertEqual(finished["collect"]["output"], 'collected=["two", "one"]')
 
+    # ------------------------------------------------------------------- needsPolicy
+
+    def test_a_needs_policy_any_fan_in_runs_when_one_branch_times_out(self):
+        # One of two parallel builds hits its timeout while the other finishes; the review
+        # step with needsPolicy any still runs, reading the finished build and a marker for
+        # the failed one instead of being skipped with the whole run.
+        relay = self.start([
+            echo(),
+            {"id": "slow", "command": PYTHON, "args": ["-c", SLOW]},
+        ])
+        workflow = run(relay, {"steps": [
+            {"id": "fast-build", "agentId": "echo", "input": "build-ok"},
+            {"id": "slow-build", "agentId": "slow", "input": "never finishes",
+             "timeoutMs": 300},
+            {"id": "review", "agentId": "echo", "needs": ["fast-build", "slow-build"],
+             "needsPolicy": "any", "input":
+             "review {{fast-build.output}} against {{slow-build.output}}"},
+        ]})
+        # The run still reports failed because one branch timed out; the point is that the
+        # review step itself runs instead of being skipped along with it.
+        self.assertEqual(workflow["status"], "failed")
+        self.assertIn("step slow-build failed", workflow["error"])
+        finished = steps_of(workflow)
+        self.assertEqual(finished["review"]["status"], "completed")
+        self.assertIn("review build-ok against [slow-build did not complete:",
+                      finished["review"]["output"])
+        self.assertIn("status=failed", finished["review"]["output"])
+        self.assertEqual(finished["fast-build"]["needsPolicy"], None)
+        self.assertEqual(finished["review"]["needsPolicy"], "any")
+
+    def test_a_needs_policy_any_step_is_skipped_when_no_need_completed(self):
+        relay = self.start({"id": "failer", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]})
+        workflow = run(relay, {"steps": [
+            {"id": "first", "agentId": "failer", "input": "FAIL: gone"},
+            {"id": "second", "agentId": "failer", "input": "FAIL: also gone"},
+            {"id": "pick", "agentId": "failer", "needs": ["first", "second"],
+             "needsPolicy": "any", "input": "pick from {{first.output}}"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["first"]["status"], "failed")
+        self.assertEqual(finished["pick"]["status"], "skipped")
+        self.assertEqual(finished["pick"]["error"], "dependency_not_completed")
+        self.assertEqual(finished["pick"]["taskIds"], [])
+
     # ------------------------------------------------------------------- control
 
     def test_cancel_stops_the_run_and_its_running_children(self):
@@ -773,6 +818,12 @@ class WorkflowTests(unittest.TestCase):
             ("fail_if_not_a_string", {"steps": [{**base, "failIfOutputMatches": 5}]},
              "invalid_fail_if"),
             ("zero_timeout", {"steps": [{**base, "timeoutMs": 0}]}, "invalid_timeout"),
+            ("bad_needs_policy", {"steps": [{**base, "needsPolicy": "some"}]},
+             "invalid_needs_policy"),
+            ("needs_policy_not_a_string", {"steps": [{**base, "needsPolicy": 1}]},
+             "invalid_needs_policy"),
+            ("needs_policy_without_needs", {"steps": [{**base, "needsPolicy": "any"}]},
+             "invalid_needs_policy"),
             ("bad_cwd", {"steps": [{**base, "cwd": ""}]}, "invalid_cwd"),
             ("too_many_retries", {"steps": [{**base, "retries": 99}]}, "invalid_retries"),
             ("bad_options", {"steps": [{**base, "options": ["effort"]}]}, "invalid_options"),
