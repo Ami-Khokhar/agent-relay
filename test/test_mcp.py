@@ -496,6 +496,59 @@ class McpHandlerTests(unittest.TestCase):
             finally:
                 upstream.close()
 
+    def test_delegate_keeps_the_task_id_when_a_legacy_relay_refuses_the_wait_after_creating(self):
+        for health in ((200, {"ok": True}), (500, {"error": "boom"})):
+            accepted = []
+
+            def old_relay(method, path, body, health=health):
+                if path == "/healthz":
+                    return health
+                if method == "POST" and body is not None and "waitMs" in body:
+                    return 400, {"error": "unknown_field", "message": "Unknown request field: waitMs"}
+                if method == "POST":
+                    accepted.append(body)
+                    return 202, {"id": "task-9", "sessionId": "s-1", "agentId": "fake", "status": "queued"}
+                return 400, {"error": "invalid_wait", "message": "waitMs must be an integer from 1 to 600000"}
+
+            upstream = FakeUpstream(old_relay)
+            handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+            try:
+                result = handle({"method": "tools/call", "params": {
+                    "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "waitMs": 900000}}})
+                self.assertNotIn("isError", result)
+                task = result["structuredContent"]
+                self.assertEqual((task["id"], task["status"]), ("task-9", "queued"))
+                self.assertIs(task["waitFailed"], True)
+                self.assertEqual(task["waitError"]["error"], "invalid_wait")
+                for text in ("task-9", "wait_task", "taskId", "Do not submit"):
+                    self.assertIn(text, task["waitError"]["message"])
+                self.assertEqual(len(accepted), 1)  # exactly one successful POST, never resubmitted
+                self.assertEqual(upstream.calls[-1][0], "GET")
+            finally:
+                upstream.close()
+
+    def test_delegate_keeps_the_task_id_when_the_wait_poll_fails_after_a_successful_submission(self):
+        def flaky(method, path, body):
+            if method == "POST":
+                return 202, {"id": "task-7", "sessionId": "s-1", "agentId": "fake", "status": "queued"}
+            return 502, {"error": "bad_gateway"}
+
+        upstream = FakeUpstream(flaky)
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            result = handle({"method": "tools/call", "params": {
+                "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "waitMs": 3000}}})
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertEqual((task["id"], task["status"]), ("task-7", "queued"))
+            self.assertIs(task["waitFailed"], True)
+            self.assertEqual(task["waitError"]["error"], "bad_gateway")
+            for text in ("task-7", "wait_task", "taskId", "Do not submit"):
+                self.assertIn(text, task["waitError"]["message"])
+            self.assertEqual([call[0] for call in upstream.calls], ["POST", "GET"])  # no resubmission
+        finally:
+            upstream.close()
+
     def test_delegate_forwards_options_and_validates_their_shape(self):
         upstream = FakeUpstream(lambda method, path, body: (202, {"id": "task-3", "status": "queued"}))
         handle = mcp_server.create_http_handler(upstream.url, timeout=5)

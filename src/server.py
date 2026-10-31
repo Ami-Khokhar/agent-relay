@@ -1444,10 +1444,6 @@ def _create_task(request):
     parent_id = request.get("parentTaskId")
     if parent_id is not None and not _valid(parent_id):
         return 400, {"error": "invalid_parent_task_id"}
-    # waitMs only names the wait the caller means to use next. Refuse a bad one here, before the
-    # task exists: a caller that gets this error then holds no task ID for a task that runs on.
-    if "waitMs" in request and not _is_valid_wait(request["waitMs"]):
-        return 400, _invalid_wait()
     options, _, option_error = _resolve_options(agent, request.get("options"))
     if option_error:
         return 400, {"error": option_error[0], "message": option_error[1]}
@@ -1497,6 +1493,11 @@ def _create_task(request):
                     or prior.get("parentTaskId") != parent_id):
                 return 409, {"error": "idempotency_conflict"}
             return 200, visible(prior)
+        # waitMs only names the wait the caller means to use next and is never stored, so a replay
+        # (which creates nothing) ignores it above; a new submission is refused here, before parent
+        # accounting or creation, so a caller that gets this error holds no task ID for a task.
+        if "waitMs" in request and not _is_valid_wait(request["waitMs"]):
+            return 400, _invalid_wait()
         parent = TASKS.get(parent_id) if parent_id is not None else None
         if parent_id is not None:
             if parent is None:

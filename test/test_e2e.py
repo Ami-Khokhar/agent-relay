@@ -104,8 +104,14 @@ class EndToEndTests(unittest.TestCase):
             # The refused first attempt created nothing, so one task exists, and a retry finds it.
             listed = client.call_tool("list_tasks", {})["structuredContent"]["tasks"]
             self.assertEqual([item["id"] for item in listed], [task["id"]])
+            # The replay returns 200 without re-checking the wait, but the follow-up long poll
+            # still refuses it and must still clamp to the relay's limit, not report waitFailed.
             again = client.call_tool("delegate", arguments)["structuredContent"]
             self.assertEqual(again["id"], task["id"])
+            self.assertEqual(again["waitMs"], 500)
+            self.assertIs(again["waitClamped"], True)
+            self.assertIs(again["waitExpired"], True)
+            self.assertNotIn("waitFailed", again)
             listed = client.call_tool("list_tasks", {})["structuredContent"]["tasks"]
             self.assertEqual(len(listed), 1)
             client.call_tool("cancel_task", {"taskId": task["id"]})
