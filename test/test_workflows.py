@@ -822,6 +822,8 @@ class WorkflowTests(unittest.TestCase):
              "invalid_needs_policy"),
             ("needs_policy_not_a_string", {"steps": [{**base, "needsPolicy": 1}]},
              "invalid_needs_policy"),
+            ("needs_policy_without_needs", {"steps": [{**base, "needsPolicy": "any"}]},
+             "invalid_needs_policy"),
             ("bad_cwd", {"steps": [{**base, "cwd": ""}]}, "invalid_cwd"),
             ("too_many_retries", {"steps": [{**base, "retries": 99}]}, "invalid_retries"),
             ("bad_options", {"steps": [{**base, "options": ["effort"]}]}, "invalid_options"),
