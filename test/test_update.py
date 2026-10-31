@@ -381,14 +381,16 @@ exit 0
 
     @staticmethod
     def _read_update_plist(tmp):
-        """Parse the generated checker plist after verifying launchd accepts its syntax."""
+        """Parse the generated checker plist with plistlib (syntax-level only;
+        this does not verify that launchd accepts the plist's semantics)."""
         with open(os.path.join(tmp, "Library", "LaunchAgents",
                                "com.agent-relay.update.plist"), "rb") as handle:
             return plistlib.load(handle)
 
     @staticmethod
     def _systemd_section(body, section):
-        """Return the directive names of a generated systemd unit section."""
+        """Return a mapping of section name to its (directive, value) pairs for
+        the requested section of a generated systemd unit body."""
         directives = {}
         current = None
         for line in body.splitlines():
@@ -399,7 +401,7 @@ exit 0
                 name, _, value = line.partition("=")
                 directives[current].append((name, value))
         return {name: values for name, values in directives.items()
-                if name == section or section is None}
+                if name == section}
 
     @staticmethod
     def _take_log(tmp):
@@ -698,8 +700,9 @@ exit 0
                           service)
             self.assertNotIn("scripts/update.sh", body)
             # The description says what the oneshot really does: a release check
-            # that only caches metadata.
-            self.assertIn("Description=agent-relay metadata-only release check", body)
+            # that only caches metadata, asserted structurally on the Unit section.
+            self.assertIn(("Description", "agent-relay metadata-only release check"),
+                          self._systemd_section(body, "Unit")["Unit"])
 
     def test_checker_units_carry_no_relay_environment_while_the_relay_keeps_its_configuration(self):
         """The release-check units get only PATH: no A2A_RELAY_PORT and no
