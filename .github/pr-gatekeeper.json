@@ -5,12 +5,22 @@
     "test/test_*.py",
     "tests/**/test_*.py"
   ],
+  "docs_globs": [
+    "*.md",
+    "*.rst",
+    "docs/*"
+  ],
   "test_command": "python3 -m unittest discover -s test -p 'test_*.py'",
   "protected_paths": [
     ".github/",
-    "AGENTS.md"
+    ".env",
+    ".env.local",
+    "secrets/",
+    ".claude/settings.json",
+    ".codex/config.toml"
   ],
   "max_changed_lines": 600,
+  "max_reviewable_lines": 1000,
   "max_changed_files": 20,
   "max_rounds": 3,
   "run_allowlist": [
@@ -22,5 +32,28 @@
   "reviewer_model": "deepseek-v4.1-flash",
   "verifier_model": "glm-5.3-flash",
   "merge_method": "squash",
-  "notify": ""
+  "notify": "",
+  "supported_platforms": [],
+  "strong_reviewer_model": "",
+  "sensitive_paths": [
+    "*auth*",
+    "*token*",
+    "*secret*",
+    "*crypt*",
+    "*permission*",
+    "*password*",
+    "*credential*",
+    "*process*",
+    "*signal*",
+    "*sandbox*"
+  ],
+  "sensitive_code": [
+    "\\bsubprocess\\b",
+    "\\bos\\.(kill|killpg|setsid|setpgid|fork|exec\\w*|chmod|umask)\\b",
+    "\\bsignal\\.",
+    "\\bshell\\s*=\\s*True\\b",
+    "(?i)\\b(pid|pgid|process group|setsid|killpg|sig(kill|term|int|hup))\\b",
+    "/proc/",
+    "(?i)\\b(token|password|secret|api[_-]?key|authorization|bearer)\\b"
+  ]
 }
