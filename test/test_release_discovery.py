@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import URLError
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -80,7 +80,7 @@ def _refresh_worker(start, results):
 
     discovery._read_cache = delayed
     start.wait(20)
-    results.put(discovery.cache_latest_offer())
+    results.put(discovery.cache_latest_offer(installed="0.3.0"))
 
 
 def _client_worker(start, results):
@@ -279,6 +279,42 @@ class ReleaseDiscoveryTests(unittest.TestCase):
             self.assertIn("No newer published stable release", output.getvalue())
             self.assertFalse((Path(temp) / "agent-relay").exists())
 
+    def test_cache_offer_cli_stores_the_fetched_offer_without_marking_it_shown(self):
+        """Guard: --cache-offer writes fetched metadata with a null notifiedVersion."""
+        installed = discovery.installed_version()
+        offer_version = "%d.0.0" % (int(installed.split(".")[0]) + 1)
+        with tempfile.TemporaryDirectory() as temp:
+            output = io.StringIO()
+            opener = fake_api([release(offer_version, notes="notes are data")])
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}), \
+                    patch.object(discovery, "build_opener", return_value=opener), \
+                    patch("sys.stdout", output):
+                self.assertEqual(discovery.main(["--cache-offer"]), 0)
+                cached = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
+                self.assertEqual(cached["offer"]["version"], offer_version)
+                self.assertEqual(cached["offer"]["notes"], "notes are data")
+                self.assertIsNone(cached["notifiedVersion"])
+                # The stored offer is still deliverable exactly once by the notice path.
+                self.assertEqual(discovery.cached_notice(installed)["version"], offer_version)
+                self.assertIsNone(discovery.cached_notice(installed))
+            self.assertIn("Cached release offer: %s" % offer_version, output.getvalue())
+            self.assertNotIn("Available version:", output.getvalue())
+
+    def test_cache_offer_with_notify_is_refused_before_any_fetch_or_cache_write(self):
+        """Guard: --notify with --cache-offer is refused before the service or cache is touched."""
+        with tempfile.TemporaryDirectory() as temp:
+            error = io.StringIO()
+            opener = Mock()
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}), \
+                    patch.object(discovery, "build_opener", opener), \
+                    patch("sys.stderr", error):
+                with self.assertRaises(SystemExit) as raised:
+                    discovery.main(["--notify", "--cache-offer"])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("--notify and --cache-offer cannot be used together", error.getvalue())
+            opener.open.assert_not_called()
+            self.assertFalse((Path(temp) / "agent-relay").exists())
+
     def test_cli_service_failure_is_reported_without_creating_notice_state(self):
         with tempfile.TemporaryDirectory() as temp:
             output = io.StringIO()
@@ -328,6 +364,8 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                     self.assertIsNone(discovery.cached_notice("0.3.0"))
 
     def test_scheduled_refresh_preserves_notice_history_and_caches_no_offer(self):
+        # The refresh passes an explicit installed baseline so the assertions never
+        # depend on whatever version pyproject currently declares.
         with tempfile.TemporaryDirectory() as temp:
             with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
                 first = {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
@@ -336,15 +374,25 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 self.assertEqual(discovery.cached_notice("0.3.0")["version"], "0.4.0")
                 with patch.object(discovery, "build_opener",
                                   return_value=fake_api([release("0.5.0")])):
-                    installed, offer = discovery.cache_latest_offer()
+                    installed, offer = discovery.cache_latest_offer(installed="0.3.0")
                 self.assertEqual(installed, "0.3.0")
                 self.assertEqual(offer["version"], "0.5.0")
                 cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
                 self.assertEqual(cache["notifiedVersion"], "0.4.0")
                 self.assertEqual(discovery.cached_notice(installed)["version"], "0.5.0")
                 with patch.object(discovery, "build_opener", return_value=fake_api([])):
-                    installed, offer = discovery.cache_latest_offer()
+                    installed, offer = discovery.cache_latest_offer(installed="0.3.0")
                 self.assertEqual(installed, "0.3.0")
+                self.assertIsNone(offer)
+                cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
+                self.assertIsNone(cache["offer"])
+                self.assertEqual(cache["notifiedVersion"], "0.5.0")
+                # A newer baseline at the installed-version boundary is honored, not hardcoded.
+                with patch.object(discovery, "installed_version", return_value="9.9.9"), \
+                        patch.object(discovery, "build_opener",
+                                     return_value=fake_api([release("0.5.0")])):
+                    installed, offer = discovery.cache_latest_offer()
+                self.assertEqual(installed, "9.9.9")
                 self.assertIsNone(offer)
                 cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
                 self.assertIsNone(cache["offer"])
@@ -357,7 +405,7 @@ class ReleaseDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
             with patch.object(discovery, "build_opener",
                               return_value=fake_api([release("0.4.0", notes=notes)])):
-                installed, fetched = discovery.cache_latest_offer()
+                installed, fetched = discovery.cache_latest_offer(installed="0.3.0")
             self.assertEqual(installed, "0.3.0")
             self.assertEqual(fetched["notes"], notes)
             cache_path = Path(temp) / "agent-relay" / "release-notices.json"

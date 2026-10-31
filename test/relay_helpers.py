@@ -204,10 +204,19 @@ def send_json(handler_request, status, value):
 
 
 class McpClient:
-    """Spawns src/mcp_server.py and speaks JSON-RPC 2.0 over its stdio."""
+    """Spawns src/mcp_server.py and speaks JSON-RPC 2.0 over its stdio.
+
+    Unless the caller supplies XDG_CACHE_HOME, the client gets a private temporary
+    cache so initialize never reads or rewrites the developer's real notice cache;
+    close() removes only that temporary cache, never a caller-supplied one."""
 
     def __init__(self, relay_url, env=None):
-        env = {**os.environ, "A2A_RELAY_URL": relay_url, "AGENT_RELAY_TOKEN": TOKEN, **(env or {})}
+        env = dict(env or {})
+        self.cache_home = None
+        if not env.get("XDG_CACHE_HOME"):
+            self.cache_home = tempfile.TemporaryDirectory(prefix="agent-relay-mcp-cache-")
+            env["XDG_CACHE_HOME"] = self.cache_home.name
+        env = {**os.environ, "A2A_RELAY_URL": relay_url, "AGENT_RELAY_TOKEN": TOKEN, **env}
         self.proc = subprocess.Popen(
             [PYTHON, MCP_SERVER], cwd=ROOT, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -268,3 +277,6 @@ class McpClient:
         for stream in (self.proc.stdout, self.proc.stderr):
             if stream is not None:
                 stream.close()
+        if self.cache_home is not None:
+            self.cache_home.cleanup()
+            self.cache_home = None

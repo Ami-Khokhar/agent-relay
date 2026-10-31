@@ -14,7 +14,8 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-from relay_helpers import MCP_SERVER, PYTHON, ROOT, send_json, start_http_server, stop_http_server
+from relay_helpers import (MCP_SERVER, PYTHON, ROOT, McpClient, send_json, start_http_server,
+                           stop_http_server)
 import mcp_server
 import workflows
 
@@ -68,6 +69,18 @@ class FakeReleaseOpener:
 
 
 class McpHandlerTests(unittest.TestCase):
+    def setUp(self):
+        # An in-process initialize reads the notice cache, so every handler test runs
+        # against a private cache instead of the developer's real one.
+        self._cache_home = tempfile.TemporaryDirectory(prefix="agent-relay-handler-cache-")
+        self._cache_env = unittest.mock.patch.dict(
+            os.environ, {"XDG_CACHE_HOME": self._cache_home.name})
+        self._cache_env.start()
+
+    def tearDown(self):
+        self._cache_env.stop()
+        self._cache_home.cleanup()
+
     def test_initialize_advertises_relay_instructions(self):
         handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
         result = handle({"method": "initialize"})
@@ -973,15 +986,87 @@ class McpHandlerTests(unittest.TestCase):
         self.assertIn("list_agents", step["properties"]["agentId"]["description"])
         self.assertIn("{{id.output}}", step["properties"]["id"]["description"])
 
+class McpNoticeIsolationTests(unittest.TestCase):
+    def test_default_initialization_cannot_consume_the_developers_notice_cache(self):
+        # The sentinel stands in for the developer's real XDG cache: a valid, undelivered
+        # offer that initialize would mark delivered if it were allowed to read that cache.
+        installed = mcp_server.release_discovery.installed_version()
+        offer_version = "%d.0.0" % (int(installed.split(".")[0]) + 1)
+        params = {"protocolVersion": "2025-06-18", "capabilities": {},
+                  "clientInfo": {"name": "isolation-test", "version": "1"}}
+
+        def seed(cache_home):
+            cache_dir = os.path.join(cache_home, "agent-relay")
+            os.mkdir(cache_dir, 0o700)
+            cache_file = os.path.join(cache_dir, "release-notices.json")
+            with open(cache_file, "w", encoding="utf-8") as handle:
+                json.dump({"offer": {"version": offer_version,
+                                      "url": mcp_server.release_discovery.RELEASE_URL + offer_version,
+                                      "notes": "sentinel notes",
+                                      "checkedAt": time.time()},
+                           "notifiedVersion": None}, handle)
+            os.chmod(cache_file, 0o600)
+            with open(cache_file, "rb") as handle:
+                return handle.read()
+
+        def notice_cache_bytes(cache_home):
+            with open(os.path.join(cache_home, "agent-relay", "release-notices.json"),
+                      "rb") as handle:
+                return handle.read()
+
+        with tempfile.TemporaryDirectory() as parent_home, \
+                tempfile.TemporaryDirectory() as fixture_home:
+            sentinel = seed(parent_home)
+            with unittest.mock.patch.dict(os.environ, {"XDG_CACHE_HOME": parent_home}):
+                client = McpClient("http://127.0.0.1:1", env={"A2A_RELAY_AUTOSTART": "0"})
+                try:
+                    initialized = client.call("initialize", params)
+                    # Without the helper's private cache the subprocess consumes the
+                    # sentinel here: the notice appears and the cache bytes change.
+                    self.assertNotIn("Cached release notice:", initialized["result"]["instructions"])
+                    self.assertEqual(notice_cache_bytes(parent_home), sentinel)
+                    private_cache = client.cache_home.name
+                finally:
+                    client.close()
+                self.assertFalse(os.path.exists(private_cache))  # close() removed the helper cache
+
+                # In-process initialize runs under the same private-cache fixture.
+                with unittest.mock.patch.dict(os.environ, {"XDG_CACHE_HOME": fixture_home}):
+                    handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
+                    result = handle({"method": "initialize"})
+                self.assertNotIn("Cached release notice:", result["instructions"])
+                self.assertEqual(notice_cache_bytes(parent_home), sentinel)
+
+                # A caller-supplied private cache is still honored, marked once, and kept.
+                with tempfile.TemporaryDirectory() as explicit_home:
+                    seed(explicit_home)
+                    explicit = McpClient("http://127.0.0.1:1", env={
+                        "A2A_RELAY_AUTOSTART": "0", "XDG_CACHE_HOME": explicit_home})
+                    try:
+                        explicit_result = explicit.call("initialize", params)
+                    finally:
+                        explicit.close()
+                    instructions = explicit_result["result"]["instructions"]
+                    self.assertIn("Cached release notice: agent-relay version %s is available"
+                                  % offer_version, instructions)
+                    self.assertTrue(os.path.isdir(explicit_home))  # caller-owned, not removed
+                    cached = json.loads(notice_cache_bytes(explicit_home).decode("utf-8"))
+                    self.assertEqual(cached["notifiedVersion"], offer_version)
+                    self.assertEqual(notice_cache_bytes(parent_home), sentinel)
+
 class McpServeTests(unittest.TestCase):
     def test_cached_release_notice_is_local_version_only_and_shown_once_by_real_process(self):
+        # The offer must outrank whatever pyproject currently declares, so it is derived
+        # from the installed version instead of a hardcoded tag.
+        installed = mcp_server.release_discovery.installed_version()
+        offer_version = "%d.0.0" % (int(installed.split(".")[0]) + 1)
         with tempfile.TemporaryDirectory() as cache_home:
             cache_dir = os.path.join(cache_home, "agent-relay")
             os.mkdir(cache_dir, 0o700)
             cache_file = os.path.join(cache_dir, "release-notices.json")
             with open(cache_file, "w", encoding="utf-8") as handle:
-                json.dump({"offer": {"version": "0.4.0",
-                                      "url": mcp_server.release_discovery.RELEASE_URL + "0.4.0",
+                json.dump({"offer": {"version": offer_version,
+                                      "url": mcp_server.release_discovery.RELEASE_URL + offer_version,
                                       "notes": "UNTRUSTED RELEASE NOTES",
                                       "checkedAt": time.time()},
                            "notifiedVersion": None}, handle)
@@ -1013,10 +1098,10 @@ class McpServeTests(unittest.TestCase):
             try:
                 first = initialize()
                 second = initialize()
-                self.assertIn("version 0.4.0 is available", first)
-                self.assertIn(mcp_server.release_discovery.RELEASE_URL + "0.4.0", first)
+                self.assertIn("version %s is available" % offer_version, first)
+                self.assertIn(mcp_server.release_discovery.RELEASE_URL + offer_version, first)
                 self.assertNotIn("UNTRUSTED RELEASE NOTES", first)
-                self.assertNotIn("version 0.4.0 is available", second)
+                self.assertNotIn("version %s is available" % offer_version, second)
                 self.assertEqual(proxy.calls, [])
                 with open(cache_file, "w", encoding="utf-8") as handle:
                     handle.write("not json")
@@ -1111,23 +1196,28 @@ class McpServeTests(unittest.TestCase):
         self.assertTrue(any(m.get("id") == 1 for m in output_stream.parsed()))
 
     def test_executable_entry_point_serves_stdio(self):
-        proc = subprocess.Popen([PYTHON, MCP_SERVER], cwd=ROOT,
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            request = {"jsonrpc": "2.0", "id": 7, "method": "initialize",
-                       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                                  "clientInfo": {"name": "fake", "version": "1"}}}
-            proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
-            proc.stdin.flush()
-            response = json.loads(proc.stdout.readline())
-            self.assertEqual(response["id"], 7)
-            self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
-        finally:
-            proc.terminate()
-            proc.wait(timeout=5)
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                if stream is not None:
-                    stream.close()
+        # The real initialize reads the notice cache, so the subprocess gets a private
+        # one instead of inheriting the developer's cache through the environment.
+        with tempfile.TemporaryDirectory() as cache_home:
+            proc = subprocess.Popen([PYTHON, MCP_SERVER], cwd=ROOT,
+                                    env={**os.environ, "XDG_CACHE_HOME": cache_home},
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            try:
+                request = {"jsonrpc": "2.0", "id": 7, "method": "initialize",
+                           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": "fake", "version": "1"}}}
+                proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+                proc.stdin.flush()
+                response = json.loads(proc.stdout.readline())
+                self.assertEqual(response["id"], 7)
+                self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
+            finally:
+                proc.terminate()
+                proc.wait(timeout=5)
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
 
 
 if __name__ == "__main__":
