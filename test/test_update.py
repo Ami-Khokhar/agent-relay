@@ -612,14 +612,16 @@ exit 0
 
             result = self._install(env)
             self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(os.path.exists(
+                os.path.join(ROOT, "skills", "agent-relay", "scripts",
+                             "setup.sh")))
             self.assertIn("release_discovery.py not found", result.stderr)
-            self.assertIn("rerun scripts/setup.sh", result.stderr)
+            self.assertIn("bash skills/agent-relay/scripts/setup.sh", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
             self.assertFalse(os.path.exists(
                 os.path.join(agents, "com.agent-relay.update.plist")))
             self.assertFalse(os.path.exists(
-                os.path.join(tmp, "Library", "Logs", "agent-relay",
-                             "update.log")))
+                os.path.join(tmp, ".local", "state", "agent-relay")))
             calls = "".join(self._take_log(tmp))
             self.assertNotIn("load", calls)
             self.assertNotIn("enable", calls)
@@ -633,12 +635,18 @@ exit 0
 
             result = self._install(env)
             self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(os.path.exists(
+                os.path.join(ROOT, "skills", "agent-relay", "scripts",
+                             "setup.sh")))
             self.assertIn("release_discovery.py not found", result.stderr)
-            self.assertIn("rerun scripts/setup.sh", result.stderr)
+            self.assertIn("bash skills/agent-relay/scripts/setup.sh", result.stderr)
+            self.assertIn("--no-update-timer", result.stderr)
             self.assertFalse(os.path.exists(
                 os.path.join(units, "agent-relay-update.timer")))
             self.assertFalse(os.path.exists(
                 os.path.join(units, "agent-relay-update.service")))
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, ".local", "state", "agent-relay")))
             calls = "".join(self._take_log(tmp))
             self.assertNotIn("enable", calls)
             self.assertNotIn("daemon-reload", calls)
