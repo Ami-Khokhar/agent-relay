@@ -8,7 +8,11 @@
   "test_command": "python3 -m unittest discover -s test -p 'test_*.py'",
   "protected_paths": [
     ".github/",
-    "AGENTS.md"
+    ".env",
+    ".env.local",
+    "secrets/",
+    ".claude/settings.json",
+    ".codex/config.toml"
   ],
   "max_changed_lines": 600,
   "max_changed_files": 20,
