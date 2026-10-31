@@ -526,6 +526,59 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["status"], "completed")
         self.assertEqual(steps_of(workflow)["fix"]["status"], "completed")
 
+    def test_one_foreach_item_matching_the_fail_pattern_fails_the_step_and_skips_its_dependent(self):
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "fan", "agentId": "echo", "foreach": ["BLOCKED: x", "ok"],
+             "input": "{{item}}", "failIfOutputMatches": "^BLOCKED"},
+            {"id": "collect", "agentId": "echo", "needs": ["fan"], "input": "collect it"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["fan"]["status"], "failed")
+        self.assertEqual(finished["fan"]["error"], "output_matched_fail_pattern")
+        self.assertEqual(json.loads(finished["fan"]["output"]), ["BLOCKED: x", "ok"])
+        self.assertEqual(finished["collect"]["status"], "skipped")
+        self.assertEqual(finished["collect"]["error"], "dependency_not_completed")
+        self.assertEqual(finished["collect"]["taskIds"], [])
+
+    def test_the_fail_pattern_is_tested_against_each_item_and_never_against_the_array(self):
+        # The aggregate is a JSON array, so an anchored bracket pattern must not fail a
+        # fan-out whose serialization merely starts with "[", while the same pattern still
+        # fails when an actual item begins with one.
+        relay = self.start(echo())
+        plain = run(relay, {"steps": [
+            {"id": "fan", "agentId": "echo", "foreach": ["plain", "text"],
+             "input": "{{item}}", "failIfOutputMatches": r"^\["},
+        ]})
+        self.assertEqual(plain["status"], "completed")
+        self.assertEqual(steps_of(plain)["fan"]["status"], "completed")
+
+        bracketed = run(relay, {"steps": [
+            {"id": "fan", "agentId": "echo", "foreach": ["[bad", "fine"],
+             "input": "{{item}}", "failIfOutputMatches": r"^\["},
+        ]})
+        self.assertEqual(bracketed["status"], "failed")
+        self.assertEqual(steps_of(bracketed)["fan"]["status"], "failed")
+        self.assertEqual(steps_of(bracketed)["fan"]["error"], "output_matched_fail_pattern")
+
+    def test_a_foreach_step_with_no_matching_item_still_feeds_json_array_output_to_its_dependent(self):
+        """Guard: a nonmatching foreach step completes with its array in item order."""
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "fan", "agentId": "echo", "foreach": ["two", "one"],
+             "input": "{{item}}", "failIfOutputMatches": "^BLOCKED"},
+            {"id": "collect", "agentId": "echo", "needs": ["fan"],
+             "input": "collected={{fan.output}}"},
+        ]})
+        self.assertEqual(workflow["status"], "completed")
+        finished = steps_of(workflow)
+        self.assertEqual(finished["fan"]["status"], "completed")
+        self.assertEqual(json.loads(finished["fan"]["output"]), ["two", "one"])
+        self.assertEqual(len(finished["fan"]["taskIds"]), 2)
+        self.assertEqual(finished["collect"]["status"], "completed")
+        self.assertEqual(finished["collect"]["output"], 'collected=["two", "one"]')
+
     # ------------------------------------------------------------------- control
 
     def test_cancel_stops_the_run_and_its_running_children(self):
