@@ -50,6 +50,11 @@ bash scripts/install-service.sh --no-update-timer   # the service only, no sched
 bash scripts/install-service.sh --uninstall
 ```
 
+The default install schedules a release check that runs the checkout's
+`src/release_discovery.py`, so a checkout missing that file is rejected before
+anything is created or scheduled; rerun `bash scripts/setup.sh` to refresh the
+checkout, or pass `--no-update-timer` to install the service only.
+
 A service does not inherit your login shell `PATH`. The installer writes a `PATH` that includes `~/.local/bin`, `~/bin`, `/opt/homebrew/bin`, and `/usr/local/bin` so agent CLIs resolve; override with `AGENT_RELAY_PATH`.
 
 ## Check for a release
