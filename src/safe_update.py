@@ -2,10 +2,14 @@
 """Safe update CLI: inspect a published release and record device-local consent.
 
 This is the first consumer of ``release_identity``. ``inspect`` resolves and
-validates a stable release identity (metadata only) and ``approve`` adds an
-interactive, private, 15-minute device-local consent record. Nothing is
-installed, activated or executed by these commands; later stages will extend
-the same CLI to consume the consent for activation.
+validates a stable release identity (metadata only), ``approve`` adds an
+interactive, private, 15-minute device-local consent record, and ``stage``
+builds an isolated private repository holding the exact approved commit —
+only for a positively identified clean canonical source checkout, only
+while the recorded consent is still valid, and never by executing any
+staged content. Nothing is installed or activated by any of these
+commands; later stages will extend the same CLI to consume the verified
+stage.
 """
 
 import argparse
@@ -21,6 +25,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, build_opener
 
 import release_identity
+import update_staging
 from release_identity import UpdateError
 
 STATE_LABEL = "release update consent"
@@ -123,6 +128,18 @@ def cmd_approve(tag):
     return 0
 
 
+def cmd_stage(tag, install_dir):
+    identity, manifest, manifest_bytes = release_identity.resolve_release(tag, fetch_json=_fetch)
+    receipt = update_staging.stage_release(
+        identity, root=install_dir, state_dir=_state_dir(), git=update_staging.default_git(),
+        manifest=manifest, manifest_bytes=manifest_bytes, now=time.time())
+    print("Staged release %s (commit %s) in the isolated repository at\n  %s\n"
+          "The stage was verified against the release manifest; nothing was installed\n"
+          "or executed, and the active checkout was not changed." %
+          (identity["tag"], identity["commit"], receipt["stage"]))
+    return 0
+
+
 def cmd_consume(tag):
     identity, _manifest = _resolve(tag)
     consent = release_identity.consume_consent(identity, state_dir=_state_dir(), now=time.time())
@@ -141,9 +158,18 @@ def main(argv=None):
     ):
         sub = subcommands.add_parser(name, help=help_text)
         sub.add_argument("tag", help="exact release tag to %s, e.g. 1.2.3" % name)
+    stage = subcommands.add_parser(
+        "stage", help="build a verified, isolated stage of an approved release; "
+                      "installs nothing and executes nothing")
+    stage.add_argument("tag", help="exact release tag to stage, e.g. 1.2.3")
+    stage.add_argument("--install-dir", required=True,
+                       help="this installation's checkout directory that approval was "
+                            "recorded for; it is inspected and never written")
     args = parser.parse_args(argv)
     handlers = {"inspect": cmd_inspect, "approve": cmd_approve, "consume": cmd_consume}
     try:
+        if args.command == "stage":
+            return cmd_stage(args.tag, args.install_dir)
         return handlers[args.command](args.tag)
     except UpdateError as exc:
         print("error: %s" % exc, file=sys.stderr)
