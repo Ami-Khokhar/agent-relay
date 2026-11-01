@@ -382,7 +382,7 @@ class WorkflowEngine:
 
     def __init__(self, *, lock, condition, create_task, get_task, cancel_task, drain,
                  agents, resolve_cwd, state_dir, max_steps, max_workflows, max_foreach,
-                 max_body,
+                 max_body, drain_refusal=None,
                  max_command_input, max_timeout_ms, now):
         self._lock = lock
         self._condition = condition
@@ -390,6 +390,9 @@ class WorkflowEngine:
         self._get_task = get_task
         self._cancel_task = cancel_task
         self._drain = drain
+        # Asked under the lock on the create path only, so a held shared-lock
+        # drain blocks new runs and resumes atomically and never a replay.
+        self._drain_refusal = drain_refusal
         self._agents = agents
         self._resolve_cwd = resolve_cwd
         self._state_dir = Path(state_dir)
@@ -444,6 +447,12 @@ class WorkflowEngine:
                     if prior["_requested_spec"] != normalized:
                         return 409, {"error": "idempotency_conflict"}
                     return 200, self._public(prior, detail=False)
+            # The shared-lock drain closes admission entirely, starting with
+            # new runs: asked here, under the lock, so the refusal and the
+            # registration of a new run cannot interleave with an acquire.
+            refused_by_drain = self._drain_refusal() if self._drain_refusal else None
+            if refused_by_drain:
+                return refused_by_drain
             if refused:
                 return 503, refused
             if not self._make_room():
@@ -524,6 +533,15 @@ class WorkflowEngine:
             return [workflow_id for workflow_id, workflow in self._workflows.items()
                     if workflow["status"] not in WORKFLOW_TERMINAL]
 
+    def active_count(self):
+        """How many runs have not reached a terminal state: the drain's own count
+        of nonterminal workflows. Runs in a gap, a retry delay or mid fanout all
+        count, whatever their child tasks' states, because a held drain must
+        wait for an idle run that may still create tasks."""
+        with self._lock:
+            return sum(1 for workflow in self._workflows.values()
+                       if workflow["status"] not in WORKFLOW_TERMINAL)
+
     def kill_all(self, reason):
         """Stop every active run, keeping each journal so it can be resumed. Returns the ids.
 
@@ -555,6 +573,11 @@ class WorkflowEngine:
             if prior is not None and prior["status"] not in WORKFLOW_TERMINAL:
                 return 409, {"error": "workflow_active",
                              "message": "The workflow is still running; cancel it before resuming"}
+            # A resume creates a live run, so a held drain refuses it exactly
+            # like a new submission, under this same lock.
+            refused = self._drain_refusal() if self._drain_refusal else None
+            if refused:
+                return refused
             workflow = self._new_workflow(saved["spec"], None, workflow_id=workflow_id)
             for step in workflow["steps"]:
                 done = saved["outputs"].get(step["id"])
