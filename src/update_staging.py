@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from stat import S_ISDIR, S_ISREG, S_IMODE
 
 import release_identity
@@ -238,13 +238,26 @@ def inspect_checkout(root, *, git):
 
 
 def _walk_regular_files(resolved):
-    """Every regular file below the stage, refusing symlinks and special files,
-    modes that could carry setuid/setgid/sticky bits, and group/world writes."""
+    """Every regular file and real directory below the stage, refusing symlinks
+    and special files, modes that could carry setuid/setgid/sticky bits, and
+    group/world writes. Entries of ``dirnames`` are classified by os.walk with
+    the symlink followed (entry.is_dir() follows links), so a directory symlink
+    is pruned here with its own lstat: without it, everything reachable through
+    such a link would be invisible to the manifest comparison."""
     seen = {}
+    walked_dirs = set()
     for dirpath, dirnames, filenames in os.walk(str(resolved), followlinks=False):
         current = Path(dirpath)
+        if current != resolved:
+            walked_dirs.add(current.relative_to(resolved).as_posix())
         if current == resolved and ".git" in dirnames:
             dirnames.remove(".git")  # .git is metadata, not manifest content
+        for name in dirnames:
+            info = os.lstat(str(current / name))
+            if not S_ISDIR(info.st_mode):
+                raise StagingError("staged %s is not a real directory; refusing symlinks "
+                                   "and special files" % os.path.join(
+                                       current.relative_to(resolved).as_posix(), name))
         for name in filenames:
             if name == STAGE_RECEIPT_NAME and current == resolved:
                 continue  # the receipt is the stage's own identity record
@@ -258,7 +271,7 @@ def _walk_regular_files(resolved):
                 raise StagingError("staged %s has an unsafe file mode (%o)"
                                    % (relative, info.st_mode))
             seen[relative] = candidate
-    return seen
+    return seen, walked_dirs
 
 
 def _hash_file(path):
@@ -332,8 +345,18 @@ def verify_stage(stage, identity, *, git=None, manifest=None):
     release_identity.validate_manifest(manifest, identity)
     inventory = sorted((entry["path"], entry["mode"], entry["sha256"])
                        for entry in manifest["files"])
-    staged = _walk_regular_files(resolved)
+    staged, staged_dirs = _walk_regular_files(resolved)
     manifest_paths = {entry[0] for entry in inventory}
+    manifest_dirs = set()
+    for path in manifest_paths:
+        parent = PurePosixPath(path).parent
+        while str(parent) != ".":
+            manifest_dirs.add(parent.as_posix())
+            parent = parent.parent
+    extra_dirs = sorted(staged_dirs - manifest_dirs)
+    if extra_dirs:
+        raise StagingError("stage contains directories the manifest cannot describe: %s"
+                           % ", ".join(extra_dirs[:8]))
     extra = sorted(set(staged) - manifest_paths)
     missing = sorted(manifest_paths - set(staged))
     if extra:

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -364,6 +365,26 @@ class StagingTest(_Case):
             update_staging.verify_stage(stage, fixture.identity())
         self.assertIn("regular file", str(caught.exception))
         os.remove(str(stage / "linked"))
+        other_dir = self.scratch / "linked-dir-target"
+        other_dir.mkdir()
+        os.symlink(str(other_dir), str(stage / "linked-dir"))
+        with self.assertRaises(update_staging.StagingError) as caught:
+            update_staging.verify_stage(stage, fixture.identity())
+        self.assertIn("real directory", str(caught.exception))
+        os.remove(str(stage / "linked-dir"))
+        (stage / "smuggled").mkdir()
+        (stage / "smuggled" / "payload.txt").write_text("extra tree\n")
+        with self.assertRaises(update_staging.StagingError) as caught:
+            update_staging.verify_stage(stage, fixture.identity())
+        # the smuggled tree is refused either as an unmanifested directory or as
+        # extra files, depending on which check sees it first
+        self.assertIn("smuggled", str(caught.exception))
+        shutil.rmtree(str(stage / "smuggled"))
+        (stage / "empty-extra").mkdir()
+        with self.assertRaises(update_staging.StagingError) as caught:
+            update_staging.verify_stage(stage, fixture.identity())
+        self.assertIn("directories the manifest cannot describe", str(caught.exception))
+        (stage / "empty-extra").rmdir()
         evil = dict(fixture.manifest, files=[
             {"path": "../outside.txt", "mode": "100644", "sha256": "0" * 64}])
         with self.assertRaises(identity.UpdateError):
