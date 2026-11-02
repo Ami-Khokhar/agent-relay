@@ -395,10 +395,9 @@ def _check_read_only(agent_id, agent_type, profile):
 
 
 def _role_instructions(role_id, spec, base_dir):
-    """Read one role's instructions from ``prompt`` or from its ``promptFile``. Raises ValueError.
+    """Read one role's instructions from ``prompt`` or ``promptFile``. Raises ValueError.
 
-    A relative ``promptFile`` is resolved against the registry file, so a registry and the prompts
-    it names move together.
+    A relative ``promptFile`` resolves against the registry file, so both move together.
     """
     prompt, prompt_file = spec.get("prompt"), spec.get("promptFile")
     if (prompt is None) == (prompt_file is None):
@@ -422,8 +421,7 @@ def _role_instructions(role_id, spec, base_dir):
 def _load_roles(config, base_dir):
     """Resolve the registry's top-level ``roles`` map into ``role id -> role``. Raises ValueError.
 
-    Instructions are read once per load, so a reload is the only way they change, and every
-    problem names the role. The prompt text stays in the entry's private ``_role`` field: it is
+    Instructions are read once per load, and stay in the entry's private ``_role`` field: they are
     never part of a task record or of the agent listing.
     """
     raw = config.get("roles")
@@ -458,6 +456,13 @@ def _load_roles(config, base_dir):
         header = spec.get("inputHeader")
         if header is not None and (not isinstance(header, str) or not header.strip()):
             raise ValueError(f"Invalid role {role_id}: inputHeader must be a non-empty string")
+        if header is not None and delivery == "adapter":
+            # The header sits between the instructions and the input, which only the relay's own
+            # composition has a place for: adapter delivery leaves the input untouched, so a header
+            # here would be silently dropped.
+            raise ValueError(f"Invalid role {role_id}: inputHeader needs \"delivery\": "
+                             "\"prepend\", because adapter delivery sends the instructions "
+                             "without touching the input")
         roles[role_id] = {"id": role_id, "description": description.strip(),
                           "instructions": instructions, "delivery": delivery,
                           "inputHeader": header.strip() if header else None}
@@ -595,11 +600,10 @@ def task_environment(agent, task):
 def adapter_request(task, agent=None):
     """The relay.adapter/v1 document for one task.
 
-    ``input`` is what the agent should work on: a role that prepends its instructions is already
-    composed into it. A role that asks for adapter delivery is sent as its own ``role`` field, so
-    a wrapper can pass it to the harness as a system prompt; an adapter that ignores it still gets
-    the task. The field is absent whenever no role is in force, so the document is unchanged for
-    every registry that declares none.
+    ``input`` is what the agent should work on, with a prepending role's instructions already
+    composed into it. A ``delivery: adapter`` role travels as its own ``role`` field, which an
+    adapter may pass to the harness as a system prompt or ignore; no role in force means no field,
+    so a registry without roles produces the same document as before.
     """
     document = {
         "protocolVersion": ADAPTER_PROTOCOL,
@@ -967,7 +971,7 @@ def active_role(agent):
 def _composed_input(agent, text):
     """The task text as the agent receives it: the role's instructions, then the caller's input.
 
-    A role with ``delivery: adapter`` travels as its own field instead, so nothing is composed.
+    A ``delivery: adapter`` role travels as its own field instead, so nothing is composed here.
     """
     role = active_role(agent)
     if role is None or role["delivery"] != "prepend":
@@ -979,9 +983,8 @@ def _composed_input(agent, text):
 def _role_overflow(agent, task_input):
     """Why a command agent's composed input does not fit on its command line, or None.
 
-    A command agent gets the text as its last argument, so a role's instructions and the caller's
-    input share one budget. The check runs at submission and again at dispatch, because the
-    registry may be reloaded with longer instructions while a task waits.
+    The instructions and the caller's input share the last argument, so they share its budget. This
+    runs at submission and again at dispatch, where a reload may have made the instructions longer.
     """
     if agent["type"] != "command" or active_role(agent) is None:
         return None
@@ -990,18 +993,15 @@ def _role_overflow(agent, task_input):
     if size <= MAX_COMMAND_INPUT:
         return None
     return ("role_input_too_large",
-            f"agent {agent['id']} carries role {active_role(agent)['id']} and takes its input as a "
-            f"command-line argument: the instructions and this input need {size} bytes, over "
-            f"AGENT_RELAY_MAX_COMMAND_INPUT_BYTES ({MAX_COMMAND_INPUT}); the instructions alone "
-            f"take {prompt_size}")
+            f"agent {agent['id']} carries role {active_role(agent)['id']} and takes its input on its "
+            f"command line: {prompt_size} bytes of instructions plus this input need {size} bytes, "
+            f"over AGENT_RELAY_MAX_COMMAND_INPUT_BYTES ({MAX_COMMAND_INPUT})")
 
 
 def _role_sha(agent):
     """The first 12 hex characters of the instructions in force, so a caller can tell them apart."""
     role = active_role(agent)
-    if role is None:
-        return None
-    return hashlib.sha256(role["instructions"].encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(role["instructions"].encode("utf-8")).hexdigest()[:12] if role else None
 
 
 def _run_command(agent, task):
@@ -1258,6 +1258,10 @@ def _drain():
                 _finish(task, "failed", error=f"{error[0]}: {error[1]}")
                 continue
             task["_extra_args"], task["_sandbox"] = extra_args, sandbox
+            # The record names what runs: a reload may have replaced the instructions since submission.
+            role = active_role(agent)
+            if role is not None:
+                task["role"], task["rolePromptSha256"] = role["id"], _role_sha(agent)
             ACTIVE += 1
             task["_counted"] = True
             task["_adapter"] = agent["type"]
@@ -1425,10 +1429,10 @@ def _cwd_required(agent, task_cwd):
 def _input_refusal(agent, task_input):
     """Why a read-only task's input may not go on the command line as it is, or None.
 
-    ``agent`` has a readOnly profile. A command agent gets the input as its last argument, after the
-    profile's args and with nothing between them. An input that starts with "-" is then an option, and
-    with most parsers the last one wins: input "--access=write" would undo the profile's
-    "--access=read". So the profile must say how the input is separated: with an ``inputSeparator``
+    ``agent`` has a readOnly profile. A command agent gets the text as its last argument, after the
+    profile's args and with nothing between them, so a prepending role already puts its instructions
+    in front of the caller's words and this check sees that. An input that starts with "-" is then an
+    option, and with most parsers the last one wins: "--access=write" would undo "--access=read". So the profile must say how the input is separated: with an ``inputSeparator``
     (for example "--") the relay puts it before the input and any input is data; without one, an
     input that starts with "-" is refused. A stdio agent gets its input on stdin, so nothing is
     refused. A profile without args has no argument for the input to override: the sandbox is its
@@ -1471,7 +1475,7 @@ def _dispatch_plan(agent, task):
     refusal = _cwd_required(agent, task.get("cwd"))
     if refusal:
         return None, False, ("cwd_required", refusal)
-    refusal = _input_refusal(agent, task["input"])
+    refusal = _input_refusal(agent, _composed_input(agent, task["input"]))
     if refusal:
         return None, False, ("invalid_input", refusal)
     profile = agent["readOnly"]
@@ -1847,7 +1851,7 @@ def _create_task(request, _internal=False):
     no_cwd = _cwd_required(agent, task_cwd) if read_only else None
     if no_cwd:
         return 400, {"error": "cwd_required", "message": no_cwd}
-    bad_input = _input_refusal(agent, input_text) if read_only else None
+    bad_input = _input_refusal(agent, _composed_input(agent, input_text)) if read_only else None
     if bad_input:
         return 400, {"error": "invalid_input", "message": bad_input}
     if agent["type"] == "command" and len(input_text.encode("utf-8")) > MAX_COMMAND_INPUT:

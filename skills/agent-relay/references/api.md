@@ -85,7 +85,8 @@ Unknown fields are rejected with `400 unknown_field`. Returns `202` with the tas
 ```json
 { "id": "uuid", "sessionId": "uuid", "agentId": "claude", "inputChars": 42,
   "status": "queued", "createdAt": "ISO-8601", "timeoutMs": 900000,
-  "cwd": "/path/to/project", "requestId": "..." }
+  "cwd": "/path/to/project", "requestId": "...", "role": "reviewer",
+  "rolePromptSha256": "24ec5ae71354" }
 ```
 
 Task objects never echo `input`: they carry `inputChars` (its length in characters). Only
@@ -392,6 +393,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `cwd` | if set | Effective working directory for the task. |
 | `options` | if supplied | The option values the task chose, for example `{"effort": "high"}`. |
 | `readOnly` | if `true` | The task was submitted as read-only. |
+| `role` | if the agent carries a role | Role id of the entry that runs the task. |
+| `rolePromptSha256` | if the agent carries a role | First 12 hex characters of the instructions' SHA-256, refreshed at dispatch; the prompt text is never echoed. |
 | `requestId` | if supplied | Echoed idempotency key. |
 | `parentTaskId` | delegated tasks | Task that delegated this one. |
 | `depth` | always | `0` for a root task, parent depth + 1 when delegated. |

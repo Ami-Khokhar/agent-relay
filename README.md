@@ -202,31 +202,27 @@ A worker is a harness plus the arguments that choose its model and effort. A **r
 ```json
 {
   "roles": {
-    "reviewer": {
-      "description": "Reviews a change against the intent that was stated; never edits.",
-      "promptFile": "../prompts/roles/reviewer.md",
-      "inputHeader": "Review this work:"
-    },
+    "reviewer": { "description": "Reviews a change against the stated intent; never edits.",
+                  "promptFile": "prompts/roles/reviewer.md", "inputHeader": "Review this work:" },
     "implementer": { "description": "Implements the change and proves it.",
                      "prompt": "You implement the change and prove it with a real check." }
   },
   "agents": [
     { "id": "pi-reviewer", "command": "pi", "args": ["--print"], "cwd": "/path/to/project", "role": "reviewer" },
-    { "id": "pi-reviewer-fast", "command": "pi", "args": ["--print", "--model", "glm-5.3-flash"], "cwd": "/path/to/project", "role": "reviewer" },
     { "id": "pi-implementer", "command": "pi", "args": ["--print", "--model", "deepseek-v4.1-flash"], "cwd": "/path/to/project", "role": "implementer" }
   ]
 }
 ```
 
 - `description` is required. `GET /v1/agents` shows it as `roleDescription`, next to `role`, so an orchestrating agent chooses a worker by the job it does instead of remembering which id means "reviewer".
-- `promptFile` (a path, relative to the registry file or absolute) or `prompt` (inline text) supplies the instructions: set exactly one. The relay reads them once per load, so a reload is the only way they change.
-- `inputHeader` (optional) is a line the relay puts between the instructions and the caller's input.
+- `promptFile` (a path) or `prompt` (inline text) supplies the instructions: set exactly one. A relative `promptFile` is resolved against the directory of the registry file that names it, never against the relay's working directory, so a registry and its prompts move together: `prompts/roles/reviewer.md` means a file beside your `agents.json`. The checkout ships a starting copy at `prompts/roles/reviewer.md` — copy it beside your registry, or give an absolute path. The relay reads the instructions once per load, so a reload is the only way they change.
+- `inputHeader` (optional) is a line the relay puts between the instructions and the caller's input. It only applies to `prepend` delivery, so it is a registry error with `adapter`.
 - `delivery` is `prepend` (the default) or `adapter`. `prepend` puts the instructions in front of the task text in the one place the agent receives it: the last `command` argument, or `task.input` in a `stdio`/`http` request. `adapter` sends them as their own `role` field in the `relay.adapter/v1` request (see [the adapter contract](#register-an-agent)), so a wrapper can use the harness's real system prompt; it needs an adapter that reads a document, so it is a registry error on a `command` agent.
-- The role changes instructions, not model choice: its `args` still decide the model and effort. A role is a property of the worker, not of the task, so there is no request field for it — a caller cannot reshape another owner's worker, and `POST /v1/tasks` gains nothing.
-- The task record carries `role` and `rolePromptSha256` (the first 12 hex characters of the instructions in force when the task was accepted), never the prompt text, and `inputChars` still counts only the caller's input.
-- A queued task runs with the instructions of the entry that dispatches it, as with `options`: a reload changes the next task, and a reload that removed the role fails the waiting task before it starts.
+- The role changes instructions, not model choice: its `args` still decide the model and effort. It is a property of the worker, not of the task, so `POST /v1/tasks` gains no field and a caller cannot reshape another owner's worker.
+- The task record carries `role` and `rolePromptSha256` (the first 12 hex characters of the instructions that run the task), never the prompt text, and `inputChars` still counts only the caller's input. Both are refreshed at dispatch, so after a reload they describe the entry that actually ran the task, not the one that accepted it.
+- A queued task runs with the instructions of the entry that dispatches it, as with `options`: a reload replaces the instructions of a waiting task too, and a reload that removed the role fails the waiting task before it starts.
 - A `command` agent takes its input as its last argument, so the instructions and the input share the `AGENT_RELAY_MAX_COMMAND_INPUT_BYTES` budget (64 KiB). A task that would not fit is refused at submission with `413 role_input_too_large` and no task is created; a task whose instructions grew while it waited fails at dispatch with the same code rather than starting. `stdio` and `http` agents read a document and have no such limit.
-- Role problems are registry errors, so the relay refuses to start or rejects the reload and keeps the running registry: a missing or empty description, both `prompt` and `promptFile` or neither, a file that cannot be read or is not UTF-8, empty instructions, instructions over `AGENT_RELAY_MAX_ROLE_PROMPT_BYTES` (default 32768, also in `GET /healthz` `limits`), an unknown field, a `delivery` that is neither value, `adapter` delivery on a `command` agent, and an agent naming a role the registry does not define.
+- Role problems are registry errors, so the relay refuses to start or rejects the reload and keeps the running registry: a missing or empty description, both `prompt` and `promptFile` or neither, a file that cannot be read or is not UTF-8, empty instructions, instructions over `AGENT_RELAY_MAX_ROLE_PROMPT_BYTES` (default 32768, also in `GET /healthz` `limits`), an unknown field, `inputHeader` with `adapter` delivery, a `delivery` that is neither value, `adapter` delivery on a `command` agent, and an agent naming a role the registry does not define.
 
 ### Read-only tasks
 

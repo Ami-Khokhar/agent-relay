@@ -61,8 +61,7 @@ class Relay:
     def __init__(self, agent, env=None, server=SERVER, files=None):
         self.dir = tempfile.mkdtemp(prefix="a2a-relay-")
         self.config = os.path.join(self.dir, "agents.json")
-        # A role's promptFile is resolved against the registry's directory, so a test that wants a
-        # relative one writes it here first.
+        # A role's promptFile resolves against the registry's directory, so write it here first.
         for name, text in (files or {}).items():
             path = os.path.join(self.dir, name)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -100,8 +99,8 @@ class Relay:
             raise
 
     def write_registry(self, config):
-        """Write the registry file. A dict with an ``agents`` key is written as it is, so a test can
-        declare top-level keys such as ``roles``; otherwise it is one agent or a list of them."""
+        """Write the registry. A dict with an ``agents`` key is used as it is, so a test can declare
+        top-level keys such as ``roles``; otherwise it is one agent or a list of them."""
         if isinstance(config, dict) and "agents" in config:
             document = config
         else:

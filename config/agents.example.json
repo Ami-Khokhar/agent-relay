@@ -2,12 +2,12 @@
   "roles": {
     "reviewer": {
       "description": "Reviews a change against the intent that was stated and reports defects; never edits.",
-      "promptFile": "../prompts/roles/reviewer.md",
+      "prompt": "You are the reviewer. Check the change against the intent that was stated, report each defect with its file and line, and do not edit files.",
       "inputHeader": "Review this work:"
     },
     "implementer": {
       "description": "Implements the stated change and proves it with a real check.",
-      "promptFile": "../prompts/roles/implementer.md"
+      "prompt": "You are the implementer. Make the smallest change that satisfies the task and report the real check you ran, not that it passes."
     }
   },
   "agents": [

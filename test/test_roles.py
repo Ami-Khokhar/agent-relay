@@ -11,26 +11,21 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-from relay_helpers import PRINT_ARGV, PYTHON, send_json, start_http_server, stop_http_server, Relay
+from relay_helpers import PRINT_ARGV, PYTHON, Relay, send_json, start_http_server, stop_http_server
 import server
-
-# A stdio adapter that answers with the relay.adapter/v1 document it received, so a test can read
-# exactly what reached the adapter.
-STDIO_ECHO = (
-    "import json, sys\n"
-    "doc = json.load(sys.stdin)\n"
-    "print(json.dumps({'protocolVersion': 'relay.adapter/v1', 'status': 'completed',\n"
-    "                  'output': json.dumps(doc)}))\n"
-)
 
 REVIEWER = "You review the change against the intent that was stated.\nReport defects only."
 IMPLEMENTER = "You implement the change and prove it."
 ROLES = {
     "reviewer": {"description": "Reviews a diff; never edits.",
                  "prompt": REVIEWER, "inputHeader": "Review this work:"},
-    "implementer": {"description": "Implements the change.",
-                    "prompt": IMPLEMENTER},
+    "implementer": {"description": "Implements the change.", "prompt": IMPLEMENTER},
 }
+# A stdio adapter that answers with the relay.adapter/v1 document it received.
+STDIO_ECHO = ("import json, sys\n"
+              "doc = json.load(sys.stdin)\n"
+              "print(json.dumps({'protocolVersion': 'relay.adapter/v1', 'status': 'completed',\n"
+              "                  'output': json.dumps(doc)}))\n")
 EXAMPLE_REGISTRY = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "agents.example.json")
 
@@ -38,6 +33,11 @@ EXAMPLE_REGISTRY = os.path.join(
 def fake(**extra):
     """A command agent that prints the arguments it received."""
     return {"id": "fake", "command": PYTHON, "args": [*PRINT_ARGV], **extra}
+
+
+def slow():
+    """A command agent that holds its slot long enough for a second task to stay queued."""
+    return {"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(3)"]}
 
 
 def registry(agents, roles=ROLES, **top):
@@ -49,8 +49,9 @@ def sha(text):
 
 
 class RolesTests(unittest.TestCase):
-    def start(self, agents, roles=ROLES):
-        relay = Relay(registry(agents, roles))
+    def start(self, agents, roles=ROLES, env=None):
+        full = isinstance(agents, dict) and "agents" in agents
+        relay = Relay(agents if full else registry(agents, roles), env=env)
         self.addCleanup(relay.close)
         return relay
 
@@ -59,16 +60,12 @@ class RolesTests(unittest.TestCase):
         self.assertEqual(task["status"], "completed", task)
         return json.loads(task["output"])
 
-    def test_a_command_worker_receives_its_role_instructions_then_the_input(self):
-        relay = self.start(fake(role="reviewer"))
-        argv = self.argv_of(relay, input="check the diff")
-        self.assertEqual(argv, [f"{REVIEWER}\n\nReview this work:\n\ncheck the diff"])
-
-    def test_the_task_names_the_role_and_the_instructions_digest_but_not_the_prompt(self):
+    def test_a_command_worker_receives_the_instructions_and_the_record_names_them(self):
         relay = self.start(fake(role="reviewer"))
         task = relay.run_task(agentId="fake", input="check the diff")
-        self.assertEqual(task["role"], "reviewer")
-        self.assertEqual(task["rolePromptSha256"], sha(REVIEWER))
+        self.assertEqual(json.loads(task["output"]),
+                         [f"{REVIEWER}\n\nReview this work:\n\ncheck the diff"])
+        self.assertEqual((task["role"], task["rolePromptSha256"]), ("reviewer", sha(REVIEWER)))
         self.assertEqual(task["inputChars"], len("check the diff"))
         self.assertNotIn(REVIEWER, json.dumps(task))
 
@@ -80,47 +77,41 @@ class RolesTests(unittest.TestCase):
         self.assertNotIn("rolePromptSha256", task)
 
     def test_the_listing_shows_the_role_so_a_caller_can_choose_by_role(self):
-        relay = self.start([fake(role="reviewer"), {"id": "other", "command": PYTHON,
-                                                    "args": PRINT_ARGV}])
+        relay = self.start([fake(role="reviewer"),
+                            {"id": "other", "command": PYTHON, "args": PRINT_ARGV}])
         _, payload = relay.request("GET", "/v1/agents")
         by_id = {entry["id"]: entry for entry in payload["agents"]}
         self.assertEqual(by_id["fake"]["role"], "reviewer")
         self.assertEqual(by_id["fake"]["roleDescription"], "Reviews a diff; never edits.")
         self.assertNotIn("role", by_id["other"])
         self.assertNotIn(REVIEWER, json.dumps(payload))
+        self.assertEqual(relay.request("GET", "/healthz")[1]["limits"]["maxRolePromptBytes"],
+                         server.MAX_ROLE_PROMPT)
 
-    def test_healthz_reports_the_role_prompt_limit(self):
-        relay = self.start(fake(role="reviewer"))
-        _, payload = relay.request("GET", "/healthz")
-        self.assertEqual(payload["limits"]["maxRolePromptBytes"], server.MAX_ROLE_PROMPT)
-
-    def test_an_input_that_no_longer_fits_with_the_instructions_is_refused_before_it_runs(self):
-        relay = self.start(fake(role="reviewer"))
-        room = server.MAX_COMMAND_INPUT - len(f"{REVIEWER}\n\nReview this work:\n\n".encode())
-        status, payload = relay.submit(agentId="fake", input="x" * (room + 1))
+    def test_the_command_line_budget_counts_the_instructions(self):
+        relay = self.start([fake(role="reviewer")],
+                           {"reviewer": {"description": "d", "prompt": "r" * 200}},
+                           env={"AGENT_RELAY_MAX_COMMAND_INPUT_BYTES": "400"})
+        status, payload = relay.submit(agentId="fake", input="x" * 199)
         self.assertEqual((status, payload["error"]), (413, "role_input_too_large"))
         self.assertIn("AGENT_RELAY_MAX_COMMAND_INPUT_BYTES", payload["message"])
         self.assertEqual(relay.request("GET", "/v1/tasks")[1]["tasks"], [])
-
-    def test_an_input_within_the_budget_still_runs(self):
-        relay = self.start(fake(role="reviewer"))
-        room = server.MAX_COMMAND_INPUT - len(f"{REVIEWER}\n\nReview this work:\n\n".encode())
-        status, submitted = relay.submit(agentId="fake", input="y" * room)
+        status, submitted = relay.submit(agentId="fake", input="y" * 198)
         self.assertEqual(status, 202, submitted)
         self.assertEqual(relay.wait_task(submitted["id"])["status"], "completed")
 
     def test_prompt_file_is_read_from_the_registry_directory(self):
         relay = Relay(registry([fake(role="reviewer")],
-                               {"reviewer": {"description": "Reviews.", "promptFile": "r.md"}}),
+                               {"reviewer": {"description": "d", "promptFile": "r.md"}}),
                       files={"r.md": "from the file\n"})
         self.addCleanup(relay.close)
         self.assertEqual(self.argv_of(relay, input="x"), ["from the file\n\nx"])
 
-    def test_reload_replaces_the_instructions_of_the_next_task(self):
+    def test_reload_replaces_the_instructions_and_the_digest(self):
         relay = self.start(fake(role="reviewer"))
         self.assertEqual(self.argv_of(relay, input="x")[0], f"{REVIEWER}\n\nReview this work:\n\nx")
         relay.write_registry(registry([fake(role="reviewer")],
-                                      {"reviewer": {"description": "Reviews.", "prompt": "new order"}}))
+                                      {"reviewer": {"description": "d", "prompt": "new order"}}))
         relay.reload()
         task = relay.run_task(agentId="fake", input="x")
         self.assertEqual(json.loads(task["output"]), ["new order\n\nx"])
@@ -131,17 +122,14 @@ class RolesTests(unittest.TestCase):
 
         def handler(request):
             captured.update(json.loads(request.rfile.read(int(request.headers["content-length"]))))
-            send_json(request, 200, {"protocolVersion": "relay.adapter/v1", "status": "completed",
-                                     "output": "done"})
+            send_json(request, 200, {"protocolVersion": "relay.adapter/v1", "status": "completed"})
 
         http_server, port = start_http_server(handler)
         self.addCleanup(stop_http_server, http_server)
-        relay = self.start(fake(role="reviewer"))
-        relay.write_registry(registry(
-            [{"id": "fake", "type": "http", "url": f"http://127.0.0.1:{port}/run",
-              "role": "reviewer"}],
-            {"reviewer": {"description": "Reviews.", "prompt": REVIEWER, "delivery": "adapter"}}))
-        relay.reload()
+        relay = self.start([{"id": "fake", "type": "http", "url": f"http://127.0.0.1:{port}/run",
+                             "role": "reviewer"}],
+                           {"reviewer": {"description": "d", "prompt": REVIEWER,
+                                         "delivery": "adapter"}})
         self.assertEqual(relay.run_task(agentId="fake", input="the input")["status"], "completed")
         self.assertEqual(captured["role"], {"id": "reviewer", "instructions": REVIEWER})
         self.assertEqual(captured["task"]["input"], "the input")
@@ -153,19 +141,41 @@ class RolesTests(unittest.TestCase):
         self.assertEqual(document["task"]["input"], f"{IMPLEMENTER}\n\nbuild it")
         self.assertNotIn("role", document)
 
-    def test_an_http_worker_without_a_role_gets_the_document_it_always_got(self):
-        captured = {}
+    def test_a_read_only_role_worker_accepts_an_input_that_starts_with_a_dash(self):
+        """The instructions precede the input on the command line, so it cannot be read as an option."""
+        relay = self.start(fake(role="reviewer", readOnly={"args": ["--access=read"]}))
+        status, submitted = relay.submit(agentId="fake", input="--access=write", readOnly=True)
+        self.assertEqual(status, 202, submitted)
+        self.assertEqual(json.loads(relay.wait_task(submitted["id"])["output"]),
+                         ["--access=read", f"{REVIEWER}\n\nReview this work:\n\n--access=write"])
 
-        def handler(request):
-            captured.update(json.loads(request.rfile.read(int(request.headers["content-length"]))))
-            send_json(request, 200, {"protocolVersion": "relay.adapter/v1", "status": "completed"})
+    def test_a_queued_task_runs_and_reports_the_reloaded_instructions(self):
+        relay = self.start([fake(role="reviewer"), slow()],
+                           env={"AGENT_RELAY_MAX_ACTIVE": "1"})
+        relay.submit(agentId="slow", input="hold the slot")
+        status, queued = relay.submit(agentId="fake", input="check the diff")
+        self.assertEqual(status, 202, queued)
+        relay.write_registry(registry([fake(role="reviewer")],
+                                      {"reviewer": {"description": "d", "prompt": "new order"}}))
+        relay.reload()
+        task = relay.wait_task(queued["id"], timeout=20)
+        self.assertEqual(json.loads(task["output"]), ["new order\n\ncheck the diff"])
+        self.assertEqual(task["rolePromptSha256"], sha("new order"))
 
-        http_server, port = start_http_server(handler)
-        self.addCleanup(stop_http_server, http_server)
-        relay = self.start({"id": "fake", "type": "http", "url": f"http://127.0.0.1:{port}/run"})
-        relay.run_task(agentId="fake", input="plain")
-        self.assertNotIn("role", captured)
-        self.assertEqual(set(captured), {"protocolVersion", "task"})
+    def test_a_queued_task_whose_instructions_grew_fails_at_dispatch(self):
+        relay = self.start([fake(role="reviewer"), slow()],
+                           {"reviewer": {"description": "d", "prompt": "r" * 200}},
+                           env={"AGENT_RELAY_MAX_ACTIVE": "1",
+                                "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES": "400"})
+        relay.submit(agentId="slow", input="hold the slot")
+        status, queued = relay.submit(agentId="fake", input="x" * 100)
+        self.assertEqual(status, 202, queued)
+        relay.write_registry(registry([fake(role="reviewer")],
+                                      {"reviewer": {"description": "d", "prompt": "r" * 380}}))
+        relay.reload()
+        task = relay.wait_task(queued["id"], timeout=20)
+        self.assertEqual(task["status"], "failed")
+        self.assertTrue(task["error"].startswith("role_input_too_large:"), task["error"])
 
 
 class RoleRegistryTests(unittest.TestCase):
@@ -182,11 +192,6 @@ class RoleRegistryTests(unittest.TestCase):
             json.dump(config, handle)
         return server.load_registry(path)
 
-    def assert_invalid(self, config, fragment, files=None):
-        with self.assertRaises(ValueError) as caught:
-            self.load(config, files)
-        self.assertIn(fragment, str(caught.exception))
-
     def test_a_registry_without_roles_still_loads(self):
         self.assertIsNone(self.load({"agents": [fake()]})["fake"]["_role"])
 
@@ -199,11 +204,14 @@ class RoleRegistryTests(unittest.TestCase):
             (one(description="d", prompt="p", promptFile="r.md"), "exactly one of prompt", None),
             (one(description="d"), "exactly one of prompt", None),
             (one(description="d", promptFile="gone.md"), "cannot read promptFile", None),
-            (one(description="d", promptFile="empty.md"), "instructions are empty", {"empty.md": "\n\n"}),
+            (one(description="d", promptFile="empty.md"), "instructions are empty",
+             {"empty.md": "\n\n"}),
             (one(description="d", prompt="   "), "instructions are empty", None),
             (one(prompt="p"), "description must be a non-empty string", None),
             (one(description="d", prompt="p", systemPrompt="x"), "unknown field systemPrompt", None),
             (one(description="d", prompt="p", delivery="inline"), "delivery must be prepend", None),
+            (one(description="d", prompt="p", delivery="adapter", inputHeader="Review:"),
+             "inputHeader needs", None),
             (one(description="d", prompt="p", delivery="adapter"),
              'asks for "delivery": "adapter"', None),
             (one(description="d", prompt="x" * (server.MAX_ROLE_PROMPT + 1)),
@@ -211,23 +219,19 @@ class RoleRegistryTests(unittest.TestCase):
         ]
         for config, fragment, files in cases:
             with self.subTest(fragment=fragment):
-                self.assert_invalid(config, fragment, files)
+                with self.assertRaises(ValueError) as caught:
+                    self.load(config, files)
+                self.assertIn(fragment, str(caught.exception))
 
-    def test_a_queued_task_whose_instructions_grew_fails_at_dispatch_instead_of_running(self):
-        """The registry may be reloaded while a task waits, so dispatch re-checks the budget."""
-        agent = self.load(registry([fake(role="reviewer")]))["fake"]
-        task = {"id": "t", "agentId": "fake", "input": "a short input"}
-        self.assertIsNone(server._dispatch_plan(agent, task)[2])
-        grown = {**agent, "_role": {**agent["_role"],
-                                   "instructions": "z" * (server.MAX_COMMAND_INPUT + 1)}}
-        self.assertEqual(server._dispatch_plan(grown, task)[2][0], "role_input_too_large")
-
-
-class ExampleRegistryTests(unittest.TestCase):
-    def test_the_example_registry_loads_and_shows_a_role_worker(self):
-        agents = server.load_registry(EXAMPLE_REGISTRY)
-        roles = {agent["role"] for agent in agents.values() if agent.get("role")}
-        self.assertTrue(roles, "config/agents.example.json should show at least one role worker")
+    def test_the_shipped_example_loads_where_it_is_and_after_a_copy(self):
+        """A user or setup.sh copies the example to the per-user config dir, so the copy must load."""
+        expected = {a["role"] for a in server.load_registry(EXAMPLE_REGISTRY).values() if a.get("role")}
+        self.assertTrue(expected, "config/agents.example.json should show role workers")
+        directory = tempfile.mkdtemp(prefix="agent-relay-example-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        copied = os.path.join(directory, "agents.json")
+        shutil.copy(EXAMPLE_REGISTRY, copied)
+        agents = server.load_registry(copied)
+        self.assertEqual({a["role"] for a in agents.values() if a.get("role")}, expected)
         for agent in agents.values():
-            if agent.get("role"):
-                self.assertTrue(agent["_role"]["instructions"].strip())
+            self.assertTrue(not agent.get("role") or agent["_role"]["instructions"].strip())

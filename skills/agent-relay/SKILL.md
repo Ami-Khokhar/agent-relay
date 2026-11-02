@@ -311,15 +311,14 @@ again when a queued task is dispatched: if a registry reload meanwhile removed t
 the agent an `http` adapter, or removed the `inputSeparator` that made the input safe, the task ends
 `failed` with `read_only_unsupported: ...` (or `invalid_input: ...`) and never runs.
 
-**Worker roles.** A worker can carry a role, and the role carries the instructions for the job it
-does. The registry declares `roles` at the top level (`description`, and `prompt` or `promptFile`;
-optional `inputHeader`; `delivery` is `prepend` or `adapter`) and an agent names one with
-`"role": "reviewer"`. `list_agents` shows `role` and `roleDescription`, so pick a worker by the job
-it does instead of remembering which model id means "reviewer". The instructions go to every task
-that worker runs, so `delegate` sends only the task. Nothing about the role is a task field: a
-caller cannot change it. The task record carries `role` and `rolePromptSha256`, never the prompt
-text. A `command` agent gets the instructions on its command line, so they count against
-`AGENT_RELAY_MAX_COMMAND_INPUT_BYTES` and an input that no longer fits is refused with
+**Worker roles.** A worker can carry a role, and the role carries the instructions for its job. The
+registry declares `roles` at the top level (`description`, and `prompt` or a `promptFile` resolved
+against the registry's own directory; optional `inputHeader`; `delivery` is `prepend` or `adapter`)
+and an agent names one with `"role": "reviewer"`. `list_agents` shows `role` and `roleDescription`,
+so pick a worker by the job it does. The instructions go to every task that worker runs, so
+`delegate` sends only the task, and nothing about the role is a task field. The task record carries
+`role` and `rolePromptSha256`, never the prompt. A `command` agent's instructions count against
+`AGENT_RELAY_MAX_COMMAND_INPUT_BYTES`, so an input that no longer fits is refused with
 `413 role_input_too_large`.
 
 What the sandbox blocks: writes under the task's `cwd` and the agent's `allowedRoots` (a new hard

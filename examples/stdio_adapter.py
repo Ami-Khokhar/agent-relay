@@ -5,9 +5,8 @@ Replace run_harness with the supported API or CLI invocation for the harness bei
 adapted. The adapter reads one request document from stdin, writes one result document
 to stdout, and sends diagnostics to stderr.
 
-A worker may carry a role (see the roles block in config/agents.example.json). When that role asks
-for adapter delivery, the request carries the instructions as its own ``role`` field, so they can go
-to the harness as a system prompt instead of a prefix of the task text.
+A worker may carry a role (see config/agents.example.json). A role that asks for adapter delivery
+sends its instructions as the request's own ``role`` field instead of a prefix of the task text.
 """
 from __future__ import annotations
 
@@ -19,8 +18,7 @@ def run_harness(prompt, instructions=None):
     """Run the harness with the task text, and with the role's instructions when the relay sent them.
 
     A role declared with "delivery": "adapter" arrives as its own field, so it can go where the
-    harness keeps its system prompt. Most harness SDKs take it as a separate argument; a CLI that
-    has no such flag can be given the same instructions as a prefix of the prompt.
+    harness keeps its system prompt; a harness with no such flag can take them as a prompt prefix.
     """
     if instructions:
         return f"example harness received a system prompt and: {prompt}"
