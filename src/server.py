@@ -1461,8 +1461,14 @@ def _dispatch_plan(agent, task):
     _, option_args, error = _resolve_options(agent, task.get("options"))
     if error:
         return None, False, error
-    # The role's instructions were reloaded with the entry that will run this task, so they may be
-    # longer than what the caller's input was accepted against.
+    # A task accepted under a role must not run silently without its instructions, and the role's
+    # instructions were reloaded with this entry, so they may now be longer than the input was
+    # accepted against.
+    if task.get("role") and active_role(agent) is None:
+        return None, False, ("role_removed",
+                             f"agent {agent['id']} carried role {task['role']} when this task was "
+                             "accepted and no longer does, so it would run without that role's "
+                             "instructions: restore the role and reload, or submit the task again")
     if agent["type"] == "command":
         overflow = _role_overflow(agent, task["input"])
         if overflow:

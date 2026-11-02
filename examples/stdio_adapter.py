@@ -4,9 +4,6 @@
 Replace run_harness with the supported API or CLI invocation for the harness being
 adapted. The adapter reads one request document from stdin, writes one result document
 to stdout, and sends diagnostics to stderr.
-
-A worker may carry a role (see config/agents.example.json). A role that asks for adapter delivery
-sends its instructions as the request's own ``role`` field instead of a prefix of the task text.
 """
 from __future__ import annotations
 

@@ -149,33 +149,36 @@ class RolesTests(unittest.TestCase):
         self.assertEqual(json.loads(relay.wait_task(submitted["id"])["output"]),
                          ["--access=read", f"{REVIEWER}\n\nReview this work:\n\n--access=write"])
 
-    def test_a_queued_task_runs_and_reports_the_reloaded_instructions(self):
-        relay = self.start([fake(role="reviewer"), slow()],
-                           env={"AGENT_RELAY_MAX_ACTIVE": "1"})
-        relay.submit(agentId="slow", input="hold the slot")
-        status, queued = relay.submit(agentId="fake", input="check the diff")
-        self.assertEqual(status, 202, queued)
-        relay.write_registry(registry([fake(role="reviewer")],
-                                      {"reviewer": {"description": "d", "prompt": "new order"}}))
-        relay.reload()
-        task = relay.wait_task(queued["id"], timeout=20)
-        self.assertEqual(json.loads(task["output"]), ["new order\n\ncheck the diff"])
-        self.assertEqual(task["rolePromptSha256"], sha("new order"))
-
-    def test_a_queued_task_whose_instructions_grew_fails_at_dispatch(self):
-        relay = self.start([fake(role="reviewer"), slow()],
-                           {"reviewer": {"description": "d", "prompt": "r" * 200}},
-                           env={"AGENT_RELAY_MAX_ACTIVE": "1",
-                                "AGENT_RELAY_MAX_COMMAND_INPUT_BYTES": "400"})
-        relay.submit(agentId="slow", input="hold the slot")
-        status, queued = relay.submit(agentId="fake", input="x" * 100)
-        self.assertEqual(status, 202, queued)
-        relay.write_registry(registry([fake(role="reviewer")],
-                                      {"reviewer": {"description": "d", "prompt": "r" * 380}}))
-        relay.reload()
-        task = relay.wait_task(queued["id"], timeout=20)
-        self.assertEqual(task["status"], "failed")
-        self.assertTrue(task["error"].startswith("role_input_too_large:"), task["error"])
+    def test_a_queued_task_follows_the_entry_that_dispatches_it(self):
+        """A reload can replace, lengthen or drop the role of a task that is still waiting."""
+        review = {"reviewer": {"description": "d", "prompt": "r" * 200}}
+        cases = [
+            ("longer instructions",
+             registry([fake(role="reviewer")],
+                      {"reviewer": {"description": "d", "prompt": "new order"}}), {}),
+            ("instructions that no longer fit",
+             registry([fake(role="reviewer")],
+                      {"reviewer": {"description": "d", "prompt": "r" * 380}}),
+             {"AGENT_RELAY_MAX_COMMAND_INPUT_BYTES": "400"}),
+            ("a role that is gone", registry([fake()], {}), {}),
+        ]
+        for label, reloaded, extra in cases:
+            with self.subTest(label=label):
+                relay = self.start([fake(role="reviewer"), slow()], review,
+                                   env={"AGENT_RELAY_MAX_ACTIVE": "1", **extra})
+                relay.submit(agentId="slow", input="hold the slot")
+                status, queued = relay.submit(agentId="fake", input="x" * 100)
+                self.assertEqual(status, 202, queued)
+                relay.write_registry(reloaded)
+                relay.reload()
+                task = relay.wait_task(queued["id"], timeout=20)
+                if label == "longer instructions":
+                    self.assertEqual(json.loads(task["output"]), ["new order\n\n" + "x" * 100])
+                    self.assertEqual(task["rolePromptSha256"], sha("new order"))
+                else:
+                    self.assertEqual(task["status"], "failed", task)
+                    self.assertTrue(task["error"].startswith(
+                        "role_input_too_large:" if extra else "role_removed:"), task["error"])
 
 
 class RoleRegistryTests(unittest.TestCase):

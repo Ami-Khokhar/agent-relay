@@ -311,15 +311,14 @@ again when a queued task is dispatched: if a registry reload meanwhile removed t
 the agent an `http` adapter, or removed the `inputSeparator` that made the input safe, the task ends
 `failed` with `read_only_unsupported: ...` (or `invalid_input: ...`) and never runs.
 
-**Worker roles.** A worker can carry a role, and the role carries the instructions for its job. The
-registry declares `roles` at the top level (`description`, and `prompt` or a `promptFile` resolved
-against the registry's own directory; optional `inputHeader`; `delivery` is `prepend` or `adapter`)
-and an agent names one with `"role": "reviewer"`. `list_agents` shows `role` and `roleDescription`,
-so pick a worker by the job it does. The instructions go to every task that worker runs, so
-`delegate` sends only the task, and nothing about the role is a task field. The task record carries
-`role` and `rolePromptSha256`, never the prompt. A `command` agent's instructions count against
-`AGENT_RELAY_MAX_COMMAND_INPUT_BYTES`, so an input that no longer fits is refused with
-`413 role_input_too_large`.
+**Worker roles.** A worker's role carries the instructions for its job. The registry declares
+`roles` at the top level (`description`, and `prompt` or a `promptFile` resolved against the
+registry's own directory; optional `inputHeader`; `delivery` is `prepend` or `adapter`) and an agent
+names one with `"role": "reviewer"`. `list_agents` shows `role` and `roleDescription`, so pick a
+worker by the job it does. The instructions go to every task it runs, so `delegate` sends only the
+task and nothing about the role is a task field. The record carries `role` and `rolePromptSha256`,
+never the prompt, and a queued task follows a reload: it fails with `role_input_too_large` or
+`role_removed` rather than running with other instructions or none.
 
 What the sandbox blocks: writes under the task's `cwd` and the agent's `allowedRoots` (a new hard
 link to a file there too); writes to the git metadata of the `cwd`, which for a git worktree lives
