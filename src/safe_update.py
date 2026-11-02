@@ -22,9 +22,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, build_opener
 
+import hashlib
+
 import release_identity
 import update_drain
 import update_staging
+import update_transaction
 from release_identity import UpdateError
 
 STATE_LABEL = "release update consent"
@@ -101,8 +104,8 @@ def _fetch(url):
 
 
 def _resolve(tag):
-    identity, manifest, _bytes = release_identity.resolve_release(tag, fetch_json=_fetch)
-    return identity, manifest
+    identity, manifest, manifest_bytes = release_identity.resolve_release(tag, fetch_json=_fetch)
+    return identity, manifest, manifest_bytes
 
 
 def _state_dir():
@@ -111,7 +114,7 @@ def _state_dir():
 
 
 def cmd_inspect(tag):
-    identity, manifest = _resolve(tag)
+    identity, manifest, _bytes = _resolve(tag)
     print("Release identity validated (no release will be installed):")
     print(release_identity.identity_summary(identity))
     print("Manifest schema: %s" % manifest["schema"])
@@ -119,7 +122,7 @@ def cmd_inspect(tag):
 
 
 def cmd_approve(tag):
-    identity, _manifest = _resolve(tag)
+    identity, _manifest, _bytes = _resolve(tag)
     consent = release_identity.approve(identity, state_dir=_state_dir(), now=time.time())
     print("Consent recorded for %s until %s (nonce %s)." %
           (consent["tag"], consent["expiresAt"], consent["nonce"][:8]))
@@ -210,12 +213,7 @@ def cmd_drain(tag, install_dir, *, base_url=None, transaction_id=None,
     state_dir = _state_dir()
     _receipt, identity = _stage_receipt(tag, install_dir, state_dir)
     _consumed_consent(identity, state_dir)
-    base_url = base_url or update_drain.relay_base_url()
-    if not base_url:
-        raise UpdateError("no relay base URL; pass --base-url or set AGENT_RELAY_URL")
-    token = update_drain.relay_token()
-    if not token:
-        raise UpdateError("no relay token; set AGENT_RELAY_TOKEN to the relay's API token")
+    base_url, token = _authorize_drain(base_url)
     transaction_id = transaction_id or update_drain.new_transaction_id()
     try:
         acquired = update_drain.acquire_drain(base_url, transaction_id, token=token)
@@ -252,8 +250,181 @@ def cmd_drain(tag, install_dir, *, base_url=None, transaction_id=None,
     return 0 if status and status["quiesced"] else 1
 
 
+def _authorize_drain(base_url):
+    base_url = base_url or update_drain.relay_base_url()
+    if not base_url:
+        raise UpdateError("no relay base URL; pass --base-url or set AGENT_RELAY_URL")
+    token = update_drain.relay_token()
+    if not token:
+        raise UpdateError("no relay token; set AGENT_RELAY_TOKEN to the relay's API token")
+    return base_url, token
+
+
+def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=None):
+    """Validate everything again and prepare a recoverable activation transaction.
+
+    Nothing is installed, activated or restarted here: the exact release,
+    manifest, stage and a clean, canonical checkout are revalidated; the
+    device-local consent's durable single-use record is re-proven one last
+    time; and only when all of that holds is the exact-revision authenticated
+    drain acquired and a durable, recoverable transaction written. The drain
+    is held after this command returns.
+    """
+    state_dir = _state_dir()
+    resolved = Path(install_dir).resolve()
+    identity, manifest, manifest_bytes = _resolve(tag)
+    receipt, stored = _stage_receipt(tag, install_dir, state_dir)
+    if release_identity.identity_digest(stored) != release_identity.identity_digest(identity):
+        raise UpdateError("the release or manifest for %s changed since approval/staging; "
+                          "refusing a mixed activation" % tag)
+    if release_identity.identity_digest(stored) != receipt["identityDigest"]:
+        raise UpdateError("the stage receipt was written for a different identity than it stores")
+    checkout = update_staging.inspect_checkout(resolved, git=update_staging.default_git())
+    if checkout["commit"] != identity["commit"] or checkout["root"] != receipt["sourceRoot"]:
+        raise UpdateError("the checkout at %s changed since staging; refusing a mixed "
+                          "activation" % resolved)
+    _consumed_consent(identity, state_dir)   # consent is consumed once, durably, by staging
+    release_identity.validate_manifest(manifest, identity)
+    if hashlib.sha256(manifest_bytes).hexdigest() != identity["manifestDigest"]:
+        raise UpdateError("the resolved manifest bytes do not match the release identity")
+    base_url, token = _authorize_drain(base_url)
+    transaction_id = transaction_id or update_drain.new_transaction_id()
+    try:
+        acquired = update_drain.acquire_drain(base_url, transaction_id, token=token)
+    except update_drain.DrainError as exc:
+        raise UpdateError("the drain could not be acquired: %s" % exc)
+    try:
+        record = update_transaction.begin_transaction(
+            {**receipt, "transactionId": transaction_id, "drain": acquired},
+            state_dir=state_dir)
+    except Exception as exc:  # the hold acquired above must never outlive a failed prepare
+        note = _release_drain_after_failure(base_url, transaction_id, token, acquired)
+        raise UpdateError("the transaction could not be prepared: %s; %s" % (exc, note)) from exc
+    print("Prepared activation transaction %s:" % transaction_id)
+    print("  target  %s (%s)" % (identity["tag"], identity["commit"]))
+    print("  old     exact relay revision %s" % acquired["revision"])
+    print("  stage   %s" % receipt["stage"])
+    print("The exact-revision drain is held and admission is closed; nothing was activated"
+          " or restarted. Use status and recover-abort to inspect or abort it.")
+    return 0
+
+
+def _release_drain_after_failure(base_url, transaction_id, token, acquired):
+    """The hold the effect boundary acquired is released again, and said so."""
+    revision, capability = acquired.get("revision"), acquired.get("capability")
+    if not revision or not capability:
+        return "the drain was never acquired"
+    try:
+        update_drain.release_drain(base_url, transaction_id, token=token,
+                                   revision=revision, capability=capability)
+    except update_drain.DrainError as exc:
+        return ("the acquired drain hold could NOT be released: %s; the hold stands "
+                "until an explicit release recovers it" % exc)
+    return "the acquired drain hold was released again"
+
+
+def _proof_references(record, state_dir):
+    """Re-prove the hashed external references a prepared transaction recorded."""
+    for point in record.get("state", []):
+        path = Path(point["path"])
+        try:
+            release_identity.private_file_checks(path, "update state reference")
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, UpdateError) as exc:
+            raise UpdateError("the update state %s changed or vanished: manual recovery "
+                              "required: %s" % (path, exc))
+        if digest != point.get("digest"):
+            raise UpdateError("the update state %s changed since preparation: manual "
+                              "recovery required" % path)
+
+
+def cmd_status():
+    record = update_transaction.recover_transaction(state_dir=_state_dir())
+    if record is None:
+        print("No update transaction is recorded for this installation.")
+        return 0
+    print("Update transaction %s in phase %s:" % (record["transactionId"], record["phase"]))
+    print("  old     exact relay revision %s" % record["revision"])
+    print("  target  %s" % record["target"]["identity"].get("tag"))
+    print("  stage   %s" % record["stage"]["path"])
+    for item in record.get("evidence", []):
+        print("  evidence %s at %s" % (item.get("phase"), item.get("at")))
+    return 0
+
+
+def _proof_running_revision(record, base_url):
+    """The running relay still runs the exact starting revision the drain names."""
+    revision = update_drain._server_revision(base_url)
+    if revision != record["revision"]:
+        raise UpdateError("the relay runs %s, not the transaction's starting revision %s; "
+                          "manual recovery required" % (revision, record["revision"]))
+
+
+def cmd_recover_abort(transaction_id, *, base_url=None):
+    """Abort a prepared transaction: reopen admission only after full proof.
+
+    The proof is the running relay's exact starting revision, the drain it
+    still holds for this transaction (proving ownership), the unchanged
+    source, stage and hashed state references, and a phase that shows no
+    activation has occurred yet. Anything else is a refusal for manual
+    recovery; nothing is reopened or quietly expunged.
+    """
+    state_dir = _state_dir()
+    record = update_transaction.recover_transaction(state_dir=state_dir)
+    if record is None:
+        raise UpdateError("no update transaction is recorded; nothing to abort")
+    if record["transactionId"] != transaction_id:
+        raise UpdateError("the recorded transaction is %s, not %s; refusing to replay another "
+                          "transaction's abort" % (record["transactionId"], transaction_id))
+    if record["phase"] not in ("prepared", "draining"):
+        raise UpdateError("the transaction is in phase %r: manual recovery required"
+                          % record["phase"])
+    base_url, token = _authorize_drain(base_url)
+    # Prove before any effect: unchanged external state, the exact starting
+    # revision still running, this transaction's owned drain and its quiescence.
+    _proof_references(record, state_dir)
+    _proof_running_revision(record, base_url)
+    drain = record.get("drain")
+    revision = record["revision"]
+    if not isinstance(drain, dict) or drain.get("revision") != revision:
+        raise UpdateError("the transaction does not name the drain it owned; manual recovery required")
+    try:
+        status = update_drain.drain_status(base_url, transaction_id, token=token,
+                                          revision=revision, capability=drain["capability"])
+    except (update_drain.DrainError, KeyError) as exc:
+        # A restarted relay owes no hold: drain_not_held proves this recorded hold no
+        # longer keeps admission closed, so there is nothing left to release. Every
+        # other refusal is not evidence; manual recovery stays required.
+        if not (isinstance(exc, update_drain.DrainError) and exc.code == "drain_not_held"):
+            raise UpdateError("the drain of this transaction could not be proven; the hold "
+                              "stands and manual recovery is required: %s" % exc) from exc
+        status = None
+    if status is not None and not status.get("quiesced"):
+        raise UpdateError("the relay had not quiesced when the abort was ordered "
+                          "(active=%(active)s queued=%(queued)s workflows=%(workflows)s); "
+                          "the drain waited: manual recovery required" % status)
+    record = update_transaction.transition(transaction_id, record["phase"], "rolled_back",
+                                           state_dir=state_dir, reason="operator recover-abort")
+    if status is None:
+        update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
+        print("Transaction %s aborted; the relay hold ended without an explicit release, so "
+              "admission reopens after the proof only. Nothing was ever activated."
+              % transaction_id)
+        return 0
+    try:
+        update_drain.release_drain(base_url, transaction_id, token=token,
+                                   revision=revision, capability=drain["capability"])
+    except (update_drain.DrainError, KeyError) as exc:
+        raise UpdateError("the abort record is written and admission reopens, but the drain "
+                          "could not be released; release it explicitly first: %s" % exc)
+    update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
+    print("Transaction %s aborted; the drain was released with its capability and admission "
+          "reopens. Nothing was ever activated." % transaction_id)
+    return 0
+
+
 def cmd_consume(tag):
-    identity, _manifest = _resolve(tag)
+    identity, _manifest, _bytes = _resolve(tag)
     consent = release_identity.consume_consent(identity, state_dir=_state_dir(), now=time.time())
     print("Consent validated and consumed for %s at commit %s." % (consent["tag"], consent["commit"]))
     return 0
@@ -289,6 +460,29 @@ def main(argv=None):
                             "A2A_RELAY_URL")
     drain.add_argument("--transaction-id", default=None,
                        help="an explicit name for this update transaction")
+    prepare = subcommands.add_parser(
+        "prepare-activation", help="validate the approved release, stage and checkout, "
+        "hold the exact-revision drain and durably prepare a recoverable activation "
+        "transaction; installs nothing, activates nothing and restarts nothing")
+    prepare.add_argument("tag", help="exact release tag the verified stage is of, e.g. 1.2.3")
+    prepare.add_argument("--install-dir", required=True,
+                         help="this installation's checkout the stage was staged from")
+    prepare.add_argument("--base-url", default=None,
+                         help="the running relay to drain; default AGENT_RELAY_URL or "
+                              "A2A_RELAY_URL")
+    prepare.add_argument("--transaction-id", default=None,
+                         help="an explicit name for this update transaction")
+    subcommands.add_parser(
+        "status", help="print the recorded update transaction of this installation, if any")
+    recover = subcommands.add_parser(
+        "recover-abort", help="abort a prepared activation transaction after proving the "
+        "original revision, unchanged source and state and that no activation occurred; "
+        "anything else is refused for manual recovery")
+    recover.add_argument("transaction_id", metavar="TRANSACTION-ID",
+                         help="the exact transaction to abort")
+    recover.add_argument("--base-url", default=None,
+                         help="the running relay to prove and release; default "
+                              "AGENT_RELAY_URL or A2A_RELAY_URL")
     args = parser.parse_args(argv)
     handlers = {"inspect": cmd_inspect, "approve": cmd_approve, "consume": cmd_consume}
     try:
@@ -297,6 +491,13 @@ def main(argv=None):
         if args.command == "drain":
             return cmd_drain(args.tag, args.install_dir, base_url=args.base_url,
                              transaction_id=args.transaction_id)
+        if args.command == "prepare-activation":
+            return cmd_prepare_activation(args.tag, args.install_dir, base_url=args.base_url,
+                                          transaction_id=args.transaction_id)
+        if args.command == "status":
+            return cmd_status()
+        if args.command == "recover-abort":
+            return cmd_recover_abort(args.transaction_id, base_url=args.base_url)
         return handlers[args.command](args.tag)
     except UpdateError as exc:
         print("error: %s" % exc, file=sys.stderr)
