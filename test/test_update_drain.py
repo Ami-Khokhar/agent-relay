@@ -362,6 +362,46 @@ class DrainTests(unittest.TestCase):
         finally:
             stop_http_server(server)
 
+    def test_drain_cli_reports_a_lost_hold_without_traceback(self):
+        """Guard: a status refusal mid-rehearsal is a readable failure, not an AttributeError.
+
+        wait_for_quiescence can raise a DrainError that is not the timeout
+        instance (drain_not_held after a relay restart, capability_mismatch,
+        drain_unreachable past the deadline); such an error carries no last
+        acknowledged counts, and cmd_drain must report the failure and still
+        release instead of printing a traceback.
+        """
+        # Not the timeout instance: no last_status travels with it.
+        refused = update_drain.DrainError("drain_not_held",
+                                          "the relay restarted mid-rehearsal")
+
+        def failing_status(*args, **kwargs):
+            raise refused
+
+        server, port = start_http_server(lambda request: send_json(request, 200, {
+            "protocolVersion": "relay.adapter/v1",
+            "status": "completed", "output": "unused"}))
+        relay = self.start([{"id": "hosted", "type": "http",
+                             "url": "http://127.0.0.1:%d" % port}])
+        try:
+            self.assertEqual(relay.submit(agentId="hosted", input="x")[0], 202)
+            with patch.object(safe_update, "_stage_receipt",
+                              self._fake_stage_success), \
+                    patch.object(safe_update, "_consumed_consent",
+                                 self._fake_consent), \
+                    patch.dict(os.environ, {"AGENT_RELAY_TOKEN": TOKEN}), \
+                    patch.object(update_drain, "drain_status", failing_status):
+                # DrainError without last_status: report it, return 1, and do
+                # not raise, so the release warning path is the last thing the
+                # caller sees.
+                self.assertEqual(
+                    safe_update.cmd_drain("0.4.0", os.getcwd(), base_url=relay.base,
+                                          transaction_id="cli-lost", quiesce_wait_s=1), 1)
+            # The hold is gone: the relay opens again.
+            self.assertEqual(relay.submit(agentId="hosted", input="0.05")[0], 202)
+        finally:
+            stop_http_server(server)
+
     def _fake_stage_success(self, tag, install_dir, state_dir):
         return {}, {"tag": tag}
 

@@ -53,6 +53,9 @@ class DrainError(UpdateError):
         super().__init__(message)
         self.code = code
         self.status = status
+        # None unless the raiser attaches the last acknowledged state; callers
+        # must not print counts they never received.
+        self.last_status = None
 
 
 def relay_base_url():
