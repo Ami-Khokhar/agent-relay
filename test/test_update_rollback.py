@@ -94,6 +94,13 @@ class _RollbackCase(_Case):
         kw.update(kwargs)
         return safe_update.cmd_recover(TXN, **kw)
 
+    def run_activate(self, *, restart=None, deadline=0.4):
+        self.fixture.write_plist()
+        return safe_update.cmd_activate(
+            TXN, str(self.repo), inspect=self.fake_inspect,
+            restart=restart if restart is not None else self.fake_restart,
+            deadline_s=deadline)
+
     def _crash(self, *, swapped):
         """Replay an activation to its boundary and leave it durably failed.
 
@@ -139,13 +146,6 @@ class _RollbackCase(_Case):
 
 class AutomaticRollbackTest(_RollbackCase):
     """A failed activate attempt recovers itself to the exact prior revision."""
-
-    def run_activate(self, *, restart=None, deadline=0.4):
-        self.fixture.write_plist()
-        return safe_update.cmd_activate(
-            TXN, str(self.repo), inspect=self.fake_inspect,
-            restart=restart if restart is not None else self.fake_restart,
-            deadline_s=deadline)
 
     def test_a_health_verdict_that_never_matches_is_rolled_back_automatically(self):
         """The relay keeps reporting the old commit, so the activation can never
@@ -468,6 +468,48 @@ class PrivateStateTest(_RollbackCase):
         for point in json.loads(journal)["state"]:
             self.assertRegex(point["digest"], r"^[0-9a-f]{64}$",
                              "external references are digests, not contents")
+
+
+class PostActivatedFailureTest(_RollbackCase):
+    """A failure after the durable activated transition is not recovered away.
+
+    The finding this guards against: _record_recovery used to advance an
+    already terminal activated journal to recovery_required and cmd_activate
+    then rolled back a successfully activated release, restarting the service
+    a second time and printing that the target was NOT activated.
+    """
+
+    def test_a_refresh_failure_after_activation_leaves_the_activation_durable(self):
+        """Guard: a _refresh that raises once after the activated transition
+        must leave HEAD at the target, the phase at activated, the barrier
+        holding, and never roll the transaction back.
+        """
+        self.refresh_raises = update_drain.DrainError("drain_unreachable", "down")
+        with self.assertRaises(identity.UpdateError) as caught:
+            self.run_activate()
+        message = str(caught.exception)
+        self.assertIn("durable as activated", message,
+                      "the operator learns the activation already stands")
+        self.assertIn("safe_update recover %s" % TXN, message)
+        self.assertEqual(self._head(), self.fixture.target,
+                         "the checkout still runs the activated target commit")
+        record = update_transaction.read_journal(state_dir=self.state)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["phase"], "activated",
+                         "a terminal activated record is never rewound to "
+                         "recovery_required by _record_recovery")
+        self.assertNotIn("release", [call[0] for call in self.calls],
+                         "the drain hold of a standing activation is not released")
+        self.assertEqual(len(self.restart_commands), 1,
+                         "only the activation restart ran; no rollback restart")
+        # the named remedy works: recover expunges the activated record without
+        # repeating a service action or any rollback
+        rc = self.run_recover()
+        self.assertEqual(rc, 0)
+        self.assertIsNone(update_transaction.read_journal(state_dir=self.state),
+                          "the activated record is expunged read-only")
+        self.assertEqual(len(self.restart_commands), 1,
+                         "recovery of a standing activation repeats no service action")
 
 
 if __name__ == "__main__":

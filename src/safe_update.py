@@ -496,6 +496,18 @@ def cmd_activate(transaction_id, install_dir, *, base_url=None, inspect=None,
         fcntl.flock(lock, fcntl.LOCK_UN)
         os.close(lock)
     if failure is not None:
+        record = update_transaction.read_journal(state_dir=state_dir)
+        if record is not None and record.get("transactionId") == transaction_id \
+                and record["phase"] != "recovery_required":
+            # the activation was already finalized durably (typically a
+            # post-activated _refresh_barrier failure): its state is the truth;
+            # rewinding a verified activation would revert a good release
+            raise UpdateError(
+                "activation is durable as %s for %s (%s), but the relay has not "
+                "reopened admission; run `safe_update recover %s` to expunge the "
+                "record and retry the refresh"
+                % (record["phase"], transaction_id, failure, transaction_id)) \
+                from failure
         try:
             rollback_transaction(transaction_id, state_dir=state_dir, service=service,
                                  base_url=base_url, token=token, git=git,
@@ -537,10 +549,12 @@ def _record_recovery(transaction_id, state_dir, exc, **evidence):
         if record["phase"] == "recovery_required":
             update_transaction.journal_recovery_note(transaction_id, state_dir=state_dir,
                                                      reason=str(exc), **evidence)
-        elif record["phase"] in update_transaction.PHASES:
+        elif record["phase"] in update_transaction.PHASES \
+                and record["phase"] not in update_transaction.TERMINAL_PHASES:
             update_transaction.transition_locked(transaction_id, record["phase"],
                                                  "recovery_required", state_dir=state_dir,
                                                  reason=str(exc), **evidence)
+        # a terminal record (activated or rolled_back) stays exactly as it was:
     except Exception as recovery_exc:
         raise UpdateError("activation failed (%s) and the recovery record could not be "
                           "written (%s); the barrier still holds admission closed; "
