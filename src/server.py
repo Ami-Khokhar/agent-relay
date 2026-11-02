@@ -1483,7 +1483,10 @@ def _load_update_barrier():
     try:
         UPDATE_BARRIER = update_transaction.admission_blocker(
             state_dir=STATE_DIR, running_revision=running)
-    except (OSError, ValueError) as exc:  # never a silent open on a broken read
+    except (update_transaction.UpdateError, OSError, ValueError) as exc:
+        # A broken update state (no device id, an unwritable or foreign private
+        # directory, corrupt records) fails closed into a 503 refusal instead of
+        # killing the relay before it could serve even reads.
         UPDATE_BARRIER = {"transactionId": None,
                           "reason": "update state could not be read: %s" % exc}
     if UPDATE_BARRIER is not None:

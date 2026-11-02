@@ -25,7 +25,10 @@ concurrent process.
 """
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # non-POSIX: importing server.py must keep working there
+    fcntl = None
 import hashlib
 import json
 import os
@@ -80,6 +83,9 @@ def _lock_path(state_dir):
 
 def _flock(path):
     """An exclusive, non-blocking, no-follow lock; refusing a concurrent process."""
+    if fcntl is None:
+        raise UpdateError("the update journal needs POSIX file locking; refusing to "
+                          "update state where os.flock is unavailable")
     try:
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as exc:

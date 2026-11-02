@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+import release_identity
 import release_identity as identity
 import update_drain
 import update_staging
@@ -44,8 +45,13 @@ BASE_URL = "127.0.0.1-fake"
 
 
 def _run_git(root, *args):
-    result = subprocess.run(["/usr/bin/git", "-C", str(root), *args],
-                            capture_output=True, text=True)
+    # Author identity and config isolation are explicit: a developer's or CI
+    # runner's global git config must never change what the fixture commits.
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_AUTHOR_NAME": "f", "GIT_AUTHOR_EMAIL": "f@example.com",
+           "GIT_COMMITTER_NAME": "f", "GIT_COMMITTER_EMAIL": "f@example.com"}
+    result = subprocess.run(["/usr/bin/git", "-C", str(root), *args], capture_output=True,
+                            text=True, env=env)
     if result.returncode != 0:
         raise AssertionError("fixture git %s failed: %s" % (args, result.stderr))
     return result.stdout
@@ -420,6 +426,49 @@ class RelayBarrierTest(_Case):
         self.assertEqual((status, body.get("error")), (503, "update_barrier_active"))
 
 
+    def test_cli_recover_abort_reopens_admission_after_a_relay_restart(self):
+        """Guard: after a restart the hold is gone (`drain_not_held`), yet the
+        operator CLI — not a direct journal call — must still open admission."""
+        probe = self._relay()
+        revision = update_drain._server_revision(probe.base)
+        probe.close()
+        update_transaction.begin_transaction(
+            self.fixture.begin_receipt(drain={"revision": revision,
+                                              "capability": "c" * 64}),
+            state_dir=self.state)
+        relay = self._relay()
+        status, body = relay.submit(agentId="worker", input="hello")
+        self.assertEqual((status, body.get("error")), (503, "update_barrier_active"))
+        relay.close()
+        # The relaunched relay serves reads while its restarted barrier still refuses
+        # admissions, and it is the relay the CLI must prove itself against.
+        relay2 = self._relay()
+        self.assertEqual(relay2.request("GET", "/healthz")[0], 200)
+        with _join([patch.object(update_drain, "relay_token", lambda: TOKEN),
+                    patch.object(safe_update, "_state_dir", lambda: self.state)]):
+            self.assertEqual(safe_update.cmd_recover_abort(TXN, base_url=relay2.base), 0,
+                             "a restarted relay's drain_not_held is accepted as proof "
+                             "after the revision and unchanged-state proofs")
+        status, body = relay2.submit(agentId="worker", input="hello")
+        self.assertEqual((status, body.get("error")), (503, "update_barrier_active"),
+                         "the relay that already read the barrier refuses until restart")
+        relay2.close()
+        relay3 = self._relay()
+        status, body = relay3.submit(agentId="worker", input="hello")
+        self.assertEqual(status, 202, "the CLI abort reopens ordinary admission")
+
+    def test_a_broken_install_fingerprint_serves_reads_and_refuses_writes(self):
+        """Guard: update state that cannot be bound to this device fails closed
+        into a 503, never a relay process death."""
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        (self.state / "device-id").unlink()
+        relay = self._relay()
+        self.assertEqual(relay.request("GET", "/healthz")[0], 200,
+                         "reads are not admissions and never die on unreadable state")
+        status, body = relay.submit(agentId="worker", input="hello")
+        self.assertEqual((status, body.get("error")), (503, "update_barrier_active"))
+
+
 class _join:
     def __init__(self, patches):
         self.patches = patches
@@ -438,12 +487,52 @@ class _join:
 class PrepareAbortCliTest(_Case):
     """`prepare-activation` / `recover-abort`: identity revalidated at the effect boundary."""
 
-    def _patches(self, relay, resolve=None):
-        resolve = resolve or (lambda tag: (self.fixture.identity(), self.fixture.manifest,
-                                           self.fixture.manifest_bytes))
+    def test_a_failed_prepare_after_the_acquire_releases_the_hold(self):
+        """Guard: a begin_transaction failure must not strand the acquired drain hold."""
+        relay = _FakeRelay()
+        with _join(self._patches(relay) +
+                   [patch.object(safe_update, "_state_dir", lambda: self.state),
+                    patch.object(update_transaction, "begin_transaction",
+                                 side_effect=identity.UpdateError(
+                                     "transaction txn is still recorded"))]):
+            with self.assertRaises(identity.UpdateError) as caught:
+                safe_update.cmd_prepare_activation(TAG, str(self.repo),
+                                                   base_url="http://127.0.0.1:9",
+                                                   transaction_id=TXN)
+        self.assertIn("released again", str(caught.exception),
+                      "the error says the acquired hold was given back")
+        self.assertEqual([call[0] for call in relay.calls], ["acquire", "release"],
+                         "the hold acquired just before the failure is released again")
+        self.assertEqual(relay.releases, [TXN])
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
+        self.assertIsNone(self.blocker())
+
+    def test_a_failed_prepare_release_reports_an_unreleasable_hold(self):
+        relay = _FakeRelay()
+
+        def refusing_release(_base, transaction_id, *, token=None, revision=None,
+                             capability=None, timeout=None):
+            raise update_drain.DrainError("drain_error", "refused")
+        relay.release = refusing_release
+        with _join(self._patches(relay) +
+                   [patch.object(safe_update, "_state_dir", lambda: self.state),
+                    patch.object(update_transaction, "begin_transaction",
+                                 side_effect=identity.UpdateError("no space"))]):
+            with self.assertRaises(identity.UpdateError) as caught:
+                safe_update.cmd_prepare_activation(TAG, str(self.repo),
+                                                   base_url="http://127.0.0.1:9",
+                                                   transaction_id=TXN)
+        self.assertIn("could NOT be released", str(caught.exception),
+                      "the error says the hold stands until an explicit release")
+
+    def _patches(self, relay, release=None):
+        """Fakes only the network hop, so the real ``_resolve`` shape is exercised."""
+        release = release or (lambda tag, fetch_json: (self.fixture.identity(),
+                                                       self.fixture.manifest,
+                                                       self.fixture.manifest_bytes))
         receipt = dict(json.loads(self.fixture.stage_receipt.read_text()))
         return [
-            patch.object(safe_update, "_resolve", resolve),
+            patch.object(release_identity, "resolve_release", release),
             patch.object(safe_update, "_stage_receipt",
                          lambda tag, install_dir, state_dir: (receipt, self.fixture.identity())),
             patch.object(update_staging, "default_git", lambda: "/usr/bin/git"),
@@ -454,9 +543,9 @@ class PrepareAbortCliTest(_Case):
             patch.object(update_drain, "relay_token", lambda: TOKEN),
         ]
 
-    def _prepared(self, relay, resolve=None):
+    def _prepared(self, relay, release=None):
         """Run prepare-activation via the CLI with the state dir patched."""
-        patches = self._patches(relay, resolve) + [
+        patches = self._patches(relay, release) + [
             patch.object(safe_update, "_state_dir", lambda: self.state)]
         with _join(patches):
             return safe_update.main(["prepare-activation", TAG, "--install-dir", str(self.repo),
@@ -501,10 +590,10 @@ class PrepareAbortCliTest(_Case):
         relay = _FakeRelay()
         before = _tree_inventory(self.state)
 
-        def drifted(tag):
+        def drifted(tag, fetch_json=None):
             return (self.fixture.identity(commit="d" * 40), self.fixture.manifest,
-                    self.fixture.manifest_bytes)
-        with _join(self._patches(relay, resolve=drifted) +
+                   self.fixture.manifest_bytes)
+        with _join(self._patches(relay, release=drifted) +
                    [patch.object(safe_update, "_state_dir", lambda: self.state)]):
             with self.assertRaises(identity.UpdateError) as caught:
                 safe_update.cmd_prepare_activation(TAG, str(self.repo),
