@@ -532,3 +532,67 @@ def activate_transaction_source(record, *, git=None):
         raise StagingError("the previous commit object %s is no longer available; only a "
                            "known-good previous revision may be activated from" % revision)
     return {"target": target, "previousObject": revision}
+
+
+def rollback_transaction_source(record, *, git=None):
+    """Restore the verified checkout to the transaction's exact prior revision.
+
+    ``record`` is the live activation transaction; the caller holds the
+    transaction/install lock. The exact prior commit comes only from the
+    durable journal — never from a branch, main or a release tag — and it is
+    proven still retained as a commit object in the checkout's own repository
+    before anything is restored. The restoration runs only on a checkout
+    ``inspect_checkout`` still accepts: any intervening user edit, symlink,
+    foreign origin or unsafe path mutation is refused, never overwritten.
+    A checkout that already sits at the prior revision (the failure happened
+    before the swap) is proven, not touched again. The restored tree is
+    re-verified (detached HEAD at the prior commit, clean status, ordinary
+    tracked modes) before it is accepted, so a failed or partial restore
+    raises instead of pretending to be finished. Only git metadata inside the
+    checkout is written; configuration, service definitions and state are
+    outside this function.
+
+    Returns ``{"previous", "root", "restored", "replacedCommit"}``.
+    """
+    git = git if isinstance(git, Git) else Git(git or default_git())
+    record = record if isinstance(record, dict) else None
+    if record is None:
+        raise StagingError("rollback needs the live transaction record")
+    inventory = record.get("inventory") or {}
+    root = inventory.get("sourceRoot")
+    resolved = _plain_private_dir(root, "checkout")
+    revision = record.get("revision") or ""
+    if not COMMIT_RE.fullmatch(revision):
+        raise StagingError("the transaction names no exact 40-hex prior revision; "
+                           "refusing to restore anything but the journaled known-good revision")
+    replaced = None
+    try:
+        replaced = (record["target"] or {}).get("identity", {}).get("commit") or None
+    except (KeyError, TypeError, AttributeError):
+        replaced = None
+    # refuses a dirty tree, a symlinked or foreign checkout, uncommitted or
+    # untracked content: an intervening user edit is never overwritten
+    inspected = inspect_checkout(resolved, git=git)
+    kind = git.run("cat-file", "-t", revision, cwd=resolved).strip()
+    if kind != "commit":
+        raise StagingError("the journaled prior revision %s is not retained as a commit "
+                           "object in %s; refusing to restore anything but the exact "
+                           "known-good revision" % (revision, resolved))
+    if inspected["commit"] == revision:
+        return {"previous": revision, "root": str(resolved), "restored": False,
+                "replacedCommit": replaced}
+    git.run("checkout", "--detach", revision, cwd=resolved)
+    if git.run("rev-parse", "HEAD", cwd=resolved).strip() != revision:
+        raise StagingError("the checkout HEAD moved while restoring the prior revision; "
+                           "refusing an uncertain rollback")
+    if git.run("status", "--porcelain", "--untracked-files=all", cwd=resolved).strip():
+        raise StagingError("the restored working tree is dirty; refusing an uncertain rollback")
+    for line in git.run("ls-files", "-s", "-z", cwd=resolved).split("\0"):
+        if not line:
+            continue
+        mode, _stage, path = line.split(" ", 2)
+        if mode not in TRACKED_MODES:
+            raise StagingError("the restored repository tracks unsafe mode %s at %s; "
+                               "refusing" % (mode, path))
+    return {"previous": revision, "root": str(resolved), "restored": True,
+            "replacedCommit": replaced}

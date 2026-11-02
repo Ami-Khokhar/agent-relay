@@ -515,6 +515,33 @@ def transition_locked(transaction_id, expected_phase, next_phase, *, state_dir, 
     return record
 
 
+def journal_recovery_note(transaction_id, *, state_dir, **evidence):
+    """Append one recovery evidence entry to the recorded recovery_required
+    journal without moving its phase.
+
+    ``rollback_transaction`` holds the lock and notes every durable recovery
+    step here *before* the next effect, so a crash mid-recovery leaves a
+    journal that shows exactly how far the last recovery got and no step is
+    silently repeated or skipped by the next recovery attempt. The phase and
+    the admission barrier stay exactly as they were.
+    """
+    lane = _update_dir(state_dir)
+    record = read_journal(state_dir)
+    if record is None:
+        raise UpdateError("no transaction is recorded in %s; nothing to note" % lane)
+    _check_shape(record, "transaction journal", TRANSACTION_SCHEMA)
+    if record["binding"] != install_fingerprint(state_dir):
+        raise UpdateError("the transaction journal was written for another device or "
+                          "install; refusing unsafe state")
+    if record["transactionId"] != transaction_id:
+        raise UpdateError("the transaction journal is for %s, not %s"
+                          % (record["transactionId"], transaction_id))
+    record["evidence"].append({"phase": record["phase"], "at": time.time(),
+                              "kind": "recovery", **evidence})
+    _write_journal(state_dir, record)
+    return record
+
+
 def clear_transaction(transaction_id, *, state_dir):
     """Expunge a finished transaction record after a proven, checked end.
 
