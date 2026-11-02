@@ -30,6 +30,14 @@ from urllib.parse import parse_qs, urlsplit
 import pressure
 from workflows import STEP_ID_RE, WORKFLOW_STATUSES, WorkflowEngine
 
+# The exact starting revision a drain acquire must name, so an updater that
+# resolved a different build never holds the shared lock of this one.
+DRAIN_COMMIT_RE = re.compile(r"[0-9a-f]{40}$")
+DRAIN_TRANSACTION_RE = re.compile(r"[A-Za-z0-9_.~-]{1,128}$")
+# Capability: the relay mints 64 hex; requests that name one are compared,
+# never trusted, so a replayed or forged capability is refused.
+DRAIN_CAPABILITY_RE = re.compile(r"[0-9a-f]{64}$")
+
 ADAPTER_PROTOCOL = "relay.adapter/v1"
 INHERITED_ENV = (
     "PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "LC_ALL",
@@ -170,6 +178,10 @@ TASKS = {}
 REQUEST_IDS = {}
 QUEUE = []
 ACTIVE = 0
+# The held shared lock during a safe update: None when no drain is held, else a
+# dict bound to one transaction, one exact starting revision and one opaque
+# capability. Guarded by LOCK, so admission and drain decisions share it.
+DRAIN = None
 SHUTTING_DOWN = False
 _WARNED_FALLBACK = False
 UNKNOWN_REVISION = {"commit": "unknown", "short": "unknown", "date": "unknown"}
@@ -1415,10 +1427,169 @@ def _wait_for_terminal(task_id, wait_ms):
             TASK_CONDITION.wait(remaining)
 
 
-def _create_task(request):
+def _drain_refusal():
+    """The refusal a new external admission gets while a drain is held, or None.
+
+    Exit/tick code must call this with LOCK held, so the close of the
+    check-and-admit race is one decision: a replayed request is answered
+    before this gate, so its semantics never change during a drain.
+    """
+    if DRAIN is None:
+        return None
+    return 503, {"error": "drain_active",
+                 "message": "An update drain is held; new external task and workflow "
+                            "admissions are refused until it is released"}
+
+
+def _drain_counts():
+    """The port-wide counts a held drain waits on. Call with LOCK held.
+
+    ``active`` is the real slot count, so a cancelled running adapter (which
+    keeps its slot until its worker returns) is still counted. Queued are the
+    accepted tasks; each nonterminal workflow counts once, which covers a run
+    between steps, in a retry delay or about to fan out — its child tasks are
+    counted in ``active``/``queued`` once they exist.
+    """
+    return {"active": ACTIVE,
+            "queued": sum(1 for task in QUEUE if task["status"] == "queued"),
+            "workflows": WORKFLOW_ENGINE.active_count()}
+
+
+def _drain_state(counts):
+    """The public view of a held drain, without the capability. LOCK held."""
+    return {"transactionId": DRAIN["transactionId"], "revision": DRAIN["revision"],
+            "quiesced": not (counts["active"] or counts["queued"]
+                             or counts["workflows"]), **counts}
+
+
+def _drain_request_params(body=None, query=None, capability_required=True):
+    """Validate a drain request's three bound fields from its body or query.
+
+    Returns ``(transaction, revision, capability)`` or ``(None, error)``.
+    Malformed input is refused here, so no malformed request can ever be
+    answered as a free or idle drain.
+    """
+    if body is None and query is None:
+        return None, {"error": "invalid_request", "message": "no drain parameters"}
+    source = body if body is not None else query
+    transaction = source.get("transactionId") if isinstance(source, dict) else None
+    if not isinstance(transaction, str) or not DRAIN_TRANSACTION_RE.fullmatch(transaction):
+        return None, {"error": "invalid_transaction_id",
+                      "message": "transactionId must match [A-Za-z0-9_.~-] and be at most "
+                                 "128 characters"}
+    revision = source.get("revision")
+    if not isinstance(revision, str) or not DRAIN_COMMIT_RE.fullmatch(revision):
+        return None, {"error": "invalid_revision",
+                      "message": "revision must be a 40-hex commit"}
+    capability = source.get("capability")
+    if capability_required and (not isinstance(capability, str)
+                                or not DRAIN_CAPABILITY_RE.fullmatch(capability)):
+        return None, {"error": "invalid_capability",
+                      "message": "capability must be a 64-hex token the relay issued"}
+    return (transaction, revision, capability), None
+
+
+def _drain_acquire(body):
+    """POST acquire: hold the shared drain for one transaction, atomically.
+
+    The lock and the admitted-work counts move together here: an acquire that
+    races a submission can never observe a queue that both exists and counts
+    as zero. Held drains conflict, even for the same transaction without its
+    capability: there is no reacquire, only an explicit release.
+    """
+    params, problem = _drain_request_params(body, capability_required=False)
+    if problem:
+        return 400, problem
+    transaction, revision, _capability = params
+    global DRAIN
+    with LOCK:
+        counts = _drain_counts()
+        if DRAIN is not None:
+            return 409, {"error": "drain_held",
+                         "message": "A drain is already held by transaction %s"
+                                    % DRAIN["transactionId"],
+                         "heldBy": DRAIN["transactionId"]}
+        if revision != REVISION["commit"]:
+            return 409, {"error": "revision_mismatch",
+                         "message": "the relay runs revision %s, not %s"
+                                    % (REVISION["commit"], revision)}
+        DRAIN = {"transactionId": transaction, "revision": revision,
+                 "capability": secrets.token_hex(32), "startedAt": now_iso()}
+        view = _drain_state(counts)
+        view["held"] = True
+        view["capability"] = DRAIN["capability"]
+        return 200, view
+
+
+def _drain_status(transaction, revision, capability):
+    """GET status: acknowledge this holder's quiescence. Only the relay says "idle".
+
+    Unknown transactions, wrong revisions and wrong capabilities are errors,
+    and no error answer may read as a free drain: the state in LOCK is the
+    only source of the truth, including "not held" while this capability is
+    alive (the hold has no expiry; a server that restarted owes no verdict).
+    """
+    with LOCK:
+        counts = _drain_counts()
+        if DRAIN is None:
+            return 409, {"error": "drain_not_held",
+                         "message": "No drain is held; nothing this capability may "
+                                    "still own is holding admission closed"}
+        if not hmac.compare_digest(capability.encode("utf-8"),
+                                   DRAIN["capability"].encode("utf-8")):
+            return 403, {"error": "capability_mismatch"}
+        if transaction != DRAIN["transactionId"]:
+            return 409, {"error": "transaction_mismatch",
+                         "message": "the drain is held by transaction %s"
+                                    % DRAIN["transactionId"]}
+        if revision != DRAIN["revision"]:
+            return 409, {"error": "revision_mismatch",
+                         "message": "the drain was acquired for revision %s"
+                                    % DRAIN["revision"]}
+        view = _drain_state(counts)
+        view["held"] = True
+        return 200, view
+
+
+def _drain_release(transaction, revision, capability):
+    """DELETE release: reopen admission with this exact capability only."""
+    global DRAIN
+    with LOCK:
+        if DRAIN is None:
+            return 409, {"error": "drain_not_held"}
+        if not hmac.compare_digest(capability.encode("utf-8"),
+                                   DRAIN["capability"].encode("utf-8")):
+            return 403, {"error": "capability_mismatch"}
+        if transaction != DRAIN["transactionId"]:
+            return 409, {"error": "transaction_mismatch",
+                         "message": "the drain is held by transaction %s"
+                                    % DRAIN["transactionId"]}
+        if revision != DRAIN["revision"]:
+            return 409, {"error": "revision_mismatch",
+                         "message": "the drain was acquired for revision %s"
+                                    % DRAIN["revision"]}
+        DRAIN = None
+        return 200, {"released": True, "transactionId": transaction, **_drain_counts()}
+
+
+def _internal_create_task(request):
+    """The workflow engine's admission path for the children of live runs.
+
+    A held drain blocks new external admissions, but a workflow the relay
+    already accepted must still reach its own child tasks while the update
+    waits. This module-level trusted path is bound into the engine at start
+    up; no request body field selects it, so a caller cannot buy a bypass by
+    sending a flag.
+    """
+    return _create_task(request, _internal=True)
+
+
+def _create_task(request, _internal=False):
     """Validate one task request and enqueue it. Returns ``(status, body)``.
 
     Called by ``POST /v1/tasks``, so every task request is validated in one place.
+    The ``_internal`` path is accepted only from the workflow engine (see
+    ``_internal_create_task``); nothing a caller sends reaches it.
     """
     if not isinstance(request, dict):
         return 400, {"error": "invalid_request"}
@@ -1493,6 +1664,13 @@ def _create_task(request):
                     or prior.get("parentTaskId") != parent_id):
                 return 409, {"error": "idempotency_conflict"}
             return 200, visible(prior)
+        # The drain gate sits inside this locked section, after the replay
+        # answer, so an idempotent replay keeps its 200 during a drain and no
+        # newly created task can bypass the check between read and queue.
+        if not _internal:
+            refused = _drain_refusal()
+            if refused:
+                return refused
         # waitMs only names the wait the caller means to use next and is never stored, so a replay
         # (which creates nothing) ignores it above; a new submission is refused here, before parent
         # accounting or creation, so a caller that gets this error holds no task ID for a task.
@@ -1576,7 +1754,8 @@ def lookup_task(task_id):
 WORKFLOW_ENGINE = WorkflowEngine(
     lock=LOCK,
     condition=TASK_CONDITION,
-    create_task=_create_task,
+    create_task=_internal_create_task,
+    drain_refusal=_drain_refusal,
     get_task=lookup_task,
     cancel_task=cancel_task,
     drain=_drain,
@@ -1691,6 +1870,32 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/v1/admin/reload":
                 if method == "POST":
                     return self._reload()
+                return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/admin/update/drain":
+                # Loopback only: the drain body carries the capability that
+                # reopens admission, and it is of use only to the local updater.
+                if not is_loopback(self.client_address[0]):
+                    return self._json(403, {"error": "forbidden"})
+                if method == "POST":
+                    error, body = self._read_json_body()
+                    if error:
+                        return self._json(error, body)
+                    return self._json(*_drain_acquire(body))
+                if method == "GET":
+                    # parse_qs wraps each value; the drain query is flat.
+                    scalar = {key: values[0] for key, values in query.items() if values}
+                    params, problem = _drain_request_params(query=scalar)
+                    if problem:
+                        return self._json(400, problem)
+                    return self._json(*_drain_status(*params))
+                if method == "DELETE":
+                    error, body = self._read_json_body()
+                    if error:
+                        return self._json(error, body)
+                    params, problem = _drain_request_params(body)
+                    if problem:
+                        return self._json(400, problem)
+                    return self._json(*_drain_release(*params))
                 return self._json(405, {"error": "method_not_allowed"})
             match = re.fullmatch(r"/v1/workflows/([^/]+)/resume", path)
             if match:

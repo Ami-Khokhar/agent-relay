@@ -134,6 +134,16 @@ kill -HUP <relay-pid>
 
 The reload endpoint needs the token and is accepted only from loopback. An invalid registry is rejected and the running registry is kept.
 
+### The update drain (rehearsal)
+
+`/v1/admin/update/drain` is the shared lock a safe update holds across an activation: while it is held, the relay refuses every new external admission — task submissions, workflow submissions and resumes — but already accepted work finishes normally: running tasks, queued tasks, and the child tasks of live workflows (whose engine uses an internal admission path no request field can select). It needs the token and is accepted only from loopback.
+
+- `POST` acquires it: body `{"transactionId": "<name>", "revision": "<40-hex commit of this running relay>"}`. It answers `200` with an opaque `capability` (a token only the relay mints), `held: true`, and the counts that are still running; `409 drain_held` when another transaction already holds it, `409 revision_mismatch` when the body does not name this relay's exact commit, `400` for malformed fields. The acquire and the admission gate are decided under the same server lock, so a racing submission either lands fully or refuses with `503 drain_active`; an idempotent replay of a known `requestId` still returns its prior answer.
+- `GET` asks the holder's status: query `transactionId`, `revision` and `capability`. Only the relay's own answer says whether the held drain is `quiesced` (`active` adapter slots, including cancelled adapters still running, `queued` accepted tasks, and each nonterminal workflow once — a run in a step gap, a retry delay or awaiting fanout still counts). A wrong or replayed capability answers `403 capability_mismatch`, a wrong transaction or revision `409`, a free drain `409 drain_not_held`, and malformed input `400`; no error ever reads as idle, and a status answer never carries a new token.
+- `DELETE` releases it: body `{"transactionId": "...", "revision": "...", "capability": "..."}` with the exact held pair. Admission reopens at once; there is no expiry that reopens it meanwhile, so a lost capability keeps the hold until its explicit release (a relay restart also reopens; that recovery path is for the activation stage).
+
+`python3 src/safe_update.py drain 1.2.3 --install-dir PATH` is the rehearsal consumer: it verifies the recorded stage receipt and the consumed approval consent for the exact release, acquires the drain, waits a bounded time (`--base-url` or `AGENT_RELAY_URL`/`A2A_RELAY_URL`; token from `AGENT_RELAY_TOKEN`) until the server acknowledges quiescence, prints the result and releases. It installs nothing and calls no service control.
+
 ### Per-task options
 
 An agent may declare named options. Each option maps its allowed values to a fixed list of arguments, so a caller chooses among what the owner allows without editing the registry:
