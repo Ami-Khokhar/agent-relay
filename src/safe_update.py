@@ -13,7 +13,12 @@ walks a prepared transaction through its journaled phases, swaps the verified
 source with trusted hook- and filter-disabled git, restarts only a positively
 validated per-user launchd/systemd service, and verifies the restarted relay
 through an authenticated endpoint carrying the exact full commit plus the
-transaction's own barrier ownership.
+transaction's own barrier ownership. A failed or interrupted activation is
+recovered to the exact prior revision, automatically at first and explicitly
+with ``recover`` while an interruption stands: the rollback reads the exact
+prior commit only from the durable journal, never overwrites intervening user
+edits, and holds the admission barrier until the authenticated endpoint again
+reports the exact prior revision.
 """
 
 import argparse
@@ -365,9 +370,14 @@ def cmd_activate(transaction_id, install_dir, *, base_url=None, inspect=None,
 
     Any failed or uncertain step leaves the transaction durably recorded
     (``recovery_required``), the admission barrier retained and external
-    state preserved; a step that failed before the first effect leaves the
-    transaction recoverable through recover-abort. Recovery stays explicit
-    and fail-closed in this release.
+    state preserved, and is then recovered automatically to the exact prior
+    revision the journal names: the rollback restores the source, restarts
+    the same inspected service boundary only when needed, and holds the
+    barrier until the authenticated endpoint again reports the exact prior
+    revision. A rollback step that itself fails keeps the recovery_required
+    record, its barrier and an actionable remedy: the operator finishes it
+    with ``recover``. A step that failed before the first effect still leaves
+    the prepared transaction recoverable through recover-abort.
     """
     state_dir = _state_dir()
     resolved = Path(install_dir).resolve()
@@ -436,30 +446,34 @@ def cmd_activate(transaction_id, install_dir, *, base_url=None, inspect=None,
                           "journal; refusing to activate state where os.flock is "
                           "unavailable")
     lock = update_transaction._flock(update_transaction._lock_path(state_dir))
+    failure = None
+    reverted = {}   # the swap result the activation had reached, if any
     try:
         journal = update_transaction.read_journal(state_dir=state_dir)
         if journal is None or journal.get("transactionId") != transaction_id \
                 or journal.get("phase") != "prepared":
+            # a refusal before any effect: no recovery recording, the raised
+            # error is the whole story
             raise UpdateError("no exactly prepared transaction is recorded for %s; manual "
                               "recovery required" % transaction_id)
-        update_transaction.transition_locked(transaction_id, "prepared", "draining",
-                                             state_dir=state_dir, quiesced=True)
-        update_transaction.transition_locked(transaction_id, "draining", "quiescent",
-                                             state_dir=state_dir, service=service)
-        update_transaction.transition_locked(
-            transaction_id, "quiescent", "activating", state_dir=state_dir,
-            oldRevision=record["revision"], targetCommit=identity["commit"],
-            servicePath=service["path"], serviceDigest=service.get("digest", ""))
         try:
-            swapped = update_staging.activate_transaction_source(record, git=git)
+            update_transaction.transition_locked(transaction_id, "prepared", "draining",
+                                                 state_dir=state_dir, quiesced=True)
+            update_transaction.transition_locked(transaction_id, "draining", "quiescent",
+                                                 state_dir=state_dir, service=service)
+            update_transaction.transition_locked(
+                transaction_id, "quiescent", "activating", state_dir=state_dir,
+                oldRevision=record["revision"], targetCommit=identity["commit"],
+                servicePath=service["path"], serviceDigest=service.get("digest", ""))
+            reverted = update_staging.activate_transaction_source(record, git=git)
             update_transaction.transition_locked(transaction_id, "activating", "restarted",
-                                                 state_dir=state_dir, commit=swapped["target"])
+                                                 state_dir=state_dir, commit=reverted["target"])
             restart(service)
             request = _activated_revision_request(base_url, token)
-            body = update_service.await_revision(swapped["target"],
+            body = update_service.await_revision(reverted["target"],
                                                  authenticated_request=request,
                                                  deadline_s=deadline_s)
-            if body.get("revision", {}).get("commit") != swapped["target"]:
+            if body.get("revision", {}).get("commit") != reverted["target"]:
                 raise UpdateError("the restarted relay did not report the activated "
                                   "commit; refusing")
             barrier = _authenticated_get(base_url, token, BARRIER_PATH)
@@ -474,14 +488,269 @@ def cmd_activate(transaction_id, install_dir, *, base_url=None, inspect=None,
                 raise UpdateError("the activated relay still holds admission closed; "
                                   "open it explicitly before serving work")
         except Exception as exc:
-            _enter_recovery(transaction_id, state_dir, exc)
+            # durably record the failed activation while this lock is still held,
+            # then release it and attempt the automatic rollback below
+            _record_recovery(transaction_id, state_dir, exc)
+            failure = exc
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         os.close(lock)
+    if failure is not None:
+        try:
+            rollback_transaction(transaction_id, state_dir=state_dir, service=service,
+                                 base_url=base_url, token=token, git=git,
+                                 restart=restart, deadline_s=deadline_s)
+        except Exception as rollback_exc:
+            raise UpdateError(
+                "activation failed (%s) and the automatic rollback did not complete (%s); "
+                "the admission barrier still holds admission closed; manual recovery "
+                "required: fix the failing step and run `safe_update recover %s`"
+                % (failure, rollback_exc, transaction_id)) from rollback_exc
+        update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
+        print("Activation failed (%s); the exact prior revision %s was restored and "
+              "verified, transaction %s is finished and admission is open. The target "
+              "release %s was NOT activated." %
+              (failure, reverted.get("previousObject", record["revision"]), transaction_id,
+               identity.get("tag")))
+        return 1
     update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
     print("Activated commit %s and verified it through the authenticated "
           "endpoint; transaction %s is finished and admission is open." %
-          (swapped["target"], transaction_id))
+          (reverted["target"], transaction_id))
+    return 0
+
+
+def _record_recovery(transaction_id, state_dir, exc, **evidence):
+    """Record a durable recovery_required end for a half-built activation.
+
+    The caller holds the transaction lock. A journal of this install for this
+    transaction in a live phase is advanced to ``recovery_required``; a record
+    already in ``recovery_required`` only gains a note. A terminal record stays
+    exactly as it was (its own finalize already carried the proof) and the
+    original failure travels to the caller. A journal write that itself fails
+    masks the failure with the remedied error, since the barrier still holds.
+    """
+    try:
+        record = update_transaction.read_journal(state_dir=state_dir)
+        if record is None or record.get("transactionId") != transaction_id:
+            return  # nothing of ours is recorded; report the failure as it is
+        if record["phase"] == "recovery_required":
+            update_transaction.journal_recovery_note(transaction_id, state_dir=state_dir,
+                                                     reason=str(exc), **evidence)
+        elif record["phase"] in update_transaction.PHASES:
+            update_transaction.transition_locked(transaction_id, record["phase"],
+                                                 "recovery_required", state_dir=state_dir,
+                                                 reason=str(exc), **evidence)
+    except Exception as recovery_exc:
+        raise UpdateError("activation failed (%s) and the recovery record could not be "
+                          "written (%s); the barrier still holds admission closed; "
+                          "manual recovery required" % (exc, recovery_exc)) from exc
+
+
+def rollback_transaction(transaction_id, *, state_dir, service, base_url=None,
+                         token=None, git=None, restart=None, deadline_s=None):
+    """Roll a failed activation back to the exact, journaled prior revision.
+
+    ``transaction_id`` names this install's recorded ``recovery_required``
+    transaction; ``service`` is the positively inspected per-user service
+    boundary of the transaction's checkout. This function takes the
+    transaction/install lock itself and reads the exact prior commit only from
+    the durable journal — never from a branch, main or a release tag. In
+    order, and journaling every step before the next effect: the hashed
+    external references are re-proven, the drain is proven held and quiescent
+    (a restarted relay owing no hold is accepted there, as in recover-abort),
+    the prior commit object is proven retained and the working tree restored
+    only when ``inspect_checkout`` still accepts it (an intervening user edit
+    or unsafe path mutation is refused, never overwritten), the service is
+    restarted only when the running relay does not already report the restored
+    revision, and the admission barrier is held until an authenticated endpoint
+    reports that exact prior revision. Only then is the journal finalized to
+    ``rolled_back`` — which removes the barrier — and the drain released with
+    its own capability. Every failed proof keeps the ``recovery_required``
+    state and its barrier, reports an actionable remedy, and never declares
+    the rollback complete or opens admission.
+
+    Returns ``{"previous", "previousObject", "restored", "serviceRestarted"}
+    when the relay reopened admission; the record is expunged by the caller.
+    Each caller holds no lock across this function."""
+    state_dir = Path(state_dir)
+    if not isinstance(service, dict) or service.get("kind") not in ("launchd", "systemd"):
+        raise UpdateError("rollback needs the positively inspected service boundary of the "
+                          "transaction's checkout")
+    git = git if isinstance(git, update_staging.Git) \
+        else update_staging.Git(git or update_staging.default_git())
+    restart = restart if restart is not None else update_service.restart_service
+    base_url = base_url or update_drain.relay_base_url()
+    if not base_url:
+        raise UpdateError("no relay base URL; pass --base-url or set AGENT_RELAY_URL")
+    if token is None:
+        token = update_drain.relay_token()
+    deadline = update_service.AWAIT_REVISION_S if deadline_s is None else deadline_s
+    lock = update_transaction._flock(update_transaction._lock_path(state_dir))
+    try:
+        record = update_transaction.read_journal(state_dir=state_dir)
+        if record is None or record.get("transactionId") != transaction_id:
+            raise UpdateError("no recorded transaction %s to roll back; nothing to recover"
+                              % transaction_id)
+        if record["phase"] != "recovery_required":
+            raise UpdateError("the transaction is in phase %r, not %r; rollback recovers "
+                              "only a failed activation (run recover-abort for a prepared "
+                              "one)" % (record["phase"], "recovery_required"))
+        revision = record["revision"]
+        drain = record.get("drain")
+        if not isinstance(drain, dict) or drain.get("revision") != revision \
+                or not isinstance(drain.get("capability"), str) or not drain["capability"]:
+            raise UpdateError("the transaction does not name the drain it owned; manual "
+                              "recovery required")
+        _proof_references(record, state_dir)
+        update_transaction.journal_recovery_note(transaction_id, state_dir=state_dir,
+                                                 recovery="started")
+        try:
+            status = update_drain.drain_status(base_url, transaction_id, token=token,
+                                               revision=revision,
+                                               capability=drain["capability"])
+        except (update_drain.DrainError, KeyError) as exc:
+            if isinstance(exc, update_drain.DrainError) and exc.code == "drain_not_held":
+                # a restarted relay owes no hold: the hold is provably gone
+                status = None
+            else:
+                raise UpdateError("the transaction's drain could not be proven; the hold "
+                                  "stands and recovery is required: %s" % exc) from exc
+        if status is not None and not status.get("quiesced"):
+            raise UpdateError("the relay had not quiesced when the rollback was ordered "
+                              "(active=%(active)s queued=%(queued)s workflows=%(workflows)s); "
+                              "no active work may be interrupted; manual recovery required"
+                              % status)
+        reverted = update_staging.rollback_transaction_source(record, git=git)
+        update_transaction.journal_recovery_note(transaction_id, state_dir=state_dir,
+                                                 recovery="source-restored",
+                                                 restored=reverted["restored"])
+        request = _activated_revision_request(base_url, token)
+        # a repeated recovery never repeats a service action: the service is
+        # restarted only when the running relay does not already report the
+        # exact restored revision through the authenticated endpoint. A relay
+        # whose source never moved and one restarted after the restore both
+        # report the restored commit already; anything else is restarted once.
+        needs_restart = False
+        try:
+            probe = _authenticated_get(base_url, token, AGENTS_PATH)
+        except update_drain.DrainError:
+            probe = None  # an unreachable probe is a reason to restart, not a verdict
+        if isinstance(probe, dict) and isinstance(probe.get("revision"), dict) \
+                and probe["revision"].get("commit") == revision:
+            pass
+        else:
+            needs_restart = True
+        if needs_restart:
+            restart(service)
+            update_transaction.journal_recovery_note(transaction_id, state_dir=state_dir,
+                                                     recovery="service-restarted")
+            body = update_service.await_revision(revision, authenticated_request=request,
+                                                 deadline_s=deadline)
+            if body.get("revision", {}).get("commit") != revision:
+                raise UpdateError("the restarted relay did not report the restored "
+                                  "revision %s; the transaction stays recovery_required" % revision)
+        # the barrier held until here; finalize atomically: rolled_back removes it
+        update_transaction.transition_locked(transaction_id, "recovery_required",
+                                             "rolled_back", state_dir=state_dir,
+                                             reason="failed activation rolled back",
+                                             restoredRevision=revision,
+                                             serviceRestarted=needs_restart)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+    try:
+        update_drain.release_drain(base_url, transaction_id, token=token,
+                                   revision=revision, capability=drain["capability"])
+        hold = "the drain was released with its own capability"
+    except update_drain.DrainError as exc:
+        if exc.code != "drain_not_held":
+            raise UpdateError("the rollback record is durable and the relay reports the "
+                              "restored revision %s, but the drain could not be released; "
+                              "release it explicitly first: %s" % (revision, exc))
+        hold = "the restarted relay owed no drain hold; nothing was released"
+    try:
+        refresh = _refresh_barrier(base_url, token)
+        if refresh.get("admissionClosed"):
+            raise update_drain.DrainError(
+                "barrier_still_closed",
+                "the relay still reports admission closed after the rollback")
+    except update_drain.DrainError as exc:
+        raise UpdateError("the rollback of %s is durable (phase rolled_back) but the relay "
+                          "has not reopened admission (%s); fix the relay and run "
+                          "`safe_update recover %s` to retry the refresh"
+                          % (transaction_id, exc, transaction_id))
+    print("Rolled transaction %s back to the exact prior revision %s, verified through "
+          "the authenticated endpoint; %s and admission is open." %
+          (transaction_id, revision, hold))
+    return {"previous": revision, "restored": reverted["restored"],
+            "serviceRestarted": needs_restart}
+
+
+def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
+                deadline_s=None):
+    """Recover a failed activation to the exact, verified prior revision.
+
+    Runs the rollback of this issue's ``recovery_required`` transactions
+    (``rollback_transaction``) through the same restricted source/service
+    boundaries activation used, and no other. Only this install's recorded
+    transaction is recovered: a wrong-device journal is refused by the reader,
+    another transaction's id is refused as a replay, and a terminal record is
+    finalized read-only — a rolled-back record only retries the one pending
+    barrier refresh and is then expunged, never repeating a service action or
+    reopening anything twice. Every failed proof keeps the failed state and
+    its barrier and names the remedy.
+    """
+    state_dir = _state_dir()
+    record = update_transaction.recover_transaction(state_dir=state_dir)
+    if record is None:
+        raise UpdateError("no update transaction is recorded for this installation; "
+                          "nothing to recover")
+    if record["transactionId"] != transaction_id:
+        raise UpdateError("the recorded transaction is %s, not %s; refusing to replay "
+                          "another transaction's recovery"
+                          % (record["transactionId"], transaction_id))
+    if record["phase"] == "activated":
+        update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
+        print("Transaction %s already finished as activated; its durable record was "
+              "expunged and nothing else was done." % transaction_id)
+        return 0
+    if record["phase"] == "rolled_back":
+        base_url, token = _authorize_drain(base_url)
+        try:
+            refresh = _refresh_barrier(base_url, token)
+            if refresh.get("admissionClosed"):
+                raise update_drain.DrainError("barrier_still_closed",
+                                              "the relay still reports admission closed")
+        except update_drain.DrainError as exc:
+            raise UpdateError("the rolled-back record of %s is durable, but the relay has "
+                              "not reopened admission (%s); fix the relay and run recover "
+                              "again" % (transaction_id, exc)) from exc
+        update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
+        print("Transaction %s was already rolled back; the relay reopened admission and "
+              "the record is expunged." % transaction_id)
+        return 0
+    if record["phase"] != "recovery_required":
+        raise UpdateError("the transaction is in phase %r; recover recovers only a failed "
+                          "activation (recovery_required), recover-abort aborts a "
+                          "prepared one" % record["phase"])
+    base_url, token = _authorize_drain(base_url)
+    root = (record.get("inventory") or {}).get("sourceRoot")
+    if not root:
+        raise UpdateError("the transaction does not name its checkout; manual recovery "
+                          "required")
+    boundary = inspect if inspect is not None else update_service.inspect_service
+    service = boundary(root)
+    try:
+        rollback_transaction(transaction_id, state_dir=state_dir, service=service,
+                             base_url=base_url, token=token, restart=restart,
+                             deadline_s=deadline_s)
+    except UpdateError as exc:
+        raise UpdateError("recovery of %s did not complete (%s); the failed state and "
+                          "its barrier are retained; fix the failing step and run "
+                          "`safe_update recover %s`" % (transaction_id, exc, transaction_id)) from exc
+    update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
+    print("Recovery finished: transaction %s is expunged and admission is open." % transaction_id)
     return 0
 
 
@@ -683,6 +952,15 @@ def main(argv=None):
     subcommands.add_parser(
         "status", help="print the recorded update transaction of this installation, if any")
     recover = subcommands.add_parser(
+        "recover", help="recover a failed activation (recovery_required) to the exact, "
+        "journaled prior revision through the same restricted source/service "
+        "boundary; anything uncertain stays recovery_required with its barrier closed")
+    recover.add_argument("transaction_id", metavar="TRANSACTION-ID",
+                         help="the failed transaction to roll back")
+    recover.add_argument("--base-url", default=None,
+                         help="the running relay to prove and release; default "
+                              "AGENT_RELAY_URL or A2A_RELAY_URL")
+    recover = subcommands.add_parser(
         "recover-abort", help="abort a prepared activation transaction after proving the "
         "original revision, unchanged source and state and that no activation occurred; "
         "anything else is refused for manual recovery")
@@ -707,6 +985,8 @@ def main(argv=None):
                                 base_url=args.base_url)
         if args.command == "status":
             return cmd_status()
+        if args.command == "recover":
+            return cmd_recover(args.transaction_id, base_url=args.base_url)
         if args.command == "recover-abort":
             return cmd_recover_abort(args.transaction_id, base_url=args.base_url)
         return handlers[args.command](args.tag)
