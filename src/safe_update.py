@@ -725,9 +725,23 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
                           "another transaction's recovery"
                           % (record["transactionId"], transaction_id))
     if record["phase"] == "activated":
+        # the activation stands; its only outstanding effect is the admission
+        # barrier, whose refresh the original activate could not confirm —
+        # expunge the record only once admission is verifiably open, like the
+        # rolled_back branch, so the named remedy cannot strand the barrier
+        base_url, token = _authorize_drain(base_url)
+        try:
+            refresh = _refresh_barrier(base_url, token)
+            if refresh.get("admissionClosed"):
+                raise update_drain.DrainError("barrier_still_closed",
+                                              "the relay still reports admission closed")
+        except update_drain.DrainError as exc:
+            raise UpdateError("the activated record of %s is durable, but the relay has "
+                              "not reopened admission (%s); fix the relay and run "
+                              "recover again" % (transaction_id, exc)) from exc
         update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
-        print("Transaction %s already finished as activated; its durable record was "
-              "expunged and nothing else was done." % transaction_id)
+        print("Transaction %s already finished as activated; admission is open and "
+              "its durable record was expunged and nothing else was done." % transaction_id)
         return 0
     if record["phase"] == "rolled_back":
         base_url, token = _authorize_drain(base_url)

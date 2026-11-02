@@ -44,6 +44,7 @@ class _RollbackCase(_Case):
         self.serving = self.fixture.old   # the commit the fake relay was started with
         self.serving_stuck = False        # set True: the relay never picks up new code
         self.refresh_raises = None
+        self.refresh_calls = 0
         self.probe_raises = None
         self._fault_patchers = []
         self._patch(safe_update, "_authenticated_get", self._fake_auth_get)
@@ -58,6 +59,7 @@ class _RollbackCase(_Case):
         return {"transactionId": transaction_id}
 
     def _refresh(self, _base, _token):
+        self.refresh_calls += 1
         if self.refresh_raises is not None:
             raise self.refresh_raises
         return {"admissionClosed": False}
@@ -502,14 +504,49 @@ class PostActivatedFailureTest(_RollbackCase):
                          "the drain hold of a standing activation is not released")
         self.assertEqual(len(self.restart_commands), 1,
                          "only the activation restart ran; no rollback restart")
-        # the named remedy works: recover expunges the activated record without
-        # repeating a service action or any rollback
+        # the named remedy works: recover refreshes the admission barrier and
+        # only then expunges the activated record, without repeating a service
+        # action or any rollback
+        self.refresh_raises = None
+        self.refresh_calls = 0
         rc = self.run_recover()
         self.assertEqual(rc, 0)
+        self.assertGreaterEqual(self.refresh_calls, 1,
+                                "recover of an activated record refreshes the barrier")
         self.assertIsNone(update_transaction.read_journal(state_dir=self.state),
                           "the activated record is expunged read-only")
         self.assertEqual(len(self.restart_commands), 1,
                          "recovery of a standing activation repeats no service action")
+
+    def test_a_recover_refresh_failure_keeps_the_activated_record(self):
+        """Guard: if the barrier refresh still refuses, recover of an activated
+        record keeps the record and its barrier — it must never expunge the
+        only proof the activation stands while admission stays closed.
+        """
+        self.refresh_raises = update_drain.DrainError("drain_unreachable", "down")
+        with self.assertRaises(identity.UpdateError) as caught:
+            self.run_activate()
+        self.assertIn("durable as activated", str(caught.exception))
+        self.refresh_calls = 0
+        with self.assertRaises(identity.UpdateError) as caught:
+            self.run_recover()
+        message = str(caught.exception)
+        self.assertGreaterEqual(self.refresh_calls, 1,
+                                "the recover did attempt the barrier refresh")
+        self.assertIn("has not reopened admission", message)
+        self.assertIn("recover again", message,
+                      "the refusal names the retry remedy, not an expunge")
+        record = update_transaction.read_journal(state_dir=self.state)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["phase"], "activated",
+                         "the durable activated record is kept, not expunged")
+        self.assertEqual(len(self.restart_commands), 1,
+                         "a refused recover repeats no service action")
+        # once the refresh succeeds, the remedy works as before
+        self.refresh_raises = None
+        rc = self.run_recover()
+        self.assertEqual(rc, 0)
+        self.assertIsNone(update_transaction.read_journal(state_dir=self.state))
 
 
 if __name__ == "__main__":
