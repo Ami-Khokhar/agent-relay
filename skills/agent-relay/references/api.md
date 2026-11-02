@@ -43,6 +43,7 @@ next run is restarted, since an old relay cannot report counts).
     "cwd": "/path/to/project", "allowedRoots": ["/path/to/project"],
     "options": { "effort": ["low", "high"] },
     "readOnly": "supported", "readOnlySandboxed": true,
+    "role": "reviewer", "roleDescription": "Reviews a change against the stated intent.",
     "capabilities": { "newTasks": true, "nativeSessions": false, "streaming": false,
                       "cancellation": "process_signal" } }
 ], "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
@@ -50,7 +51,8 @@ next run is restarted, since an old relay cannot report counts).
 ```
 
 `revision` is the same object as in `GET /healthz`. `timeoutMs` is the effective timeout for that agent. `cancellation` is `process_signal`
-for command/stdio adapters and `request_only` for HTTP. `cwd`, `allowedRoots`, and
+for command/stdio adapters and `request_only` for HTTP. `role` and `roleDescription` appear only
+when the agent names a role in the registry; the instructions themselves are never listed. `cwd`, `allowedRoots`, and
 `delegateTo` (the agents its tasks may delegate to) appear only when configured. `options`
 maps each option name the agent declares to its allowed values, and appears only when the agent
 declares options. `readOnly` is `supported` or `unsupported` for every agent: `supported` means
@@ -75,7 +77,7 @@ Body:
 | `cwd` | no | Absolute or relative path. Must be inside the agent's `allowedRoots` (or equal to its `cwd`), else `400 cwd_not_allowed`. |
 | `waitMs` | no | The wait you mean to use next on `GET /v1/tasks/:id?waitMs=`. The relay checks it before it creates the task: a value that is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS` returns `400 invalid_wait` (message names the range) and creates nothing. The submission does not wait; it still returns `202`. It is not stored on the task. The check sits after the idempotent-replay decision: a replay (`requestId` matching a stored task with identical fields) ignores an invalid `waitMs` and returns `200` with the stored task, because the wait is advisory and a replay creates nothing; a replay with changed fields still returns `409`. |
 | `options` | no | Object of option name to value string, for example `{"effort": "high"}`. Each name and value must be declared in the agent's registry `options`; the relay adds the args the owner mapped to them after the agent's `args` and before `input`. An undeclared name is `400 unknown_option`, an undeclared value `400 invalid_option_value`, a non-object or non-string value `400 invalid_options`. |
-| `readOnly` | no | `true` requires a run that cannot change files: the agent's `readOnly` profile args are added after its `args` and options and, when the profile sets `sandbox`, the run is wrapped in `sandbox-exec`. An agent without a profile (or whose sandbox needs macOS) returns `400 read_only_unsupported`; a sandboxed profile with no `cwd` on the task or agent returns `400 cwd_required`; a value that is not `true` or `false`, including `null`, returns `400 invalid_read_only`. For a `command` agent whose profile has `args` and no `inputSeparator`, an `input` that starts with `-` returns `400 invalid_input` (it could be read as an option that overrides the profile's args); with an `inputSeparator` the relay puts it before the input and any input is accepted. A `stdio` agent is not checked. The relay checks the task against the registry entry again when it dispatches a queued task, so a reload in between cannot turn a read-only task into an unenforced one: the task ends `failed` and its `error` starts with the code submission would have given (see "Task errors" below). Default `false`. |
+| `readOnly` | no | `true` requires a run that cannot change files: the agent's `readOnly` profile args are added after its `args` and options and, when the profile sets `sandbox`, the run is wrapped in `sandbox-exec`. An agent without a profile (or whose sandbox needs macOS) returns `400 read_only_unsupported`; a sandboxed profile with no `cwd` on the task or agent returns `400 cwd_required`; a value that is not `true` or `false`, including `null`, returns `400 invalid_read_only`. For a `command` agent whose profile has `args` and no `inputSeparator`, an `input` that starts with `-` returns `400 invalid_input` (it could be read as an option that overrides the profile's args); the check reads the text the command receives, so a role that prepends its instructions makes such an input safe; with an `inputSeparator` the relay puts it before the input and any input is accepted. A `stdio` agent is not checked. The relay checks the task against the registry entry again when it dispatches a queued task, so a reload in between cannot turn a read-only task into an unenforced one: the task ends `failed` and its `error` starts with the code submission would have given (see "Task errors" below). Default `false`. |
 | `parentTaskId` | no | Task delegating this one (the MCP `delegate` tool sends `AGENT_RELAY_PARENT_TASK_ID`). Applies the delegation policy: `delegateTo`, cycles, `AGENT_RELAY_MAX_DELEGATION_DEPTH`, `AGENT_RELAY_MAX_DELEGATED_TASKS`. |
 
 Unknown fields are rejected with `400 unknown_field`. Returns `202` with the task:
@@ -83,7 +85,8 @@ Unknown fields are rejected with `400 unknown_field`. Returns `202` with the tas
 ```json
 { "id": "uuid", "sessionId": "uuid", "agentId": "claude", "inputChars": 42,
   "status": "queued", "createdAt": "ISO-8601", "timeoutMs": 900000,
-  "cwd": "/path/to/project", "requestId": "..." }
+  "cwd": "/path/to/project", "requestId": "...", "role": "reviewer",
+  "rolePromptSha256": "24ec5ae71354" }
 ```
 
 Task objects never echo `input`: they carry `inputChars` (its length in characters). Only
@@ -322,7 +325,7 @@ Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow ste
 | 404 | `unknown_agent`, `unknown_task`, `unknown_workflow`, `not_found` | Missing agent/task/run/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
 | 409 | `idempotency_conflict`, `workflow_active`, `delegation_cycle`, `delegation_depth_exceeded` | `requestId` reused with different fields; resume requested while the run is still going; target already in the delegation chain; chain too deep. |
-| 413 | `command_input_too_large` (and body-too-large) | Input/body exceeds a limit. |
+| 413 | `command_input_too_large`, `role_input_too_large` (and body-too-large) | Input plus a role's instructions, or the body, exceeds a limit. |
 | 415 | `unsupported_media_type` | `POST /v1/tasks` or `POST /v1/workflows` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
@@ -336,6 +339,7 @@ A task can also end `failed` after it was accepted, with a code at the start of 
 | Code | Meaning |
 | --- | --- |
 | `read_only_unsupported`, `cwd_required`, `invalid_input`, `unknown_option`, `invalid_option_value` | A registry reload while the task was queued changed its agent, and the current entry no longer allows what the task asked for. The same codes as at submission; nothing ran. |
+| `role_removed`, `role_input_too_large` | A role worker's task was queued and the reloaded entry either lost its `role` or carries instructions that no longer fit the command line. Nothing ran, and the record keeps the role it was accepted under. |
 | `read_only_git_unknown` | A sandboxed `readOnly` task's `cwd` is in a git repository (a `.git` file or directory, or a directory with `HEAD`, `objects` and `refs` as a bare repository has, exists at or above it) but `git rev-parse` could not say where its git metadata is: git missing or not runnable, slower than 5 s or than the task's remaining time, non-zero exit (including a repository whose owner git does not trust: the relay ignores the global git config, so `safe.directory` there does not help), or unusable output. The relay runs its trusted git (`/usr/bin/git`, or the owner's `AGENT_RELAY_GIT`) by absolute path in a minimal environment. It fails closed and does not run the task with less protection. This is a failed task and not a `400`, because the lookup runs when the sandbox is built, at dispatch. A `cwd` with no such sign above it needs no git and runs. |
 
 A task whose time runs out while the relay is still locating git metadata ends `timed_out` and its adapter never starts.
@@ -390,6 +394,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `cwd` | if set | Effective working directory for the task. |
 | `options` | if supplied | The option values the task chose, for example `{"effort": "high"}`. |
 | `readOnly` | if `true` | The task was submitted as read-only. |
+| `role` | if the agent carries a role | Role id of the entry that runs the task. |
+| `rolePromptSha256` | if the agent carries a role | First 12 hex characters of the instructions' SHA-256, refreshed at dispatch; the prompt text is never echoed. |
 | `requestId` | if supplied | Echoed idempotency key. |
 | `parentTaskId` | delegated tasks | Task that delegated this one. |
 | `depth` | always | `0` for a root task, parent depth + 1 when delegated. |

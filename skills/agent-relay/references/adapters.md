@@ -19,6 +19,16 @@ The relay sends exactly one request document:
 }
 ```
 
+When the agent's role sets `"delivery": "adapter"`, the document also carries the role as its own
+field, so the wrapper can pass it to the harness as a system prompt:
+
+```json
+{"protocolVersion": "relay.adapter/v1", "role": {"id": "reviewer", "instructions": "You review the change."}, "task": {"id": "relay-task-id", "sessionId": "correlation-id", "input": "do the work", "timeoutMs": 900000}}
+```
+
+With the default `"delivery": "prepend"` the instructions are already in `task.input` and there is
+no `role` field. An agent with no role sends the document above unchanged.
+
 The adapter returns exactly one result document:
 
 ```json
@@ -56,9 +66,10 @@ import json
 import sys
 
 
-def run_harness(prompt):
+def run_harness(prompt, instructions=None):
     # Call the harness here and return its text result.
-    # Example: run its CLI and capture stdout.
+    # Example: run its CLI and capture stdout. Pass `instructions` to the harness's
+    # system prompt when it accepts one; a role sends them as "delivery": "adapter".
     return f"example harness received: {prompt}"
 
 
@@ -70,7 +81,9 @@ def main():
         if request.get("protocolVersion") != "relay.adapter/v1" \
                 or not isinstance(task, dict) or not isinstance(task.get("input"), str):
             raise ValueError("invalid relay.adapter/v1 request")
-        output = run_harness(task["input"])
+        role = request.get("role")
+        instructions = role.get("instructions") if isinstance(role, dict) else None
+        output = run_harness(task["input"], instructions)
         result = {"protocolVersion": "relay.adapter/v1", "status": "completed", "output": output}
     except Exception as exc:
         result = {"protocolVersion": "relay.adapter/v1", "status": "failed", "error": str(exc)}

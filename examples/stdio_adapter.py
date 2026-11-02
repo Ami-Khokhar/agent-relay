@@ -11,7 +11,14 @@ import json
 import sys
 
 
-def run_harness(prompt):
+def run_harness(prompt, instructions=None):
+    """Run the harness with the task text, and with the role's instructions when the relay sent them.
+
+    A role declared with "delivery": "adapter" arrives as its own field, so it can go where the
+    harness keeps its system prompt; a harness with no such flag can take them as a prompt prefix.
+    """
+    if instructions:
+        return f"example harness received a system prompt and: {prompt}"
     return f"example harness received: {prompt}"
 
 
@@ -23,7 +30,9 @@ def main():
         if request.get("protocolVersion") != "relay.adapter/v1" or not isinstance(task, dict) \
                 or not isinstance(task.get("input"), str):
             raise ValueError("invalid relay.adapter/v1 request")
-        output = run_harness(task["input"])
+        role = request.get("role")
+        instructions = role.get("instructions") if isinstance(role, dict) else None
+        output = run_harness(task["input"], instructions)
         result = {"protocolVersion": "relay.adapter/v1", "status": "completed", "output": output}
     except Exception as exc:  # noqa: BLE001 - report any failure as a relay.adapter/v1 result
         result = {"protocolVersion": "relay.adapter/v1", "status": "failed", "error": str(exc)}

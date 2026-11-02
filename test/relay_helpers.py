@@ -58,11 +58,16 @@ def free_port():
 class Relay:
     """Spawns the given server.py (default src/server.py) with an agent registry and talks over HTTP."""
 
-    def __init__(self, agent, env=None, server=SERVER):
+    def __init__(self, agent, env=None, server=SERVER, files=None):
         self.dir = tempfile.mkdtemp(prefix="a2a-relay-")
         self.config = os.path.join(self.dir, "agents.json")
-        with open(self.config, "w", encoding="utf-8") as handle:
-            json.dump({"agents": agent if isinstance(agent, list) else [agent]}, handle)
+        # A role's promptFile resolves against the registry's directory, so write it here first.
+        for name, text in (files or {}).items():
+            path = os.path.join(self.dir, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        self.write_registry(agent)
         self.port = free_port()
         # No test reads the developer's real host. The guard thread is off, and the probes answer
         # from stubs, because the submission preflight reads pressure whether or not the guard
@@ -92,6 +97,20 @@ class Relay:
         except BaseException:
             self.close()  # a relay that never became ready must not outlive the failed start
             raise
+
+    def write_registry(self, config):
+        """Write the registry. A dict with an ``agents`` key is used as it is, so a test can declare
+        top-level keys such as ``roles``; otherwise it is one agent or a list of them."""
+        if isinstance(config, dict) and "agents" in config:
+            document = config
+        else:
+            document = {"agents": config if isinstance(config, list) else [config]}
+        with open(self.config, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+
+    def reload(self):
+        """Reload the registry, as POST /v1/admin/reload does, and return the response."""
+        return self.request("POST", "/v1/admin/reload")
 
     def _wait_ready(self):
         # Generous: the suite also runs on a loaded CI runner, where the interpreter alone can take
