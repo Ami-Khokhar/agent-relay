@@ -133,6 +133,10 @@ Per-agent optional fields:
   `cwd` (a worktree's too), read the relay token, or connect to the relay port. Must set `args`, `sandbox`, or both. `command` and `stdio` agents
   only. A `command` profile may add `"inputSeparator": "--"`, which the relay puts before the
   input so the input cannot be read as an option. See "Read-only tasks" below.
+- `role` — a role id from the registry's top-level `roles` block, for example
+  `"role": "reviewer"`. The role's instructions go to every task this agent runs, so the same
+  harness and model can be registered twice under two roles. `list_agents` shows `role` and
+  `roleDescription`, so pick a worker by role. See "Worker roles" below.
 - `capabilities` may only declare what is true; the relay rejects `nativeSessions: true`,
   `streaming: true`, and `newTasks: false` in this version.
 
@@ -306,6 +310,17 @@ has `args` and no `inputSeparator`, a read-only input that starts with `-` is re
 again when a queued task is dispatched: if a registry reload meanwhile removed the profile or made
 the agent an `http` adapter, or removed the `inputSeparator` that made the input safe, the task ends
 `failed` with `read_only_unsupported: ...` (or `invalid_input: ...`) and never runs.
+
+**Worker roles.** A worker can carry a role, and the role carries the instructions for the job it
+does. The registry declares `roles` at the top level (`description`, and `prompt` or `promptFile`;
+optional `inputHeader`; `delivery` is `prepend` or `adapter`) and an agent names one with
+`"role": "reviewer"`. `list_agents` shows `role` and `roleDescription`, so pick a worker by the job
+it does instead of remembering which model id means "reviewer". The instructions go to every task
+that worker runs, so `delegate` sends only the task. Nothing about the role is a task field: a
+caller cannot change it. The task record carries `role` and `rolePromptSha256`, never the prompt
+text. A `command` agent gets the instructions on its command line, so they count against
+`AGENT_RELAY_MAX_COMMAND_INPUT_BYTES` and an input that no longer fits is refused with
+`413 role_input_too_large`.
 
 What the sandbox blocks: writes under the task's `cwd` and the agent's `allowedRoots` (a new hard
 link to a file there too); writes to the git metadata of the `cwd`, which for a git worktree lives

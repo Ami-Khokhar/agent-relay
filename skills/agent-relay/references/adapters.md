@@ -19,6 +19,17 @@ The relay sends exactly one request document:
 }
 ```
 
+When the agent's role sets `"delivery": "adapter"`, the document also carries the role as its own
+field, so the wrapper can pass it to the harness as a system prompt:
+
+```json
+{"protocolVersion": "relay.adapter/v1", "role": {"id": "reviewer", "instructions": "You review the change."},
+ "task": {"id": "relay-task-id", "sessionId": "correlation-id", "input": "do the work", "timeoutMs": 900000}}
+```
+
+With the default `"delivery": "prepend"` the instructions are already in `task.input` and there is
+no `role` field. An agent with no role sends the document above unchanged.
+
 The adapter returns exactly one result document:
 
 ```json

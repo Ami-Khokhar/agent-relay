@@ -43,6 +43,7 @@ next run is restarted, since an old relay cannot report counts).
     "cwd": "/path/to/project", "allowedRoots": ["/path/to/project"],
     "options": { "effort": ["low", "high"] },
     "readOnly": "supported", "readOnlySandboxed": true,
+    "role": "reviewer", "roleDescription": "Reviews a change against the stated intent.",
     "capabilities": { "newTasks": true, "nativeSessions": false, "streaming": false,
                       "cancellation": "process_signal" } }
 ], "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
@@ -50,7 +51,8 @@ next run is restarted, since an old relay cannot report counts).
 ```
 
 `revision` is the same object as in `GET /healthz`. `timeoutMs` is the effective timeout for that agent. `cancellation` is `process_signal`
-for command/stdio adapters and `request_only` for HTTP. `cwd`, `allowedRoots`, and
+for command/stdio adapters and `request_only` for HTTP. `role` and `roleDescription` appear only
+when the agent names a role in the registry; the instructions themselves are never listed. `cwd`, `allowedRoots`, and
 `delegateTo` (the agents its tasks may delegate to) appear only when configured. `options`
 maps each option name the agent declares to its allowed values, and appears only when the agent
 declares options. `readOnly` is `supported` or `unsupported` for every agent: `supported` means
