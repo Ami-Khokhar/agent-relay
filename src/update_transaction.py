@@ -280,6 +280,10 @@ def admission_blocker(*, state_dir, running_revision=None):
     barrier = None
     try:
         record = read_journal(state_dir)
+        if record is not None:
+            # A valid-JSON but incomplete record would KeyError instead of
+            # UpdateError; shape-check it here so admission fails closed.
+            record = _check_shape(record, "transaction journal", TRANSACTION_SCHEMA)
         barrier = read_barrier(state_dir)
     except UpdateError as exc:
         return {"transactionId": None, "reason": str(exc)}
@@ -356,6 +360,7 @@ def begin_transaction(receipt, *, state_dir):
     try:
         record = read_journal(state_dir)
         if record is not None:
+            _check_shape(record, "transaction journal", TRANSACTION_SCHEMA)
             if record["phase"] not in TERMINAL_PHASES:
                 raise UpdateError(
                     "transaction %s is already live in %r; one install holds one update "
@@ -439,6 +444,7 @@ def transition(transaction_id, expected_phase, next_phase, *, state_dir, **evide
         record = read_journal(state_dir)
         if record is None:
             raise UpdateError("no transaction is recorded in %s; nothing to transition" % lane)
+        _check_shape(record, "transaction journal", TRANSACTION_SCHEMA)
         if record["binding"] != install_fingerprint(state_dir):
             raise UpdateError("the transaction journal was written for another device or "
                               "install; refusing unsafe state")
@@ -476,6 +482,7 @@ def clear_transaction(transaction_id, *, state_dir):
         record = read_journal(state_dir)
         if record is None:
             return None
+        _check_shape(record, "transaction journal", TRANSACTION_SCHEMA)
         if record["binding"] != install_fingerprint(state_dir):
             raise UpdateError("the transaction journal was written for another device or "
                               "install; refusing unsafe state")

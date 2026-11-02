@@ -426,6 +426,23 @@ class RelayBarrierTest(_Case):
         self.assertEqual((status, body.get("error")), (503, "update_barrier_active"))
 
 
+    def test_an_incomplete_but_valid_json_journal_fails_closed(self):
+        """Guard: a shaped-yet-incomplete journal record (valid JSON, missing
+        the keys readers index) must fail closed into a 503 refusal, not a
+        KeyError that kills the relay before it serves even reads."""
+        update_dir = self.state / "update"
+        update_dir.mkdir(mode=0o700, exist_ok=True)
+        journal = update_dir / "transaction.json"
+        journal.write_text(json.dumps({"schema": "agent-relay.update-transaction/v1"}))
+        os.chmod(journal, 0o600)
+        relay = self._relay()
+        self.assertEqual(relay.request("GET", "/healthz")[0], 200,
+                         "reads are not admissions and never die on incomplete state")
+        status, body = relay.submit(agentId="worker", input="hello")
+        self.assertEqual((status, body.get("error")), (503, "update_barrier_active"),
+                         "an incomplete journal is untrustworthy and refuses admission")
+        relay.close()
+
     def test_cli_recover_abort_reopens_admission_after_a_relay_restart(self):
         """Guard: after a restart the hold is gone (`drain_not_held`), yet the
         operator CLI — not a direct journal call — must still open admission."""
