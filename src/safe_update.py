@@ -7,9 +7,13 @@ interactive, private, 15-minute device-local consent record, and ``stage``
 builds an isolated private repository holding the exact approved commit —
 only for a positively identified clean canonical source checkout, only
 while the recorded consent is still valid, and never by executing any
-staged content. Nothing is installed or activated by any of these
-commands; later stages will extend the same CLI to consume the verified
-stage.
+staged content. Nothing is installed, activated or restarted by these
+commands. This issue adds ``activate``, the first activation consumer: it
+walks a prepared transaction through its journaled phases, swaps the verified
+source with trusted hook- and filter-disabled git, restarts only a positively
+validated per-user launchd/systemd service, and verifies the restarted relay
+through an authenticated endpoint carrying the exact full commit plus the
+transaction's own barrier ownership.
 """
 
 import argparse
@@ -18,6 +22,11 @@ import os
 import sys
 import time
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX: importing this module must keep working there
+    fcntl = None
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, build_opener
@@ -26,11 +35,14 @@ import hashlib
 
 import release_identity
 import update_drain
+import update_service
 import update_staging
 import update_transaction
 from release_identity import UpdateError
 
 STATE_LABEL = "release update consent"
+BARRIER_PATH = "/v1/admin/update/state"
+AGENTS_PATH = "/v1/agents"
 JSON_ACCEPT = "application/vnd.github+json"
 # The manifest asset is file content: GitHub answers the JSON Accept header with
 # asset metadata, so it must be requested with the octet-stream Accept header.
@@ -323,6 +335,181 @@ def _release_drain_after_failure(base_url, transaction_id, token, acquired):
     return "the acquired drain hold was released again"
 
 
+def _authenticated_get(base_url, token, path):
+    """One authenticated GET against the relay; a refusal is an error, never a guess."""
+    status, body = update_drain._request("GET", base_url, path, token=token)
+    if status != 200:
+        message = (body or {}).get("message", status)
+        raise update_drain.DrainError("state_refused_%d" % status,
+                                      "the relay refused %s: %s" % (path, message),
+                                      status=status)
+    if not isinstance(body, dict):
+        raise update_drain.DrainError("unknown_health", "the relay gave no JSON object")
+    return body
+
+
+def cmd_activate(transaction_id, install_dir, *, base_url=None, inspect=None,
+                 restart=None, deadline_s=None):
+    """Activate the exact staged revision through the restricted service boundary.
+
+    Everything is proven again before one durable effect: the hashed external
+    references are unchanged, the relay still runs the exact starting revision
+    and this transaction's drain is held and quiesced, the stage still
+    verifies, the checkout is the prepared original, and the per-user service
+    definition positively names this install dir. Only then, inside the
+    transaction/install lock, does the flow walk the journal through its
+    phases, swapping the source with the journaled exact-revision activation,
+    restarting the service and verifying the restarted relay via an
+    authenticated endpoint carrying the exact full commit plus the barrier's
+    transaction ownership — never a mere ok:true or an open port.
+
+    Any failed or uncertain step leaves the transaction durably recorded
+    (``recovery_required``), the admission barrier retained and external
+    state preserved; a step that failed before the first effect leaves the
+    transaction recoverable through recover-abort. Recovery stays explicit
+    and fail-closed in this release.
+    """
+    state_dir = _state_dir()
+    resolved = Path(install_dir).resolve()
+    record = update_transaction.recover_transaction(state_dir=state_dir)
+    if record is None:
+        raise UpdateError("no update transaction is recorded; nothing to activate")
+    if record["transactionId"] != transaction_id:
+        raise UpdateError("the recorded transaction is %s, not %s; refusing to replay "
+                          "another transaction's activation"
+                          % (record["transactionId"], transaction_id))
+    if record["phase"] != "prepared":
+        raise UpdateError("the transaction is in phase %r: manual recovery required; "
+                          "only a prepared transaction may be activated"
+                          % record["phase"])
+    drain = record.get("drain")
+    if not isinstance(drain, dict) or drain.get("revision") != record["revision"] \
+            or not isinstance(drain.get("capability"), str) or not drain.get("capability"):
+        raise UpdateError("the transaction does not name the drain it owned; manual "
+                          "recovery required")
+    identity = (record.get("target") or {}).get("identity")
+    if not isinstance(identity, dict) or \
+            release_identity.identity_digest(identity) != (record.get("target") or {}).get("identityDigest"):
+        raise UpdateError("the transaction does not bind an intact release identity; "
+                          "manual recovery required")
+    base_url, token = _authorize_drain(base_url)
+    deadline_s = update_service.AWAIT_REVISION_S if deadline_s is None else deadline_s
+    inspect = inspect if inspect is not None else update_service.inspect_service
+    restart = restart if restart is not None else update_service.restart_service
+    git = update_staging.Git(update_staging.default_git())
+    # everything below is proven before any effect happens
+    _proof_references(record, state_dir)
+    _proof_running_revision(record, base_url)
+    try:
+        status = update_drain.drain_status(base_url, transaction_id, token=token,
+                                           revision=record["revision"],
+                                           capability=drain["capability"])
+    except (update_drain.DrainError, KeyError) as exc:
+        raise UpdateError("this transaction's exact-revision drain must be held and "
+                          "acknowledged quiescent; manual recovery required: %s" % exc) from exc
+    if not status.get("quiesced"):
+        raise UpdateError("the relay had not quiesced when activation was ordered "
+                          "(active=%(active)s queued=%(queued)s workflows=%(workflows)s); "
+                          "manual recovery required" % status)
+    try:
+        update_staging.verify_stage(record["stage"]["path"], identity, git=git)
+    except (update_staging.StagingError, KeyError, OSError) as exc:
+        raise UpdateError("the staged release no longer verifies (%s); leaving the "
+                          "transaction recoverable" % exc)
+    # recheck the active HEAD, cleanliness and canonical identity before any effect
+    checkout = update_staging.inspect_checkout(resolved, git=git)
+    if checkout["commit"] != record["revision"] or checkout["root"] != str(resolved):
+        raise UpdateError("the checkout at %s is %s at HEAD %s, not the transaction's "
+                          "cleanly prepared original revision %s; refusing an unsafe "
+                          "activation" % (resolved, checkout["root"], checkout["commit"],
+                                          record["revision"]))
+    # the restricted per-user service boundary, positively validated first
+    service = inspect(resolved)
+    if fcntl is None:
+        raise UpdateError("activation needs POSIX file locking for the transaction "
+                          "journal; refusing to activate state where os.flock is "
+                          "unavailable")
+    lock = update_transaction._flock(update_transaction._lock_path(state_dir))
+    try:
+        journal = update_transaction.read_journal(state_dir=state_dir)
+        if journal is None or journal.get("transactionId") != transaction_id \
+                or journal.get("phase") != "prepared":
+            raise UpdateError("no exactly prepared transaction is recorded for %s; manual "
+                              "recovery required" % transaction_id)
+        update_transaction.transition_locked(transaction_id, "prepared", "draining",
+                                             state_dir=state_dir, quiesced=True)
+        update_transaction.transition_locked(transaction_id, "draining", "quiescent",
+                                             state_dir=state_dir, service=service)
+        update_transaction.transition_locked(
+            transaction_id, "quiescent", "activating", state_dir=state_dir,
+            oldRevision=record["revision"], targetCommit=identity["commit"],
+            servicePath=service["path"], serviceDigest=service.get("digest", ""))
+        try:
+            swapped = update_staging.activate_transaction_source(record, git=git)
+            update_transaction.transition_locked(transaction_id, "activating", "restarted",
+                                                 state_dir=state_dir, commit=swapped["target"])
+            restart(service)
+            request = _activated_revision_request(base_url, token)
+            body = update_service.await_revision(swapped["target"],
+                                                 authenticated_request=request,
+                                                 deadline_s=deadline_s)
+            if body.get("revision", {}).get("commit") != swapped["target"]:
+                raise UpdateError("the restarted relay did not report the activated "
+                                  "commit; refusing")
+            barrier = _authenticated_get(base_url, token, BARRIER_PATH)
+            closed = (barrier.get("barrier") or {}).get("transactionId")
+            if not barrier.get("admissionClosed") or closed != transaction_id:
+                raise UpdateError("the restarted relay does not name this transaction's "
+                                  "admission barrier; refusing an unowned activation")
+            update_transaction.transition_locked(transaction_id, "restarted", "activated",
+                                                 state_dir=state_dir)
+            refresh = _refresh_barrier(base_url, token)
+            if refresh.get("admissionClosed"):
+                raise UpdateError("the activated relay still holds admission closed; "
+                                  "open it explicitly before serving work")
+        except Exception as exc:
+            _enter_recovery(transaction_id, state_dir, exc)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+    update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
+    print("Activated commit %s and verified it through the authenticated "
+          "endpoint; transaction %s is finished and admission is open." %
+          (swapped["target"], transaction_id))
+    return 0
+
+
+def _enter_recovery(transaction_id, state_dir, exc):
+    """Record a durable recovery_required end for a half-built activation."""
+    try:
+        update_transaction.transition_locked(transaction_id, update_transaction.read_journal(
+            state_dir=state_dir)["phase"], "recovery_required", state_dir=state_dir,
+            reason=str(exc))
+    except Exception as recovery_exc:  # the journal is retained either way
+        raise UpdateError("activation failed (%s) and the recovery record could not be "
+                          "written (%s); the barrier still holds admission closed; "
+                          "manual recovery required" % (exc, recovery_exc)) from exc
+    raise UpdateError("activation failed: %s; the transaction now requires recovery and "
+                      "the admission barrier stays closed" % exc)
+
+
+def _refresh_barrier(base_url, token):
+    """Ask the restarted relay to re-read the private barrier state from disk."""
+    status, body = update_drain._request("POST", base_url, BARRIER_PATH, token=token)
+    if status != 200 or not isinstance(body, dict):
+        raise update_drain.DrainError("barrier_refresh_refused_%d" % status,
+                                      "the relay refused the barrier refresh: %s"
+                                      % (body or {}).get("message", status))
+    return body
+
+
+def _activated_revision_request(base_url, token):
+    """An authenticated revision probe: the relay's own exact commit only."""
+    def request():
+        return _authenticated_get(base_url, token, AGENTS_PATH)
+    return request
+
+
 def _proof_references(record, state_dir):
     """Re-prove the hashed external references a prepared transaction recorded."""
     for point in record.get("state", []):
@@ -432,7 +619,9 @@ def cmd_consume(tag):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Inspect a published agent-relay release or record device-local approval; never installs or activates.")
+        description="Inspect a published agent-relay release, record device-local "
+                    "approval or drive exactly verified activation; never pulls or "
+                    "installers, never a force mode.")
     subcommands = parser.add_subparsers(dest="command", required=True)
     for name, handler, help_text in (
         ("inspect", cmd_inspect, "resolve and validate a stable release identity (metadata only)"),
@@ -472,6 +661,19 @@ def main(argv=None):
                               "A2A_RELAY_URL")
     prepare.add_argument("--transaction-id", default=None,
                          help="an explicit name for this update transaction")
+    activate = subcommands.add_parser(
+        "activate", help="activate the exact staged release of a prepared transaction "
+        "under the transaction's own drain: swap the verified source, restart the "
+        "positively validated per-user service barrier boundary and verify the "
+        "restarted relay; anything uncertain stays blocked for explicit recovery")
+    activate.add_argument("transaction_id", metavar="TRANSACTION-ID",
+                          help="the prepared transaction whose exact stage is activated")
+    activate.add_argument("--install-dir", required=True,
+                          help="this installation's checkout the service definition "
+                               "must positively name")
+    activate.add_argument("--base-url", default=None,
+                          help="the running relay to drain and verify; default "
+                               "AGENT_RELAY_URL or A2A_RELAY_URL")
     subcommands.add_parser(
         "status", help="print the recorded update transaction of this installation, if any")
     recover = subcommands.add_parser(
@@ -494,6 +696,9 @@ def main(argv=None):
         if args.command == "prepare-activation":
             return cmd_prepare_activation(args.tag, args.install_dir, base_url=args.base_url,
                                           transaction_id=args.transaction_id)
+        if args.command == "activate":
+            return cmd_activate(args.transaction_id, args.install_dir,
+                                base_url=args.base_url)
         if args.command == "status":
             return cmd_status()
         if args.command == "recover-abort":

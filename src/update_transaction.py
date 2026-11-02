@@ -52,12 +52,19 @@ COMMIT_RE = re.compile(r"[0-9a-f]{40}$")
 DEVICE_RE = re.compile(r"[0-9a-f]{32}$")
 # 40-hex any-HexCast of a sha256, used for the hashed external references.
 DIGEST_RE = re.compile(r"[0-9a-f]{64}$")
-# The phases introduced by this issue; the rest of the lifecycle
-# (quiescent, activating, ...) waits for the consumers of later issues.
-PHASES = ("prepared", "draining", "rolled_back")
-# A transaction in these phases is live: it holds activation incomplete and
-# admission closed even if its barrier file was lost with a crash.
-TERMINAL_PHASES = ("rolled_back",)
+# The lifecycle phases. The consumers through #157 introduced "prepared" and
+# "draining"; #158's activation walks a journaled transaction through
+# "quiescent", "activating" and "restarted" to a terminal end.
+PHASES = ("prepared", "draining", "quiescent", "activating", "restarted",
+          "activated", "recovery_required", "rolled_back")
+# A transaction in these phases is finished as far as the journal is concerned:
+# it still refuses admission until its barrier (recovery_required) is removed
+# or its record is expunged.
+TERMINAL_PHASES = ("activated", "recovery_required", "rolled_back")
+# Only these end phases may have their admission barrier removed; a
+# recovery_required transaction keeps its barrier so admission stays closed
+# until explicit manual recovery proves the original state.
+BARRIER_FREE_PHASES = ("rolled_back", "activated")
 UPDATE_DIRNAME = "update"
 JOURNAL_NAME = "transaction.json"
 BARRIER_NAME = "admission-barrier.json"
@@ -316,7 +323,7 @@ def _write_journal(state_dir, record):
     """Write one transaction record: journal first, then the barrier it commands."""
     _atomic_write(_journal_path(state_dir), json.dumps(record, indent=1).encode("utf-8"))
     os.chmod(_journal_path(state_dir), 0o600)
-    if record["phase"] in TERMINAL_PHASES:
+    if record["phase"] in BARRIER_FREE_PHASES:
         _remove_barrier(state_dir)
     else:
         _write_barrier(state_dir, {
@@ -456,15 +463,56 @@ def transition(transaction_id, expected_phase, next_phase, *, state_dir, **evide
             raise UpdateError(
                 "the transaction is in %r, not the expected %r; refusing an out-of-order "
                 "transition" % (record["phase"], expected_phase))
-        record["phase"] = next_phase
-        now = time.time()
-        record["updatedAt"] = now
-        record["evidence"].append({"phase": next_phase, "at": now, **evidence})
-        _write_journal(state_dir, record)
+        record = transition_locked(record["transactionId"], record["phase"], next_phase,
+                                   state_dir=state_dir, **evidence)
         return record
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+def transition_locked(transaction_id, expected_phase, next_phase, *, state_dir, **evidence):
+    """The phase compare-and-swap for a caller that already holds the lock.
+
+    ``transition`` itself takes the transaction lock because most consumers are
+    one-call scripts; the activation flow rechecks and effects many phases and
+    one durable boundary per write, so it must hold the lock across them and
+    loop here instead — never re-entering _flock, which would deadlock against
+    its own held lock).
+    """
+    if not isinstance(transaction_id, str) or not TRANSACTION_RE.fullmatch(transaction_id):
+        raise UpdateError("transactionId must name a well-formed transaction")
+    if next_phase not in PHASES or next_phase == expected_phase:
+        raise UpdateError(
+            "phase %r has no consumer in this issue or is not a next phase; refusing "
+            "a state built by conjuring a phase name" % next_phase)
+    index = PHASES.index(expected_phase) if expected_phase in PHASES else -1
+    if index == -1:
+        raise UpdateError("phase %r is not a live phase of this issue; refusing" % expected_phase)
+    if PHASES.index(next_phase) <= index:
+        raise UpdateError("a transaction moves forward through phases; refusing "
+                          "a repeat %s=%s transaction" % (expected_phase, next_phase))
+    record = read_journal(state_dir)
+    if record is None:
+        raise UpdateError("no transaction is recorded; nothing to transition")
+    _check_shape(record, "transaction journal", TRANSACTION_SCHEMA)
+    if record["binding"] != install_fingerprint(state_dir):
+        raise UpdateError("the transaction journal was written for another device or "
+                          "install; refusing unsafe state")
+    if record["transactionId"] != transaction_id:
+        raise UpdateError(
+            "the transaction journal is for %s, not %s; refusing to replay another "
+            "transaction's transition" % (record["transactionId"], transaction_id))
+    if record["phase"] != expected_phase:
+        raise UpdateError(
+            "the transaction is in %r, not the expected %r; refusing an out-of-order "
+            "transition" % (record["phase"], expected_phase))
+    record["phase"] = next_phase
+    now = time.time()
+    record["updatedAt"] = now
+    record["evidence"].append({"phase": next_phase, "at": now, **evidence})
+    _write_journal(state_dir, record)
+    return record
 
 
 def clear_transaction(transaction_id, *, state_dir):
