@@ -20,7 +20,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import safe_update
 import update_drain
+import update_transaction
+from pathlib import Path
 from relay_helpers import TOKEN, Relay, send_json, start_http_server, stop_http_server
+import release_identity as identity
 
 # Sleeps for the seconds the task's input names, then prints "drained".
 SLEEPER = "import sys, time; time.sleep(float(sys.argv[-1])); print('drained')"
@@ -298,6 +301,43 @@ class DrainTests(unittest.TestCase):
             self.assertEqual(relay.submit(agentId="hosted", input="0")[0], 202)
         finally:
             stop_http_server(server)
+
+    # --------------------------------------------------- persistent barrier
+
+    def test_post_update_state_refuses_a_barrier_and_reopens_admission_after_it(self):
+        """POST /v1/admin/update/state is safe_update._refresh_barrier's real
+        route: it re-reads the private barrier from disk, so a barrier that a
+        finished activation removed on disk reopens admission on the live
+        relay, and a barrier that boots with the relay holds admission closed
+        through the very same endpoint."""
+        identity.ensure_device_id(Path(self.state))
+        # Learn the commit the barrier must bind from a relay without a barrier.
+        revision = update_drain._server_revision(self.start([self.sleeper()]).base)
+        self.relays[0].close()
+        self.relays.clear()
+        update_transaction._write_barrier(Path(self.state), {
+            "schema": update_transaction.BARRIER_SCHEMA,
+            "transactionId": "txn-barrier-test",
+            "phase": "prepared",
+            "revision": revision,
+            "binding": update_transaction.install_fingerprint(Path(self.state))})
+        # A relay that boots inside the barrier must refuse admission.
+        relay = self.start([self.sleeper()],
+                           env={"AGENT_RELAY_STATE_DIR": self.state})
+        status, view = relay.request("POST", "/v1/admin/update/state")
+        self.assertEqual(status, 200)
+        self.assertTrue(view["admissionClosed"])
+        self.assertEqual(view["barrier"]["transactionId"], "txn-barrier-test")
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 503)
+        # The activation journal finished and removed its file from disk; the
+        # real _refresh_barrier POST must make the live relay re-read that.
+        os.unlink(Path(self.state) / "update" / "admission-barrier.json")
+        refresh = safe_update._refresh_barrier(relay.base, TOKEN)
+        self.assertFalse(refresh.get("admissionClosed"))
+        self.assertIsNone(refresh.get("barrier"))
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202,
+                         "admission reopens on the live relay after the barrier "
+                         "journal is finished")
 
     # --------------------------------------------------------------- CLI consumer
 

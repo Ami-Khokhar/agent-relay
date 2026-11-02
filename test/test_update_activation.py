@@ -465,6 +465,30 @@ class ActivationFlowTest(_Case):
         self.assertEqual(update_transaction.recover_transaction(
             state_dir=self.state)["phase"], "prepared")
 
+    def test_a_different_install_dir_is_refused_before_any_effect(self):
+        """A second clean canonical clone at the prepared revision is not the
+        prepared checkout: activating there would prove and restart its service
+        while swapping the prepared root, so it is refused before the journal,
+        the barrier or the service boundary moves at all."""
+        self._patch(safe_update, "_authenticated_get", self._fake_authenticated_get)
+        other = Path(self.fixture.tmp.name) / "other-checkout"
+        _run_git("clone", "-q", "--no-local", str(self.repo), str(other))
+        _run_git("-C", str(other), "checkout", "-q", "--detach", self.fixture.old)
+        before = update_transaction.read_barrier(state_dir=self.state)
+        self.assertIsNotNone(before)
+        with self.assertRaises(identity.UpdateError) as caught:
+            safe_update.cmd_activate(TXN, str(other), inspect=self.fake_inspect,
+                                     restart=self.fake_restart, deadline_s=1.0)
+        self.assertIn(str(other.resolve()), str(caught.exception))
+        self.assertIn(str(self.repo.resolve()), str(caught.exception),
+                      "the refusal names both the prepared and the offered paths")
+        record = update_transaction.recover_transaction(state_dir=self.state)
+        self.assertEqual(record["phase"], "prepared", "no journal transition ran")
+        self.assertEqual(update_transaction.read_barrier(state_dir=self.state), before,
+                         "the barrier is untouched")
+        self.assertEqual(self.calls, [], "not even the service boundary acted")
+        self.assertEqual(self.restart_commands, [])
+
     def test_a_failed_service_restart_leaves_a_recoverable_transaction(self):
         def failing_restart(service):
             self.calls.append(("restart", service["kind"]))

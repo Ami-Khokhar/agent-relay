@@ -382,6 +382,12 @@ def cmd_activate(transaction_id, install_dir, *, base_url=None, inspect=None,
         raise UpdateError("the transaction is in phase %r: manual recovery required; "
                           "only a prepared transaction may be activated"
                           % record["phase"])
+    prepared_root = (record.get("inventory") or {}).get("sourceRoot")
+    if str(resolved) != prepared_root:
+        raise UpdateError("this transaction was prepared for the checkout %s, not %s; "
+                          "refusing to activate a different install dir than the one "
+                          "the stage and drain were proven against"
+                          % (prepared_root, resolved))
     drain = record.get("drain")
     if not isinstance(drain, dict) or drain.get("revision") != record["revision"] \
             or not isinstance(drain.get("capability"), str) or not drain.get("capability"):
