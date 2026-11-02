@@ -28,6 +28,7 @@ from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlsplit
 
 import pressure
+import update_transaction
 from workflows import STEP_ID_RE, WORKFLOW_STATUSES, WorkflowEngine
 
 # The exact starting revision a drain acquire must name, so an updater that
@@ -182,6 +183,11 @@ ACTIVE = 0
 # dict bound to one transaction, one exact starting revision and one opaque
 # capability. Guarded by LOCK, so admission and drain decisions share it.
 DRAIN = None
+# The update-state decision loaded once at startup before any work is served:
+# None when admission is open, else a dict naming the transaction and reason an
+# activation barrier or live update transaction holds admission closed. A
+# stale, malformed or incomplete barrier fails closed, never silently open.
+UPDATE_BARRIER = None
 SHUTTING_DOWN = False
 _WARNED_FALLBACK = False
 UNKNOWN_REVISION = {"commit": "unknown", "short": "unknown", "date": "unknown"}
@@ -1441,6 +1447,49 @@ def _drain_refusal():
                             "admissions are refused until it is released"}
 
 
+def _barrier_refusal():
+    """The refusal every new external admission gets while the private update
+    barrier of this installation holds admission closed, or None.
+
+    The barrier survives a relay restart: it is read once at startup, before
+    any work is served, so a mid-activation crash can never silently reopen
+    admission and autostarted relays cannot admit work inside the gap.
+    """
+    if UPDATE_BARRIER is None:
+        return None
+    transaction = UPDATE_BARRIER.get("transactionId")
+    name = " transaction %s" % transaction if transaction else ""
+    return 503, {"error": "update_barrier_active",
+                 "message": "An update activation%s holds admission closed: %s New "
+                            "task and workflow admissions are refused until the "
+                            "transaction is committed or aborted with recover-abort"
+                            % (name, UPDATE_BARRIER.get("reason"))}
+
+
+def _admission_refusal():
+    """One admission gate: the live drain, then the persistent update barrier."""
+    return _drain_refusal() or _barrier_refusal()
+
+
+def _load_update_barrier():
+    """Read this installation's private update state once, before serving work.
+
+    Failing to read it is itself a refusal: unreadable, malformed, stale or
+    foreign update state refuses every new admission until it is recovered.
+    """
+    global UPDATE_BARRIER
+    running = REVISION["commit"] if update_transaction.COMMIT_RE.fullmatch(
+        REVISION["commit"]) else None
+    try:
+        UPDATE_BARRIER = update_transaction.admission_blocker(
+            state_dir=STATE_DIR, running_revision=running)
+    except (OSError, ValueError) as exc:  # never a silent open on a broken read
+        UPDATE_BARRIER = {"transactionId": None,
+                          "reason": "update state could not be read: %s" % exc}
+    if UPDATE_BARRIER is not None:
+        _log("update barrier holds admission closed: " + UPDATE_BARRIER.get("reason", ""))
+
+
 def _drain_counts():
     """The port-wide counts a held drain waits on. Call with LOCK held.
 
@@ -1668,7 +1717,7 @@ def _create_task(request, _internal=False):
         # answer, so an idempotent replay keeps its 200 during a drain and no
         # newly created task can bypass the check between read and queue.
         if not _internal:
-            refused = _drain_refusal()
+            refused = _admission_refusal()
             if refused:
                 return refused
         # waitMs only names the wait the caller means to use next and is never stored, so a replay
@@ -1755,7 +1804,7 @@ WORKFLOW_ENGINE = WorkflowEngine(
     lock=LOCK,
     condition=TASK_CONDITION,
     create_task=_internal_create_task,
-    drain_refusal=_drain_refusal,
+    drain_refusal=_admission_refusal,
     get_task=lookup_task,
     cancel_task=cancel_task,
     drain=_drain,
@@ -2204,6 +2253,7 @@ def main():
         _log(f"Configuration error: {exc}", err=True)
         return 1
     REVISION = deployed_revision(str(Path(__file__).resolve().parent.parent))
+    _load_update_barrier()
     if TASK_RETENTION_MS:
         threading.Thread(target=_purge_periodically, daemon=True).start()
     if PRESSURE_GUARD:
