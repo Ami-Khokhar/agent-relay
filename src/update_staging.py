@@ -23,6 +23,7 @@ before any command that could run a checkout filter is issued.
 
 import base64
 import hashlib
+import re
 import json
 import os
 import shutil
@@ -35,6 +36,8 @@ from stat import S_ISDIR, S_ISREG, S_IMODE
 
 import release_identity
 from release_identity import UpdateError
+
+COMMIT_RE = re.compile(r"[0-9a-f]{40}$")
 
 STAGE_SCHEMA = "agent-relay.stage/v1"
 REPOSITORY = release_identity.REPOSITORY
@@ -113,12 +116,19 @@ class Git:
             raise StagingError("git must be an absolute path to an executable file")
         self.exe = exe
 
-    def run(self, *args, cwd=None):
+    def run(self, *args, cwd=None, local_file=False):
+        # ``local_file`` widens the protocol allowlist for exactly one command:
+        # an object fetch between two user-owned private repositories of this
+        # same installation. Nothing else ever leaves https.
+        extra = ("-c", "protocol.file.allow=always") if local_file else ()
+        env = _git_env()
+        if local_file:
+            env = {**env, "GIT_ALLOW_PROTOCOL": "https:file"}
         try:
             process = subprocess.run(
                 [self.exe, "--no-optional-locks", "-c", "core.hooksPath=%s" % os.devnull,
-                 "-c", "core.autocrlf=false", "-c", "core.eol=lf", *args],
-                env=_git_env(), cwd=None if cwd is None else str(cwd),
+                 "-c", "core.autocrlf=false", "-c", "core.eol=lf", *extra, *args],
+                env=env, cwd=None if cwd is None else str(cwd),
                 stdin=subprocess.DEVNULL, capture_output=True, text=True,
                 timeout=GIT_TIMEOUT_S)
         except subprocess.TimeoutExpired as exc:
@@ -452,3 +462,73 @@ def stage_release(identity, *, root, state_dir, git, manifest, manifest_bytes, n
         shutil.rmtree(str(stage_dir), ignore_errors=True)
         raise
     return receipt
+
+
+def activate_transaction_source(record, *, git=None):
+    """Swap the verified checkout to the staged exact commit, once, journaled elsewhere.
+
+    ``record`` is the live activation transaction: the checkout it names is the
+    previously verified ordinary one, and the target is the verified stage's
+    commit. The caller holds the transaction/install lock and has just
+    journaled every pre-effect fact; this function performs the one source
+    effect: while the original HEAD, cleanliness and canonical origin recheck,
+    the target commit's object is copied from the stage's own repository into
+    the checkout (hooks and filters are off; the local fetch runs only between
+    two user-owned private repositories of this same installation), the
+    known-good original commit is kept both in the checkout's history and as an
+    explicit rollback ref, and only then is the working tree switched. The
+    switched tree is re-verified (detached HEAD at the target, clean status,
+    ordinary tracked modes, the previous object still present) before it is
+    accepted, so a failed or partial switch raises instead of advancing.
+
+    The original service definitions, PATH, port and configuration are outside
+    this function: it writes only git metadata inside the checkout itself.
+    Returns ``{"target", "previousObject"}``.
+    """
+    git = git if isinstance(git, Git) else Git(git or default_git())
+    record = record if isinstance(record, dict) else None
+    if record is None:
+        raise StagingError("activation needs the live transaction record")
+    inventory = record.get("inventory") or {}
+    root = inventory.get("sourceRoot")
+    resolved = _plain_private_dir(root, "checkout")
+    inspected = inspect_checkout(resolved, git=git)
+    revision = record.get("revision") or ""
+    target = (record.get("target") or {}).get("identity", {}).get("commit") or ""
+    if not COMMIT_RE.fullmatch(target):
+        raise StagingError("the transaction names no exact 40-hex target commit; refusing")
+    if inspected["commit"] != revision or inspected["root"] != str(resolved):
+        raise StagingError("the checkout at %s is %s at HEAD %s, not the transaction's "
+                           "cleanly prepared original; refusing an unsafe activation"
+                           % (resolved, inspected["root"], inspected["commit"]))
+    try:
+        stage = Path(record["stage"]["path"])
+    except (KeyError, TypeError) as exc:
+        raise StagingError("the transaction names no verified stage; refusing") from exc
+    _plain_private_dir(stage, "stage")
+    # keep the known-good original reachable as an explicit rollback ref, too
+    git.run("update-ref", "refs/agent-relay/update-rollback/%s" % record["transactionId"],
+            revision, cwd=resolved)
+    # a local object transport between two private user-owned repositories:
+    # hooks and filters are dead for the fetch and the checkout that follows
+    git.run("fetch", "--no-recurse-submodules", str(stage), target, cwd=resolved,
+            local_file=True)
+    git.config_guard(cwd=resolved)
+    git.run("checkout", "--detach", target, cwd=resolved)
+    if git.run("rev-parse", "HEAD", cwd=resolved).strip() != target:
+        raise StagingError("the checkout HEAD moved while switching to the target "
+                           "commit; refusing")
+    if git.run("status", "--porcelain", "--untracked-files=all", cwd=resolved).strip():
+        raise StagingError("the switched working tree is dirty; refusing an uncertain "
+                           "activation")
+    for line in git.run("ls-files", "-s", "-z", cwd=resolved).split("\0"):
+        if not line:
+            continue
+        mode, _stage, path = line.split(" ", 2)
+        if mode not in TRACKED_MODES:
+            raise StagingError("activated repository tracks unsafe mode %s at %s; "
+                               "refusing" % (mode, path))
+    if git.run("cat-file", "-t", revision, cwd=resolved).strip() != "commit":
+        raise StagingError("the previous commit object %s is no longer available; only a "
+                           "known-good previous revision may be activated from" % revision)
+    return {"target": target, "previousObject": revision}

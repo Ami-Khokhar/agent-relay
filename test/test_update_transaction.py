@@ -257,8 +257,10 @@ class TransactionJournalTest(_Case):
         with self.assertRaises(identity.UpdateError):
             update_transaction.transition(TXN, "prepared", "draining", state_dir=self.state,
                                           note="a replay never rewrites history")
+        # "activating" has had a consumer since #158; a phase beyond this
+        # issue's lifecycle is still conjuring, not a state.
         with self.assertRaises(identity.UpdateError) as caught:
-            update_transaction.transition(TXN, "draining", "activating", state_dir=self.state)
+            update_transaction.transition(TXN, "draining", "finished", state_dir=self.state)
         self.assertIn("no consumer", str(caught.exception),
                       "a phase without a consumer in this issue is conjuring, not a state")
         with self.assertRaises(identity.UpdateError):

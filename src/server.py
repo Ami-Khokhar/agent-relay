@@ -1923,6 +1923,27 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "POST":
                     return self._reload()
                 return self._json(405, {"error": "method_not_allowed"})
+            if path == "/v1/admin/update/state":
+                # Loopback only: this is the persisted activation barrier the
+                # updater verifies beyond a mere ok:true or a revision.
+                if not is_loopback(self.client_address[0]):
+                    return self._json(403, {"error": "forbidden"})
+                if method == "GET":
+                    with LOCK:
+                        return self._json(200, {
+                            "admissionClosed": UPDATE_BARRIER is not None,
+                            "barrier": UPDATE_BARRIER})
+                if method == "POST":
+                    # The shape safe_update._refresh_barrier() probes after the
+                    # journal finished: re-read the private barrier state, so a
+                    # finished activation reopens admission on the live relay.
+                    with LOCK:
+                        _load_update_barrier()
+                        return self._json(200, {
+                            "admissionClosed": UPDATE_BARRIER is not None,
+                            "barrier": UPDATE_BARRIER})
+                return self._json(405, {"error": "method_not_allowed"})
+                return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/admin/update/drain":
                 # Loopback only: the drain body carries the capability that
                 # reopens admission, and it is of use only to the local updater.
