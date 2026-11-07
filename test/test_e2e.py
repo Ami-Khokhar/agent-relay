@@ -132,7 +132,8 @@ class EndToEndTests(unittest.TestCase):
             fetched = client.call_tool("get_task", {"taskId": task_id})["structuredContent"]
             listed = client.call_tool("list_tasks", {})["structuredContent"]["tasks"][0]
             self.assertEqual(delegated["status"], "completed")
-            for snapshot in (delegated, waited, fetched, listed):
+            cancelled = client.call_tool("cancel_task", {"taskId": task_id})["structuredContent"]
+            for snapshot in (delegated, waited, fetched, listed, cancelled):
                 self.assertNotIn("input", snapshot)
                 self.assertEqual(snapshot["inputChars"], len(text))
             opted_in = client.call_tool("get_task", {"taskId": task_id, "includeInput": True})
