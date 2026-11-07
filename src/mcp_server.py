@@ -11,7 +11,6 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
-import re
 import socket
 import subprocess
 import sys
@@ -20,14 +19,13 @@ import time
 from pathlib import Path
 from feedback import prepare_feedback
 import release_discovery
+from workflows import STEP_ID_RE
 from urllib import request as urlrequest
 from urllib.parse import quote, urlencode, urlsplit
 
 STATUSES = ("queued", "running", "completed", "failed", "timed_out", "cancelled")
 WORKFLOW_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 FALSE_VALUES = ("0", "false", "no", "off")
-# Mirrors the relay's own step id rule, so a bad selector is refused before the call.
-STEP_ID_RE = re.compile(r"^[A-Za-z0-9_.~-]{1,128}$")
 
 
 def _env(*names, default=None):
@@ -87,7 +85,7 @@ WORKFLOW_SPEC = {
                 "required": ["id", "agentId", "input"],
                 "properties": {
                     "id": {"type": "string", "minLength": 1, "maxLength": 128,
-                           "pattern": "^[A-Za-z0-9_.~-]{1,128}$",
+                           "pattern": STEP_ID_RE.pattern,
                            "description": "Unique in the document. Other steps name it in needs "
                                           "and read its result as {{id.output}}."},
                     "agentId": {"type": "string", "minLength": 1, "maxLength": 128,
@@ -99,7 +97,7 @@ WORKFLOW_SPEC = {
                                              "{{item}} / {{index}} on a foreach step."},
                     "needs": {"type": "array",
                               "items": {"type": "string", "minLength": 1, "maxLength": 128,
-                                        "pattern": "^[A-Za-z0-9_.~-]{1,128}$"},
+                                        "pattern": STEP_ID_RE.pattern},
                               "description": "Step ids that must complete first. A step with no "
                                              "needs starts immediately; the graph must be acyclic."},
                     "needsPolicy": {"type": "string", "enum": ["any", "all"],
@@ -302,16 +300,16 @@ TOOLS = [
     },
     {
         "name": "get_workflow",
-        "description": "Get a workflow run with every step: its status, attempts, startedAt and finishedAt, output, and error. A failed step's error is the short cause — the last non-empty lines the agent printed, with agent_quota in front when they name a quota or rate limit — and errorDetail (this detailed view only) keeps the agent's full stderr. Pass view: \"summary\" to leave out the spec and every full output: each step then carries outputChars and firstLine instead, so an orchestrator can see which step finished without paying for the transcripts. Pass step to get that one step alone, with its full output and errorDetail. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
+        "description": "Get a workflow run with every step: its status, attempts, startedAt and finishedAt, output, and error. A failed step's error is the short cause — the last non-empty lines the agent printed, with agent_quota in front when they name a quota or rate limit — and errorDetail (this detailed view only) keeps the agent's full stderr. Pass view: \"summary\" to leave out the spec and every full output: each step then carries outputChars and firstLine (at most 200 characters, with a trailing … when truncated) instead, so an orchestrator can see which step finished without paying for the transcripts. Pass step to get that one step alone, with its full output and errorDetail. Pass maxWaitMs to long-poll until the run is terminal or the wait elapses; a result that is still running then carries waitExpired: true, and you call get_workflow again with the same workflowId. A run that has left the relay's memory but still has a journal on disk returns unknown_workflow with a message: continue it with resume_workflow.",
         "inputSchema": {
             "type": "object", "required": ["workflowId"], "additionalProperties": False,
             "properties": {
                 "workflowId": {"type": "string", "minLength": 1, "maxLength": 128,
                                "description": "Run ID returned by run_workflow."},
                 "view": {"type": "string", "enum": ["summary"],
-                         "description": "Pass \"summary\" for a small view: no spec, and each step carries outputChars (the output's length) and firstLine (its first line) instead of the full output and errorDetail. Combine with step to summarize one step."},
+                         "description": "Pass \"summary\" for a small view: no spec, and each step carries outputChars (the output's length) and firstLine (its first line, at most 200 characters with a trailing … when truncated) instead of the full output and errorDetail. Combine with step to summarize one step."},
                 "step": {"type": "string", "minLength": 1, "maxLength": 128,
-                         "pattern": "^[A-Za-z0-9_.~-]{1,128}$",
+                         "pattern": STEP_ID_RE.pattern,
                          "description": "Return only this step of the run, with its full output and errorDetail. A step the run does not have is unknown_step."},
                 "maxWaitMs": {"type": "integer", "minimum": 1,
                               "description": "Maximum time, in milliseconds, to wait for the run to become terminal before returning its current state. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
