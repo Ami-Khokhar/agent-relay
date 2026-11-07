@@ -59,10 +59,13 @@ class _Fixture:
     """One clean canonical checkout at the old commit, one verified stage at the
     target commit, untouched external state and one prepared transaction."""
 
+    def __init__(self, state_name="state"):
+        self.state_name = state_name
+
     def __enter__(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
-        self.state = base / "state"
+        self.state = base / self.state_name
         self.repo = base / "relay-checkout"
         (self.repo / "src").mkdir(parents=True)
         (self.repo / "README.md").write_text("# agent-relay old\n")
