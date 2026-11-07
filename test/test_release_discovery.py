@@ -4,7 +4,6 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
-import re
 import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -22,6 +21,10 @@ import release_discovery as discovery
 def release(tag, *, prerelease=False, draft=False, url=None, notes="release notes"):
     return {"tag_name": tag, "prerelease": prerelease, "draft": draft,
             "html_url": url or discovery.RELEASE_URL + tag, "body": notes}
+
+
+def newer_version(installed):
+    return "%d.0.0" % (int(installed.split(".")[0]) + 1)
 
 
 class FakeResponse:
@@ -197,9 +200,11 @@ class ReleaseDiscoveryTests(unittest.TestCase):
         self.assertEqual(requested, ["/api"])
 
     def test_cli_notice_is_private_and_deduplicated_by_version(self):
+        installed = discovery.installed_version()
+        offer_version = newer_version(installed)
         with tempfile.TemporaryDirectory() as temp:
             output = io.StringIO()
-            opener = fake_api([release("0.4.0", notes="hello")])
+            opener = fake_api([release(offer_version, notes="hello")])
             with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}), \
                     patch.object(discovery, "build_opener", return_value=opener), \
                     patch("sys.stdout", output):
@@ -208,19 +213,17 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 output.seek(0)
                 output.truncate()
                 self.assertEqual(discovery.main(["--notify"]), 0)
-            version_text = (Path(discovery.__file__).parent.parent / "pyproject.toml").read_text()
-            installed = re.search(r'^version\s*=\s*"([^"]+)"', version_text, re.M).group(1)
             install_kind = ("source checkout" if (Path(discovery.__file__).parent.parent / ".git").exists()
                             else "non-git installation; update method unknown")
             installed_line = "Installed version: %s (%s)" % (installed, install_kind)
             self.assertIn(installed_line, first)
-            self.assertIn("Available version: 0.4.0", first)
+            self.assertIn("Available version: %s" % offer_version, first)
             self.assertIn("hello", first)
             self.assertEqual(output.getvalue(), installed_line + "\n")
             cache = Path(temp) / "agent-relay" / "release-notices.json"
             cached = json.loads(cache.read_text())
-            self.assertEqual(cached["notifiedVersion"], "0.4.0")
-            self.assertEqual(cached["offer"]["version"], "0.4.0")
+            self.assertEqual(cached["notifiedVersion"], offer_version)
+            self.assertEqual(cached["offer"]["version"], offer_version)
             if os.name == "posix":
                 self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(cache.parent.stat().st_mode & 0o777, 0o700)
@@ -250,6 +253,8 @@ class ReleaseDiscoveryTests(unittest.TestCase):
         self.assertIn("installed version is not semantic versioning", error.getvalue())
 
     def test_malformed_cache_is_replaced_and_cache_write_errors_are_actionable(self):
+        installed = discovery.installed_version()
+        offer_version = newer_version(installed)
         with tempfile.TemporaryDirectory() as temp:
             cache = Path(temp) / "agent-relay" / "release-notices.json"
             cache.parent.mkdir(mode=0o700)
@@ -259,7 +264,7 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 self.assertTrue(discovery._notify_once(offer))
                 self.assertEqual(json.loads(cache.read_text())["notifiedVersion"], "0.4.0")
                 output, error = io.StringIO(), io.StringIO()
-                opener = fake_api([release("0.5.0")])
+                opener = fake_api([release(offer_version)])
                 with patch.object(discovery, "build_opener", return_value=opener), \
                         patch.object(discovery.os, "replace", side_effect=OSError("private path")), \
                         patch("sys.stdout", output), patch("sys.stderr", error):
@@ -282,7 +287,7 @@ class ReleaseDiscoveryTests(unittest.TestCase):
     def test_cache_offer_cli_stores_the_fetched_offer_without_marking_it_shown(self):
         """Guard: --cache-offer writes fetched metadata with a null notifiedVersion."""
         installed = discovery.installed_version()
-        offer_version = "%d.0.0" % (int(installed.split(".")[0]) + 1)
+        offer_version = newer_version(installed)
         with tempfile.TemporaryDirectory() as temp:
             output = io.StringIO()
             opener = fake_api([release(offer_version, notes="notes are data")])
@@ -312,7 +317,7 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                     discovery.main(["--notify", "--cache-offer"])
             self.assertEqual(raised.exception.code, 2)
             self.assertIn("--notify and --cache-offer cannot be used together", error.getvalue())
-            opener.open.assert_not_called()
+            opener.assert_not_called()
             self.assertFalse((Path(temp) / "agent-relay").exists())
 
     def test_cli_service_failure_is_reported_without_creating_notice_state(self):
@@ -485,15 +490,17 @@ class ReleaseDiscoveryTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "the notice cache lock is a POSIX flock")
     def test_lock_failure_is_reported_instead_of_claiming_delivery(self):
+        installed = discovery.installed_version()
+        offer_version = newer_version(installed)
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
-            offer = {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0",
+            offer = {"version": offer_version, "url": discovery.RELEASE_URL + offer_version,
                      "notes": "notes", "checkedAt": time.time()}
             discovery._write_cache(offer)
             blocked = patch.object(discovery.fcntl, "flock",
                                    side_effect=BlockingIOError(11, "Resource temporarily unavailable"))
             with patch.object(discovery, "LOCK_TIMEOUT", 0.05), blocked, \
-                    patch.object(discovery, "build_opener", return_value=fake_api([release("0.4.0")])):
-                self.assertIsNone(discovery.cached_notice("0.3.0"))
+                    patch.object(discovery, "build_opener", return_value=fake_api([release(offer_version)])):
+                self.assertIsNone(discovery.cached_notice(installed))
                 with self.assertRaisesRegex(discovery.DiscoveryError, "lock"):
                     discovery._notify_once(offer)
                 error = io.StringIO()
@@ -501,8 +508,8 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                     self.assertEqual(discovery.main(["--notify"]), 1)
                 self.assertIn("Release notice failed", error.getvalue())
                 self.assertIn("lock", error.getvalue())
-            self.assertEqual(discovery.cached_notice("0.3.0")["version"], "0.4.0")
-            self.assertIsNone(discovery.cached_notice("0.3.0"))
+            self.assertEqual(discovery.cached_notice(installed)["version"], offer_version)
+            self.assertIsNone(discovery.cached_notice(installed))
 
     @unittest.skipUnless(os.name == "posix", "the notice cache lock is a POSIX flock")
     def test_untrusted_cache_lock_is_refused_not_followed(self):
