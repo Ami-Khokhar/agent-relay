@@ -251,12 +251,14 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
 
 - `list_agents {}` → registered agents.
 - `delegate { agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, options?, readOnly?, waitMs? }` → task.
-  With `waitMs`, `delegate` long-polls and returns the terminal task, or the current task
+  Without `waitMs` it returns the queued task at once. With `waitMs`, `delegate` long-polls
+  and returns the terminal task, or the current task
   with `waitExpired: true` when the wait ends first. A `waitMs` above the relay limit creates
   no task: `delegate` retries once with the limit (never longer than asked) and adds `waitMs`
   and `waitClamped: true` to the result.
-- `wait_task { taskId, maxWaitMs? }` → holds the call until terminal or the wait elapses
-  (default 60000 ms).
+- `wait_task { taskId, maxWaitMs? }` → the task's current state and result. With no
+  `maxWaitMs` the call returns at once and never waits; pass `maxWaitMs` to hold it until
+  the task is terminal or the wait elapses.
 - `get_task { taskId, includeInput? }` → current task state and result.
 - `list_tasks { sessionId?, status?, limit? }` → stored tasks, most recent first.
 - `cancel_task { taskId }` → cancel a queued or running task.
@@ -273,7 +275,8 @@ curl -sS -H "$AUTH" -X DELETE "http://127.0.0.1:43124/v1/tasks/$ID"        # can
   context — and pass `step` to get that one step alone with its full output and `errorDetail`.
 - `wait_workflow_events { sessionId, after?, maxWaitMs? }` → the session's ordered change
   feed: each step or run status change with `workflowId`, `stepId`, `oldStatus`, `newStatus`
-  and a rising `seq`. Pass the last `seq` seen as `after`; an empty `events` list means the
+  and a rising `seq`. Pass the last `seq` seen as `after`. With no `maxWaitMs` the call
+  returns the changes recorded so far at once; with one, an empty `events` list means the
   wait ended with no change, so call again with the same `after`.
 - `list_workflows { sessionId?, status?, limit? }` → stored runs, most recent first.
 - `cancel_workflow { workflowId }` → cancel the run and every task it started.
@@ -373,8 +376,13 @@ its default) and offers `-s workspace-write` as the `access` option; a task that
 passes `options: {"access": "write"}`. Codex applies its own sandbox, and macOS does not nest
 sandboxes, so the Codex entry uses `args` only and no `"sandbox": true`.
 
-**Prefer `wait_task` over a `get_task` polling loop** — one call instead of many, and it
-does not stop polling too early.
+**Waiting is opt-in.** No MCP call waits unless you give it one: `wait_task` and
+`wait_workflow_events` without a `maxWaitMs` read the current state and return at once, and
+`delegate`, `run_workflow` and `resume_workflow` wait only when you pass `waitMs`. Read
+with `get_task` or `list_tasks` whenever you want the state without blocking.
+
+**When you do wait, prefer `wait_task` over a `get_task` polling loop** — one call instead
+of many, and it does not stop polling too early.
 
 **Tell "finished" from "my wait ended".** When the wait ends and the task is still not
 terminal, the result has `waitExpired: true`, `waitedMs` (the wait that elapsed) and a

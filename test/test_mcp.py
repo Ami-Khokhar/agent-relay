@@ -98,6 +98,8 @@ class McpHandlerTests(unittest.TestCase):
         for keyword in ("delegate", "wait_task", "list_agents", "pi", "codex", "sessionId",
                         "orchestrat", "fan out", "shell"):
             self.assertIn(keyword, instructions)
+        # Waiting is an opt-in, not the documented next step after a submission.
+        self.assertNotIn("then wait_task", instructions)
 
     def test_tool_descriptions_name_the_harnesses_and_their_arguments(self):
         handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
@@ -210,6 +212,29 @@ class McpHandlerTests(unittest.TestCase):
             self.assertIn("sessionId=s-1", upstream.calls[1][1])
             self.assertIn("status=completed", upstream.calls[1][1])
             self.assertIn("limit=5", upstream.calls[1][1])
+        finally:
+            upstream.close()
+
+    def test_wait_task_without_a_wait_returns_the_current_state_at_once(self):
+        upstream = FakeUpstream(lambda method, path, body: (200, {"id": "task-1", "status": "running"}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=5)
+        try:
+            started = time.monotonic()
+            result = handle({"method": "tools/call", "params": {
+                "name": "wait_task", "arguments": {"taskId": "task-1"}}})
+            elapsed = time.monotonic() - started
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertEqual(task["status"], "running")
+            self.assertNotIn("waitExpired", task)
+            self.assertLess(elapsed, 1.0)
+            # No wait was asked for, so the relay is asked for the task alone.
+            self.assertEqual([call[1] for call in upstream.calls], ["/v1/tasks/task-1"])
+
+            tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
+            self.assertIn("never waits", tools["wait_task"]["description"])
+            self.assertIn("Omit it to return the current status at once",
+                          tools["wait_task"]["inputSchema"]["properties"]["maxWaitMs"]["description"])
         finally:
             upstream.close()
 
@@ -839,11 +864,11 @@ class McpHandlerTests(unittest.TestCase):
             self.assertEqual(upstream.calls[0][1],
                              "/v1/workflows/events?sessionId=s-1&after=6&waitMs=5000")
 
-            # after defaults to 0 and maxWaitMs to 60000.
+            # after defaults to 0, and with no maxWaitMs no wait is asked for.
             handle({"method": "tools/call", "params": {
                 "name": "wait_workflow_events", "arguments": {"sessionId": "s-1"}}})
             self.assertEqual(upstream.calls[1][1],
-                             "/v1/workflows/events?sessionId=s-1&after=0&waitMs=60000")
+                             "/v1/workflows/events?sessionId=s-1&after=0")
         finally:
             upstream.close()
 
