@@ -196,7 +196,7 @@ TOOLS = [
     },
     {
         "name": "delegate",
-        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. When called from an agent the relay itself started, the relay enforces its delegation policy (allowed targets, no cycles, depth and task budgets) and may refuse the task. Returns the task object (the existing task when requestId matches an earlier submission); pass its `id` field to wait_task, get_task, or cancel_task. Task objects leave out `input` and carry `inputChars` (its length) instead; get_task with includeInput returns it.",
+        "description": "Send a new task to another coding agent (pi, Codex, OpenCode, Claude Code). Use for delegation, orchestration, fan-out, and second opinions. When called from an agent the relay itself started, the relay enforces its delegation policy (allowed targets, no cycles, depth and task budgets) and may refuse the task. The call returns as soon as the relay queues the task and never waits on its own; read it later with get_task or list_tasks, cancel it with cancel_task, or block on it by passing waitMs or calling wait_task with a maxWaitMs. Returns the task object (the existing task when requestId matches an earlier submission). Task objects leave out `input` and carry `inputChars` (its length) instead; get_task with includeInput returns it.",
         "inputSchema": {
             "type": "object", "required": ["agentId", "input"], "additionalProperties": False,
             "properties": {
@@ -224,14 +224,14 @@ TOOLS = [
     },
     {
         "name": "wait_task",
-        "description": "Long-poll until a relay task is terminal or maxWaitMs elapses. If the task is still not terminal when the wait ends, the result carries waitExpired: true, waitedMs (the wait that elapsed), and a hint: call wait_task again with the same taskId. A terminal result has no waitExpired. A client with a short tool-call budget should use maxWaitMs of about 110000 or less and loop while waitExpired is true: Claude Code moves an MCP call that runs longer than 120 s to the background, and its completion notice then shows a task that is still running. The task object has `inputChars` and no `input`; use get_task with includeInput to read the input.",
+        "description": "Read a relay task's current state and result. With no maxWaitMs the call returns at once and never waits; pass maxWaitMs only when you choose to block on the result. If the task is still not terminal when the wait ends, the result carries waitExpired: true, waitedMs (the wait that elapsed), and a hint: call wait_task again with the same taskId. A terminal result has no waitExpired. A client with a short tool-call budget should use maxWaitMs of about 110000 or less and loop while waitExpired is true: Claude Code moves an MCP call that runs longer than 120 s to the background, and its completion notice then shows a task that is still running. The task object has `inputChars` and no `input`; use get_task with includeInput to read the input.",
         "inputSchema": {
             "type": "object", "required": ["taskId"], "additionalProperties": False,
             "properties": {
                 "taskId": {"type": "string", "minLength": 1, "maxLength": 128,
                            "description": "Task ID returned by delegate."},
                 "maxWaitMs": {"type": "integer", "minimum": 1,
-                              "description": "Maximum time to wait, in milliseconds (default 60000), before returning the current status. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+                              "description": "Maximum time to wait, in milliseconds, before returning the current status. Omit it to return the current status at once with no wait. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -319,7 +319,7 @@ TOOLS = [
     },
     {
         "name": "wait_workflow_events",
-        "description": "Long-poll for the next state change of a session's workflow runs in one ordered feed, instead of polling get_workflow per run. Pass the sessionId the runs share (a run_workflow result carries it); the result's events list carries each change in order: workflowId, stepId (null for a run-level status change), oldStatus, newStatus, and a rising seq. Pass the last seq you saw as after to continue the feed from there. A wait that ends with no change returns an empty events list; call again with the same after. A maxWaitMs above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background.",
+        "description": "Read the next state change of a session's workflow runs in one ordered feed, instead of polling get_workflow per run. Pass the sessionId the runs share (a run_workflow result carries it); the result's events list carries each change in order: workflowId, stepId (null for a run-level status change), oldStatus, newStatus, and a rising seq. Pass the last seq you saw as after to continue the feed from there. With no maxWaitMs the call returns the changes recorded so far at once and never waits; pass maxWaitMs only when you choose to block for the next change. A wait that ends with no change returns an empty events list; call again with the same after. A maxWaitMs above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit, never raised: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background.",
         "inputSchema": {
             "type": "object", "required": ["sessionId"], "additionalProperties": False,
             "properties": {
@@ -328,7 +328,7 @@ TOOLS = [
                 "after": {"type": "integer", "minimum": 0,
                           "description": "Return only changes whose seq is greater than this. Pass the seq of the last event you saw (0 for the whole retained feed)."},
                 "maxWaitMs": {"type": "integer", "minimum": 1,
-                              "description": "Maximum time to wait, in milliseconds (default 60000), for the next change. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+                              "description": "Maximum time to wait, in milliseconds, for the next change. Omit it to read the feed as it stands at once, with no wait. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -639,10 +639,14 @@ def create_http_handler(base_url=None, timeout=None):
                 "agent-relay sends tasks to other coding agents (pi, Codex, OpenCode, "
                 "Claude Code) and returns their results. When the user asks to delegate, "
                 "orchestrate, fan out, or use another agent or model: call list_agents, "
-                "then delegate, then wait_task. Do not run agent CLIs (pi, codex, "
+                "then delegate. A task runs in the background: delegate returns as soon as "
+                "the relay queues it, and you read its state when you need it with get_task "
+                "or list_tasks. Nothing waits unless you ask it to: pass waitMs to delegate, "
+                "or call wait_task with a maxWaitMs, only when you choose to block on the "
+                "result. Do not run agent CLIs (pi, codex, "
                 "opencode, claude) in a shell to do this work. The relay owns task IDs, "
                 "status, timeouts, cancellation, and idempotency. For parallel work, call "
-                "delegate once per task, then wait for each taskId. Reuse the sessionId "
+                "delegate once per task, then check each taskId when you need it. Reuse the sessionId "
                 "from an earlier task to group related work for list_tasks; it does not "
                 "resume the harness session. Omit it to start a new session. If no listed "
                 "agent fits, tell the user and ask before you run a CLI directly."
@@ -788,20 +792,24 @@ def create_http_handler(base_url=None, timeout=None):
             elif name == "wait_task":
                 args = _arguments_for(rpc, ["taskId", "maxWaitMs"])
                 _non_empty(args, "taskId", 128)
-                max_wait = args.get("maxWaitMs", 60_000)
-                if not _is_positive_int(max_wait):
-                    _invalid("maxWaitMs must be a positive integer")
                 task_path = "/v1/tasks/" + quote(args["taskId"], safe="")
-                try:
-                    value = _relay_request(base_url, f"{task_path}?waitMs={max_wait}",
-                                           timeout=max(timeout, max_wait / 1000.0 + 5))
-                except RelayError as exc:
-                    limit = _relay_wait_limit(base_url, exc, max_wait)
-                    if limit is None:
-                        raise
-                    value = _relay_request(base_url, f"{task_path}?waitMs={limit}",
-                                           timeout=max(timeout, limit / 1000.0 + 5))
-                    value.update(waitMs=limit, waitClamped=True)
+                max_wait = args.get("maxWaitMs")
+                if max_wait is None:
+                    # No wait was asked for, so read the current state and return at once.
+                    value = _relay_request(base_url, task_path, timeout=timeout)
+                else:
+                    if not _is_positive_int(max_wait):
+                        _invalid("maxWaitMs must be a positive integer")
+                    try:
+                        value = _relay_request(base_url, f"{task_path}?waitMs={max_wait}",
+                                               timeout=max(timeout, max_wait / 1000.0 + 5))
+                    except RelayError as exc:
+                        limit = _relay_wait_limit(base_url, exc, max_wait)
+                        if limit is None:
+                            raise
+                        value = _relay_request(base_url, f"{task_path}?waitMs={limit}",
+                                               timeout=max(timeout, limit / 1000.0 + 5))
+                        value.update(waitMs=limit, waitClamped=True)
             elif name == "get_task":
                 args = _arguments_for(rpc, ["taskId", "includeInput"])
                 _non_empty(args, "taskId", 128)
@@ -874,22 +882,27 @@ def create_http_handler(base_url=None, timeout=None):
                 after = args.get("after", 0)
                 if isinstance(after, bool) or not isinstance(after, int) or after < 0:
                     _invalid("after must be a non-negative integer")
-                max_wait = args.get("maxWaitMs", 60_000)
-                if not _is_positive_int(max_wait):
-                    _invalid("maxWaitMs must be a positive integer")
+                max_wait = args.get("maxWaitMs")
                 params = urlencode({"sessionId": args["sessionId"], "after": after})
-                path = f"/v1/workflows/events?{params}&waitMs={max_wait}"
-                try:
-                    value = _relay_request(base_url, path,
-                                           timeout=max(timeout, max_wait / 1000.0 + 5))
-                except RelayError as exc:
-                    limit = _relay_wait_limit(base_url, exc, max_wait)
-                    if limit is None:
-                        raise
-                    path = f"/v1/workflows/events?{params}&waitMs={limit}"
-                    value = _relay_request(base_url, path,
-                                           timeout=max(timeout, limit / 1000.0 + 5))
-                    value.update(waitMs=limit, waitClamped=True)
+                if max_wait is None:
+                    # No wait was asked for, so read the feed as it stands and return at once.
+                    value = _relay_request(base_url, f"/v1/workflows/events?{params}",
+                                           timeout=timeout)
+                else:
+                    if not _is_positive_int(max_wait):
+                        _invalid("maxWaitMs must be a positive integer")
+                    path = f"/v1/workflows/events?{params}&waitMs={max_wait}"
+                    try:
+                        value = _relay_request(base_url, path,
+                                               timeout=max(timeout, max_wait / 1000.0 + 5))
+                    except RelayError as exc:
+                        limit = _relay_wait_limit(base_url, exc, max_wait)
+                        if limit is None:
+                            raise
+                        path = f"/v1/workflows/events?{params}&waitMs={limit}"
+                        value = _relay_request(base_url, path,
+                                               timeout=max(timeout, limit / 1000.0 + 5))
+                        value.update(waitMs=limit, waitClamped=True)
             elif name == "list_workflows":
                 args = _arguments_for(rpc, ["sessionId", "status", "limit"])
                 params = {}

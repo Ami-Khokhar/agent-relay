@@ -1,15 +1,20 @@
 # Use-case patterns
 
 The relay is a job board, not a shared memory. Each task is a fresh invocation, and results
-come back by waiting or polling. Build the user's workflow from these patterns.
+come back when you read them: nothing waits unless you ask it to. Build the user's workflow
+from these patterns.
 
 Before any pattern: confirm the target CLIs exist (`which <command>`), register them, start
 the relay, and verify with `GET /v1/agents`.
 
-Throughout, "delegate" means `POST /v1/tasks` (or the MCP `delegate` tool). Prefer the
-long poll — `GET /v1/tasks/:id?waitMs=<ms>` (or MCP `wait_task`) — over a `get_task` loop:
-one call instead of many, and it does not stop too early. Use `GET /v1/tasks?sessionId=...`
-(or `list_tasks`) to recover task IDs after an orchestrator context reset.
+Throughout, "delegate" means `POST /v1/tasks` (or the MCP `delegate` tool), and it returns as
+soon as the relay queues the task. Read a task's state when you need it with
+`GET /v1/tasks/:id` (or MCP `get_task`), and recover task IDs after an orchestrator context
+reset with `GET /v1/tasks?sessionId=...` (or `list_tasks`).
+
+When you want the result before going on, wait for it: prefer the long poll —
+`GET /v1/tasks/:id?waitMs=<ms>` (or MCP `wait_task` with a `maxWaitMs`) — over a `get_task`
+loop: one call instead of many, and it does not stop too early.
 
 Keep each wait short, and loop. A wait that ends before the task is terminal returns the
 task with `waitExpired: true` and a still `queued` or `running` status. That is not a
@@ -99,12 +104,14 @@ Add the MCP server to the client's config and start the HTTP service alongside i
 the MCP process start it on demand). The client then sees the task tools (`list_agents`,
 `delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`) and the workflow tools
 (`run_workflow`, `get_workflow`, `wait_workflow_events`, `list_workflows`, `cancel_workflow`,
-`resume_workflow`) and `get_pressure`. Because submission is asynchronous,
-use `wait_task` (or `delegate` with `waitMs`) to block until the result is ready. Use a wait
+`resume_workflow`) and `get_pressure`. Submission is asynchronous and no call waits by
+default: read a result when you need it with `get_task` (or `list_tasks`), and block on it
+only by asking — `wait_task` with a `maxWaitMs`, or `delegate` with `waitMs`. Use a wait
 of about 110000 ms or less, and wait again while the result has `waitExpired: true`. When
 several workflow runs share one session, `wait_workflow_events` (or
 `GET /v1/workflows/events`) reports each step or run status change in one ordered feed, so
-the orchestrator reacts to whichever run progresses first without polling every run.
+the orchestrator reacts to whichever run progresses first without polling every run; without
+a `maxWaitMs` it returns the changes recorded so far at once.
 
 ## 7. A write step whose test suite binds 127.0.0.1
 
