@@ -206,7 +206,7 @@ class McpHandlerTests(unittest.TestCase):
         finally:
             upstream.close()
 
-    def test_get_task_asks_the_relay_for_the_input_only_when_include_input_is_true(self):
+    def test_task_tools_describe_snapshots_and_get_task_only_requests_input_when_opted_in(self):
         upstream = FakeUpstream(lambda method, path, body: (200, {"id": "task-1", "status": "completed"}))
         handle = mcp_server.create_http_handler(upstream.url, timeout=5)
         try:
