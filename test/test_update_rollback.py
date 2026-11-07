@@ -41,6 +41,7 @@ class _RollbackCase(_Case):
 
     def setUp(self):
         super().setUp()
+        self.drain_held = True
         self.serving = self.fixture.old   # the commit the fake relay was started with
         self.serving_stuck = False        # set True: the relay never picks up new code
         self.refresh_raises = None
@@ -56,7 +57,13 @@ class _RollbackCase(_Case):
         self.calls.append(("release", transaction_id))
         if revision != self.fixture.old or capability != CAPABILITY:
             raise update_drain.DrainError("revision_mismatch", "refused")
+        self.drain_held = False
         return {"transactionId": transaction_id}
+
+    def _fake_drain_status(self, *args, **kwargs):
+        if not self.drain_held:
+            raise update_drain.DrainError("drain_not_held", "no drain")
+        return super()._fake_drain_status(*args, **kwargs)
 
     def _refresh(self, _base, _token):
         self.refresh_calls += 1
@@ -546,6 +553,87 @@ class PostActivatedFailureTest(_RollbackCase):
         self.refresh_raises = None
         rc = self.run_recover()
         self.assertEqual(rc, 0)
+        self.assertIsNone(update_transaction.read_journal(state_dir=self.state))
+
+
+class TerminalDrainRecoveryTest(unittest.TestCase):
+    """Recovery keeps the capability until HTTP confirms the hold is gone."""
+
+    def setUp(self):
+        self.fixture = _Fixture(state_name="agent-relay")
+        self.fixture.__enter__()
+        self.addCleanup(self.fixture.__exit__, None, None, None)
+        self.state = self.fixture.state
+        env = patch.dict(os.environ, {"AGENT_RELAY_TOKEN": "t" * 32,
+                                     "XDG_STATE_HOME": str(self.state.parent)})
+        env.start()
+        self.addCleanup(env.stop)
+        for old, new in (("prepared", "draining"), ("draining", "rolled_back")):
+            update_transaction.transition(TXN, old, new, state_dir=self.state)
+        self.held = True
+        self.release_error = None
+        self.status_error = None
+        self.keep_hold = False
+        self.calls = []
+        request = patch.object(update_drain, "_request", self.request)
+        request.start()
+        self.addCleanup(request.stop)
+
+    def request(self, method, base, path, **kwargs):
+        self.calls.append((method, path))
+        if path == update_drain.DRAIN_PATH:
+            ownership = kwargs.get("body") if method == "DELETE" else kwargs.get("query")
+            self.assertEqual(ownership, {"transactionId": TXN, "revision": self.fixture.old,
+                                         "capability": CAPABILITY})
+            self.assertEqual(kwargs["token"], "t" * 32)
+            if method == "DELETE":
+                if self.release_error:
+                    raise self.release_error
+                if not self.keep_hold:
+                    self.held = False
+            elif self.status_error:
+                raise self.status_error
+            if not self.held:
+                return 409, {"error": "drain_not_held", "message": "no drain"}
+            return 200, {"quiesced": True}
+        self.assertEqual((method, path), ("POST", safe_update.BARRIER_PATH))
+        return 200, {"admissionClosed": False}
+
+    def recover(self):
+        return safe_update.cmd_recover(TXN, base_url="http://127.0.0.1:43124")
+
+    def test_release_and_status_proof_precede_refresh_and_expunge(self):
+        self.assertEqual(self.recover(), 0)
+        self.assertFalse(self.held)
+        self.assertIsNone(update_transaction.read_journal(state_dir=self.state))
+        self.assertEqual(self.calls, [("DELETE", update_drain.DRAIN_PATH),
+                                     ("GET", update_drain.DRAIN_PATH),
+                                     ("POST", safe_update.BARRIER_PATH)])
+
+    def test_a_successful_release_that_leaves_a_hold_retains_the_capability(self):
+        self.keep_hold = True
+        with self.assertRaisesRegex(identity.UpdateError, "release is pending"):
+            self.recover()
+        self.assertTrue(self.held)
+        self.assertEqual(update_transaction.read_journal(state_dir=self.state)["drain"]
+                         ["capability"], CAPABILITY)
+        self.assertNotIn(("POST", safe_update.BARRIER_PATH), self.calls)
+        self.keep_hold = False
+        self.assertEqual(self.recover(), 0)
+
+    def test_release_or_status_failure_retains_the_record_for_retry(self):
+        for boundary in ("release_error", "status_error"):
+            with self.subTest(boundary=boundary):
+                setattr(self, boundary, update_drain.DrainError("drain_unreachable", "offline"))
+                with self.assertRaisesRegex(identity.UpdateError, "release is pending"):
+                    self.recover()
+                self.assertIsNotNone(update_transaction.read_journal(state_dir=self.state))
+                setattr(self, boundary, None)
+        self.assertEqual(self.recover(), 0)
+
+    def test_a_restarted_relay_with_no_hold_can_finish_recovery(self):
+        self.held = False
+        self.assertEqual(self.recover(), 0)
         self.assertIsNone(update_transaction.read_journal(state_dir=self.state))
 
 

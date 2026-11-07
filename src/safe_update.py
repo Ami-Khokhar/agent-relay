@@ -710,10 +710,10 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
     boundaries activation used, and no other. Only this install's recorded
     transaction is recovered: a wrong-device journal is refused by the reader,
     another transaction's id is refused as a replay, and a terminal record is
-    finalized read-only — a rolled-back record only retries the one pending
-    barrier refresh and is then expunged, never repeating a service action or
-    reopening anything twice. Every failed proof keeps the failed state and
-    its barrier and names the remedy.
+    finalized without repeating a service action: a rolled-back record first
+    releases and verifies its recorded drain, and a rolled-back or activated
+    record retries the pending barrier refresh before it is expunged. Every
+    failed proof keeps the record and names the remedy.
     """
     state_dir = _state_dir()
     record = update_transaction.recover_transaction(state_dir=state_dir)
@@ -745,6 +745,27 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
         return 0
     if record["phase"] == "rolled_back":
         base_url, token = _authorize_drain(base_url)
+        drain = record["drain"]
+        ownership = {"token": token, "revision": drain["revision"],
+                     "capability": drain["capability"]}
+        try:
+            try:
+                update_drain.release_drain(base_url, transaction_id, **ownership)
+            except update_drain.DrainError as exc:
+                if exc.code != "drain_not_held":
+                    raise
+            try:
+                update_drain.drain_status(base_url, transaction_id, **ownership)
+            except update_drain.DrainError as exc:
+                if exc.code != "drain_not_held":
+                    raise
+            else:
+                raise update_drain.DrainError("drain_still_held",
+                                              "the relay still holds the recorded drain")
+        except update_drain.DrainError as exc:
+            raise UpdateError("the rolled-back record of %s is durable, but its drain "
+                              "release is pending (%s); fix the relay and run recover "
+                              "again; the capability is retained" % (transaction_id, exc)) from exc
         try:
             refresh = _refresh_barrier(base_url, token)
             if refresh.get("admissionClosed"):
