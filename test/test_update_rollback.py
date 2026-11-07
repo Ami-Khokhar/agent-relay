@@ -247,8 +247,8 @@ class RecoveryCommandTest(_RollbackCase):
 
     def test_a_terminal_rolled_back_record_finalizes_read_only(self):
         """A crash between the durable finalize and the expunge leaves a
-        ``rolled_back`` record that only owes one barrier refresh; recovery
-        retries exactly that and repeats no service action."""
+        ``rolled_back`` record that owes a drain release and one barrier refresh;
+        recovery proves the hold is gone and refreshes without repeating a service action."""
         self._crash(swapped=False)
         record = update_transaction.read_journal(state_dir=self.state)
         record["phase"] = "rolled_back"
@@ -601,6 +601,30 @@ class TerminalDrainRecoveryTest(unittest.TestCase):
 
     def recover(self):
         return safe_update.cmd_recover(TXN, base_url="http://127.0.0.1:43124")
+
+    def test_malformed_terminal_drain_is_refused_without_http_or_record_mutation(self):
+        path = self.state / "update" / "transaction.json"
+        original = json.loads(path.read_text())
+        cases = [
+            ("missing", None), ("null", None), ("list", []), ("empty", {}),
+            ("wrong revision", {"revision": "f" * 40, "capability": CAPABILITY}),
+            ("missing capability", {"revision": self.fixture.old}),
+            ("empty capability", {"revision": self.fixture.old, "capability": ""}),
+            ("non-string capability", {"revision": self.fixture.old, "capability": 7}),
+        ]
+        for label, drain in cases:
+            with self.subTest(label=label):
+                record = dict(original)
+                if label == "missing":
+                    del record["drain"]
+                else:
+                    record["drain"] = drain
+                path.write_text(json.dumps(record))
+                before = path.read_bytes()
+                with self.assertRaisesRegex(identity.UpdateError, "manual recovery required"):
+                    self.recover()
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(self.calls, [])
 
     def test_release_and_status_proof_precede_refresh_and_expunge(self):
         self.assertEqual(self.recover(), 0)

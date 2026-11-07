@@ -745,7 +745,11 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
         return 0
     if record["phase"] == "rolled_back":
         base_url, token = _authorize_drain(base_url)
-        drain = record["drain"]
+        drain = record.get("drain")
+        if not isinstance(drain, dict) or drain.get("revision") != record["revision"] \
+                or not isinstance(drain.get("capability"), str) or not drain["capability"]:
+            raise UpdateError("the transaction does not name the drain it owned; manual "
+                              "recovery required")
         ownership = {"token": token, "revision": drain["revision"],
                      "capability": drain["capability"]}
         try:
