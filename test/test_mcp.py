@@ -227,7 +227,7 @@ class McpHandlerTests(unittest.TestCase):
             option = tools["get_task"]["inputSchema"]["properties"]["includeInput"]
             self.assertEqual(option["type"], "boolean")
             self.assertTrue(option["description"])
-            for name in ("delegate", "wait_task", "get_task", "list_tasks"):
+            for name in ("delegate", "wait_task", "get_task", "list_tasks", "cancel_task"):
                 self.assertIn("inputChars", tools[name]["description"])
         finally:
             upstream.close()
