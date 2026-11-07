@@ -170,7 +170,7 @@ class _Case(unittest.TestCase):
         self._patch(update_drain, "drain_status", self._fake_drain_status)
         self._patch(update_drain, "_server_revision", lambda _base: self.fixture.old)
         self._patch(safe_update, "_refresh_barrier", lambda _b, _t: {"admissionClosed": False})
-        self.home_patch = patch.dict(os.environ, {"HOME": str(self.fixture.home)})
+        self.home_patch = patch.dict(os.environ, {"HOME": str(self.fixture.home), "XDG_CONFIG_HOME": ""})
         self.home_patch.start()
         self.addCleanup(self.home_patch.stop)
         self._patch(safe_update, "_state_dir", lambda: self.state)
@@ -230,6 +230,155 @@ class ServiceInspectionTest(_Case):
         self.assertIn(str(self.repo.resolve() / "src" / "server.py"),
                       receipt["programArguments"][1])
         self.assertTrue(receipt["digest"])
+
+    def test_a_wrapper_before_python_is_refused_by_both_managers(self):
+        script = str(self.repo / "src" / "server.py")
+        plist, _ = self.fixture.write_plist(
+            ProgramArguments=["/tmp/other", sys.executable, script])
+        with self.assertRaisesRegex(update_service.ServiceError, "immediately after"):
+            update_service.inspect_service(self.repo)
+        plist.unlink()
+        unit = self.fixture.home / ".config" / "systemd" / "user" / "agent-relay.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=/tmp/other %s %s\nWorkingDirectory=%s\n"
+                        % (sys.executable, script, self.repo.resolve()))
+        with self.assertRaisesRegex(update_service.ServiceError, "immediately after"):
+            update_service.inspect_service(self.repo)
+
+    def test_launchd_program_must_match_the_validated_executable(self):
+        for program in ("/bin/date", "python3", 42, ""):
+            with self.subTest(program=program):
+                self.fixture.write_plist(Program=program)
+                with self.assertRaisesRegex(update_service.ServiceError, "Program.*match"):
+                    update_service.inspect_service(self.repo)
+        path, definition = self.fixture.write_plist(Program=sys.executable)
+        before = path.read_bytes()
+        receipt = update_service.inspect_service(self.repo)
+        self.assertEqual(receipt["programArguments"], definition["ProgramArguments"])
+        self.assertEqual(path.read_bytes(), before)
+
+    def _write_systemd_unit(self, config):
+        unit = config / "systemd" / "user" / "agent-relay.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=%s %s\nWorkingDirectory=%s\n"
+                        % (sys.executable, self.repo / "src" / "server.py", self.repo.resolve()))
+        return unit
+
+    def test_systemd_accepts_an_xdg_location_identical_to_the_default(self):
+        config = self.fixture.home / ".config"
+        unit = self._write_systemd_unit(config)
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config)}):
+            receipt = update_service.inspect_service(self.repo)
+        self.assertEqual(receipt["path"], str(unit))
+
+    def test_systemd_counts_aliased_config_locations_once_and_keeps_the_receipt_path(self):
+        for default_is_alias in (False, True):
+            with self.subTest(default_is_alias=default_is_alias):
+                home = self.fixture.home / str(default_is_alias)
+                home.mkdir()
+                real = home / ("dotfiles" if default_is_alias else ".config")
+                unit = self._write_systemd_unit(real)
+                if default_is_alias:
+                    (home / ".config").symlink_to(real, target_is_directory=True)
+                    configured = real
+                else:
+                    configured = home / "config-alias"
+                    configured.symlink_to(real, target_is_directory=True)
+                before = unit.read_bytes()
+                with patch.dict(os.environ, {"HOME": str(home), "XDG_CONFIG_HOME": str(configured)}):
+                    receipt = update_service.inspect_service(self.repo)
+                self.assertEqual(receipt["path"], str(configured / "systemd" / "user"
+                                                     / "agent-relay.service"))
+                self.assertEqual(unit.read_bytes(), before)
+
+    def test_relative_xdg_is_ignored_even_when_its_unit_exists_in_the_cwd(self):
+        unit = self._write_systemd_unit(self.fixture.home / ".config")
+        cwd = self.fixture.home / "working"
+        self._write_systemd_unit(cwd / "relative-config")
+        previous = Path.cwd()
+        try:
+            os.chdir(cwd)
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": "relative-config"}):
+                receipt = update_service.inspect_service(self.repo)
+        finally:
+            os.chdir(previous)
+        self.assertEqual(receipt["path"], str(unit))
+
+    def test_systemd_uses_the_xdg_config_home_definition(self):
+        config = self.fixture.home / "custom-config"
+        unit = config / "systemd" / "user" / "agent-relay.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=%s %s\nWorkingDirectory=%s\n"
+                        % (sys.executable, self.repo / "src" / "server.py", self.repo.resolve()))
+        before = unit.read_bytes()
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config)}):
+            receipt = update_service.inspect_service(self.repo)
+        self.assertEqual(receipt["path"], str(unit))
+        self.assertEqual(receipt["kind"], "systemd")
+        self.assertEqual(unit.read_bytes(), before)
+
+    def test_installer_output_is_discovered_with_custom_or_relative_xdg_home(self):
+        stubs = self.fixture.home / "stubs"
+        stubs.mkdir()
+        for name, text in (("uname", "#!/bin/sh\necho Linux\n"),
+                           ("systemctl", "#!/bin/sh\nexit 0\n")):
+            stub = stubs / name
+            stub.write_text(text)
+            stub.chmod(0o755)
+        script = Path(__file__).resolve().parents[1] / "scripts" / "install-service.sh"
+        installer_root = self.fixture.home / "checkout-alias"
+        installer_root.symlink_to(self.repo, target_is_directory=True)
+        for configured in (str(self.fixture.home / "custom-config"), "relative-config"):
+            with self.subTest(configured=configured), patch.dict(os.environ, {
+                    "XDG_CONFIG_HOME": configured, "AGENT_RELAY_DIR": str(installer_root.resolve()),
+                    "AGENT_RELAY_PYTHON": sys.executable,
+                    "PATH": str(stubs) + ":/usr/bin:/bin"}):
+                installed = subprocess.run(["bash", str(script), "--no-update-timer"],
+                                           capture_output=True, text=True)
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                unit = self.fixture.home / ".config" / "systemd" / "user" / "agent-relay.service"
+                before = unit.read_bytes()
+                receipt = update_service.inspect_service(installer_root)
+                self.assertEqual(receipt["path"], str(unit))
+                assignments = dict(value.split("=", 1)
+                                   for value in receipt["environment"].split())
+                self.assertEqual(assignments["A2A_RELAY_PORT"], "43124")
+                self.assertIn("PATH", assignments)
+                self.assertEqual(unit.read_bytes(), before)
+
+    def test_repeated_systemd_environment_still_refuses_internal_config(self):
+        unit = self.fixture.home / ".config" / "systemd" / "user" / "agent-relay.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text('[Service]\nExecStart=%s %s\nWorkingDirectory=%s\n'
+                        'Environment=PORT=43124\nEnvironment="CONFIG=%s"\n'
+                        % (sys.executable, self.repo / "src" / "server.py",
+                           self.repo.resolve(), self.repo / "private config.json"))
+        with self.assertRaisesRegex(update_service.ServiceError, "inside the checkout"):
+            update_service.inspect_service(self.repo)
+
+    def test_only_environment_can_repeat_and_an_empty_value_resets_it(self):
+        unit = self.fixture.home / ".config" / "systemd" / "user" / "agent-relay.service"
+        unit.parent.mkdir(parents=True)
+        command = "%s %s" % (sys.executable, self.repo / "src" / "server.py")
+        body = ('[Service]\nExecStart=%s\nWorkingDirectory=%s\n'
+                'Environment="CONFIG=%s"\nEnvironment=\nEnvironment=PORT=43124\n'
+                % (command, self.repo.resolve(), self.repo / "private config.json"))
+        unit.write_text(body)
+        receipt = update_service.inspect_service(self.repo)
+        self.assertEqual(receipt["environment"], "PORT=43124")
+        unit.write_text(body + "ExecStart=" + command + "\n")
+        with self.assertRaisesRegex(update_service.ServiceError, "not a readable systemd unit"):
+            update_service.inspect_service(self.repo)
+
+    def test_two_systemd_unit_locations_are_refused_as_ambiguous(self):
+        configured = self.fixture.home / "custom-config"
+        for root in (configured, self.fixture.home / ".config"):
+            unit = root / "systemd" / "user" / "agent-relay.service"
+            unit.parent.mkdir(parents=True)
+            unit.write_text("[Service]\n")
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(configured)}):
+            with self.assertRaisesRegex(update_service.ServiceError, "multiple service definitions"):
+                update_service.inspect_service(self.repo)
 
     def test_missing_definition_is_refused(self):
         with self.assertRaises(identity.UpdateError) as caught:

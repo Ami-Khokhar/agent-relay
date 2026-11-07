@@ -43,7 +43,6 @@ import update_staging
 SERVICE_LABEL = "com.agent-relay"
 SYSTEMD_SERVICE = "agent-relay.service"
 PLIST_DIRNAME = Path("Library") / "LaunchAgents"
-UNIT_DIRNAME = Path(".config") / "systemd" / "user"
 SCRIPT_PARTS = ("src", "server.py")
 MAX_SERVICE_BYTES = 64 * 1024
 RESTART_TIMEOUT_S = 30
@@ -139,6 +138,10 @@ def _analysis(args, install_root, label):
                            "foreign or unsupported definition"
                            % (label, os.sep.join(SCRIPT_PARTS)))
     index, resolved = script
+    if index not in (0, 1):
+        raise ServiceError("%s service must name the relay script first or immediately "
+                           "after the Python interpreter; remove any wrapper or extra "
+                           "interpreter argument" % label)
     interpreter = None
     if index > 0:
         candidate = Path(args[index - 1])
@@ -211,6 +214,12 @@ def _plist(path, resolved_root, label):
     program = definition.get("ProgramArguments")
     if program is None and definition.get("Program") is not None:
         program = [definition["Program"]]
+    if "Program" in definition:
+        executable = definition["Program"]
+        if not isinstance(executable, str) or not os.path.isabs(executable) or \
+                not isinstance(program, list) or not program or executable != program[0]:
+            raise ServiceError("%s service Program must be absolute and match "
+                               "ProgramArguments[0]; remove the conflicting program" % label)
     _analysis(program or [], resolved_root, label)
     _working_directory(definition.get("WorkingDirectory"), resolved_root, label)
     environment = definition.get("EnvironmentVariables") or {}
@@ -237,7 +246,23 @@ def _systemd(path, resolved_root, label):
     parser = configparser.ConfigParser(interpolation=None, strict=True)
     try:
         with open(str(path), encoding="utf-8") as handle:
-            parser.read_file(handle)
+            lines = handle.readlines()
+        # systemd permits repeated Environment directives (our installer emits
+        # them). Keep strict duplicate checks for every other directive.
+        section, environment, directives = None, [], []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("["):
+                section = stripped
+            name, separator, value = stripped.partition("=")
+            if section == "[Service]" and separator and name.strip().lower() == "environment":
+                if value.strip():
+                    environment.append(value.strip())
+                else:
+                    environment.clear()
+            else:
+                directives.append(line)
+        parser.read_string("".join(directives))
     except (OSError, configparser.Error, UnicodeDecodeError) as exc:
         raise ServiceError("the %s service definition is not a readable systemd unit: "
                            "%s" % (label, exc)) from exc
@@ -245,6 +270,7 @@ def _systemd(path, resolved_root, label):
         raise ServiceError("the %s service definition has no [Service] section; "
                            "refusing" % label)
     service = {key.lower(): value for key, value in parser.items("Service")}
+    service["environment"] = " ".join(environment)
     unexpected = {key.lower() for key in service} - {key.lower() for key in SYSTEMD_KEYS}
     if unexpected:
         raise ServiceError("the %s service definition carries unsupported directives %s; "
@@ -268,7 +294,12 @@ def _systemd(path, resolved_root, label):
                            % (label, args[0][:1]))
     _analysis(args, resolved_root, label)
     _working_directory(service.get("workingdirectory"), resolved_root, label)
-    for assignment in service.get("environment", "").split():
+    try:
+        assignments = shlex.split(service["environment"], comments=False, posix=True)
+    except ValueError as exc:
+        raise ServiceError("the %s service environment cannot be parsed: %s"
+                           % (label, exc)) from exc
+    for assignment in assignments:
         name, _, value = assignment.partition("=")
         resolved = Path(value).resolve(strict=False) if os.path.isabs(value) else None
         if resolved is not None and str(resolved).startswith(str(resolved_root) + os.sep):
@@ -277,7 +308,7 @@ def _systemd(path, resolved_root, label):
     return {"kind": "systemd", "label": SYSTEMD_SERVICE, "path": str(path),
             "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
             "programArguments": args,
-            "environment": service.get("Environment", "")}
+            "environment": service["environment"]}
 
 
 def inspect_service(install_root):
@@ -297,17 +328,24 @@ def inspect_service(install_root):
     home = Path.home()
     candidates = []
     plist_path = home / PLIST_DIRNAME / ("%s.plist" % SERVICE_LABEL)
-    unit_path = home / UNIT_DIRNAME / SYSTEMD_SERVICE
-    for path, label, parser in ((plist_path, "launchd", _plist),
-                                (unit_path, "systemd --user", _systemd)):
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    config_home = Path(configured) if configured and os.path.isabs(configured) else home / ".config"
+    unit_paths = {}
+    for root in (config_home, home / ".config"):
+        path = root / "systemd" / "user" / SYSTEMD_SERVICE
+        unit_paths.setdefault(path.resolve(strict=False), path)
+    definitions = [(plist_path, "launchd", _plist)]
+    definitions.extend((path, "systemd --user", _systemd) for path in unit_paths.values())
+    for path, label, parser in definitions:
         if path.exists():
             candidates.append((path, label, parser))
     if not candidates:
-        raise ServiceError("no per-user %s or %s service definition at %s or %s; only "
+        raise ServiceError("no per-user %s or %s service definition at %s; only "
                            "positively validated per-user services are supported"
-                           % (SERVICE_LABEL, SYSTEMD_SERVICE, plist_path, unit_path))
+                           % (SERVICE_LABEL, SYSTEMD_SERVICE,
+                              ", ".join(str(item[0]) for item in definitions)))
     if len(candidates) > 1:
-        raise ServiceError("both launchd and systemd service definitions exist; refusing "
+        raise ServiceError("multiple service definitions exist; refusing "
                            "an ambiguous service boundary")
     path, label, parser = candidates[0]
     _plain_definition(path, label)
