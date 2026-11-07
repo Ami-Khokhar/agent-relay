@@ -347,26 +347,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("errorDetail", step)
         self.assertLess(len(json.dumps(summary)), len(json.dumps(workflow)))
 
-    def test_summary_caps_a_single_long_line_and_can_select_one_step(self):
+    def test_summary_caps_first_lines_only_above_the_limit_and_can_select_one_step(self):
         relay = self.start(echo())
-        workflow = run(relay, {"steps": [
-            {"id": "big", "agentId": "echo", "input": "x" * 8000},
-            {"id": "other", "agentId": "echo", "input": "small"},
-        ]})
-        for selector in ("view=summary", "view=summary&step=big"):
-            with self.subTest(selector=selector):
-                status, summary = relay.request(
-                    "GET", f"/v1/workflows/{workflow['id']}?{selector}")
-                self.assertEqual(status, 200)
-                step = steps_of(summary)["big"]
-                self.assertEqual(step["firstLine"], "x" * 199 + "…")
-                self.assertEqual(step["outputChars"], 8000)
-                self.assertNotIn("output", step)
-                self.assertNotIn("taskIds", step)
-                self.assertLess(len(json.dumps(summary)), 2000)
-                if "step=" in selector:
-                    self.assertEqual([s["id"] for s in summary["steps"]], ["big"])
-        self.assertEqual(steps_of(workflow)["big"]["output"], "x" * 8000)
+        cases = [("x" * 200, "x" * 200),
+                 ("x" * 201, "x" * 199 + "…"),
+                 ("x" * 8000, "x" * 199 + "…")]
+        for text, expected in cases:
+            with self.subTest(output_chars=len(text)):
+                workflow = run(relay, {"steps": [
+                    {"id": "big", "agentId": "echo", "input": text},
+                    {"id": "other", "agentId": "echo", "input": "small"},
+                ]})
+                for selector in ("view=summary", "view=summary&step=big"):
+                    with self.subTest(selector=selector):
+                        status, summary = relay.request(
+                            "GET", f"/v1/workflows/{workflow['id']}?{selector}")
+                        self.assertEqual(status, 200)
+                        step = steps_of(summary)["big"]
+                        self.assertEqual(step["firstLine"], expected)
+                        self.assertEqual(step["outputChars"], len(text))
+                        self.assertNotIn("output", step)
+                        self.assertNotIn("taskIds", step)
+                        self.assertLess(len(json.dumps(summary)), 2000)
+                        if "step=" in selector:
+                            self.assertEqual([s["id"] for s in summary["steps"]], ["big"])
+                self.assertEqual(steps_of(workflow)["big"]["output"], text)
 
     def test_an_unknown_step_is_refused_before_long_polling_an_unfinished_run(self):
         relay = self.start({"id": "slow", "command": PYTHON, "args": ["-c", SLOW]})
