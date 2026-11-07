@@ -58,13 +58,20 @@ class FakeReleaseResponse:
         return self.body[:limit]
 
 
+def newer_version(installed):
+    return "%d.0.0" % (int(installed.split(".")[0]) + 1)
+
+
 class FakeReleaseOpener:
+    def __init__(self, version):
+        self.version = version
+
     def open(self, request, timeout):
         self.request = request
         self.timeout = timeout
-        return FakeReleaseResponse([{"tag_name": "0.4.0", "prerelease": False,
+        return FakeReleaseResponse([{"tag_name": self.version, "prerelease": False,
                                     "draft": False,
-                                    "html_url": mcp_server.release_discovery.RELEASE_URL + "0.4.0",
+                                    "html_url": mcp_server.release_discovery.RELEASE_URL + self.version,
                                     "body": "release notes are data"}])
 
 
@@ -995,7 +1002,7 @@ class McpNoticeIsolationTests(unittest.TestCase):
         # The sentinel stands in for the developer's real XDG cache: a valid, undelivered
         # offer that initialize would mark delivered if it were allowed to read that cache.
         installed = mcp_server.release_discovery.installed_version()
-        offer_version = "%d.0.0" % (int(installed.split(".")[0]) + 1)
+        offer_version = newer_version(installed)
         params = {"protocolVersion": "2025-06-18", "capabilities": {},
                   "clientInfo": {"name": "isolation-test", "version": "1"}}
 
@@ -1063,7 +1070,7 @@ class McpServeTests(unittest.TestCase):
         # The offer must outrank whatever pyproject currently declares, so it is derived
         # from the installed version instead of a hardcoded tag.
         installed = mcp_server.release_discovery.installed_version()
-        offer_version = "%d.0.0" % (int(installed.split(".")[0]) + 1)
+        offer_version = newer_version(installed)
         with tempfile.TemporaryDirectory() as cache_home:
             cache_dir = os.path.join(cache_home, "agent-relay")
             os.mkdir(cache_dir, 0o700)
@@ -1119,14 +1126,16 @@ class McpServeTests(unittest.TestCase):
                 proxy.close()
 
     def test_check_updates_tool_returns_notes_as_data_only_on_explicit_call(self):
+        installed = mcp_server.release_discovery.installed_version()
+        offer_version = newer_version(installed)
         upstream = FakeUpstream(lambda method, path, body: (200, {}))
         handle = mcp_server.create_http_handler(upstream.url, timeout=1)
         try:
             with unittest.mock.patch.object(mcp_server.release_discovery, "build_opener",
-                                            return_value=FakeReleaseOpener()):
+                                            return_value=FakeReleaseOpener(offer_version)):
                 result = handle({"method": "tools/call", "params": {
                     "name": "check_updates", "arguments": {}}})
-            self.assertEqual(result["structuredContent"]["availableVersion"], "0.4.0")
+            self.assertEqual(result["structuredContent"]["availableVersion"], offer_version)
             self.assertEqual(result["structuredContent"]["releaseNotes"], "release notes are data")
             self.assertEqual(upstream.calls, [])
             tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
