@@ -227,7 +227,7 @@ class McpHandlerTests(unittest.TestCase):
             option = tools["get_task"]["inputSchema"]["properties"]["includeInput"]
             self.assertEqual(option["type"], "boolean")
             self.assertTrue(option["description"])
-            for name in ("delegate", "wait_task", "get_task", "list_tasks"):
+            for name in ("delegate", "wait_task", "get_task", "list_tasks", "cancel_task"):
                 self.assertIn("inputChars", tools[name]["description"])
         finally:
             upstream.close()
@@ -305,13 +305,13 @@ class McpHandlerTests(unittest.TestCase):
         try:
             result = handle({"method": "tools/call", "params": {
                 "name": "get_workflow",
-                "arguments": {"workflowId": "wf-1", "maxWaitMs": 900000}}})
+                "arguments": {"workflowId": "wf-1", "maxWaitMs": 900000, "view": "summary", "step": "a"}}})
             run = result["structuredContent"]
             self.assertEqual(run["waitMs"], 600000)
             self.assertIs(run["waitClamped"], True)
             self.assertEqual([call[1] for call in upstream.calls],
-                             ["/v1/workflows/wf-1?waitMs=900000", "/healthz",
-                              "/v1/workflows/wf-1?waitMs=600000"])
+                             ["/v1/workflows/wf-1?waitMs=900000&view=summary&step=a", "/healthz",
+                              "/v1/workflows/wf-1?waitMs=600000&view=summary&step=a"])
         finally:
             upstream.close()
 
@@ -321,6 +321,9 @@ class McpHandlerTests(unittest.TestCase):
         tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "run_workflow")
         step = tool["inputSchema"]["properties"]["spec"]["properties"]["steps"]["items"]["properties"]
         self.assertEqual(step["id"]["pattern"], workflows.STEP_ID_RE.pattern)
+        selector = next(t for t in mcp_server.TOOLS if t["name"] == "get_workflow")
+        self.assertEqual(selector["inputSchema"]["properties"]["step"]["pattern"],
+                         workflows.STEP_ID_RE.pattern)
         self.assertEqual(step["needs"]["items"]["pattern"], workflows.STEP_ID_RE.pattern)
         self.assertEqual(set(step["needsPolicy"]["enum"]), {"any", "all"})
         self.assertEqual(step["foreach"]["items"]["maxLength"], workflows.MAX_ITEM_CHARS)

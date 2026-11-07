@@ -155,14 +155,15 @@ class RolesTests(unittest.TestCase):
         cases = [
             ("longer instructions",
              registry([fake(role="reviewer")],
-                      {"reviewer": {"description": "d", "prompt": "new order"}}), {}),
+                      {"reviewer": {"description": "d", "prompt": "new order"}}), {}, None),
             ("instructions that no longer fit",
              registry([fake(role="reviewer")],
                       {"reviewer": {"description": "d", "prompt": "r" * 380}}),
-             {"AGENT_RELAY_MAX_COMMAND_INPUT_BYTES": "400"}),
-            ("a role that is gone", registry([fake()], {}), {}),
+             {"AGENT_RELAY_MAX_COMMAND_INPUT_BYTES": "400"}, "role_input_too_large"),
+            ("a role that is gone", registry([fake()], {}),
+             {"AGENT_RELAY_MAX_COMMAND_INPUT_BYTES": "400"}, "role_removed"),
         ]
-        for label, reloaded, extra in cases:
+        for label, reloaded, extra, expected_code in cases:
             with self.subTest(label=label):
                 relay = self.start([fake(role="reviewer"), slow()], review,
                                    env={"AGENT_RELAY_MAX_ACTIVE": "1", **extra})
@@ -172,13 +173,12 @@ class RolesTests(unittest.TestCase):
                 relay.write_registry(reloaded)
                 relay.reload()
                 task = relay.wait_task(queued["id"], timeout=20)
-                if label == "longer instructions":
+                if expected_code is None:
                     self.assertEqual(json.loads(task["output"]), ["new order\n\n" + "x" * 100])
                     self.assertEqual(task["rolePromptSha256"], sha("new order"))
                 else:
                     self.assertEqual(task["status"], "failed", task)
-                    self.assertTrue(task["error"].startswith(
-                        "role_input_too_large:" if extra else "role_removed:"), task["error"])
+                    self.assertTrue(task["error"].startswith(expected_code + ":"), task["error"])
 
 
 class RoleRegistryTests(unittest.TestCase):

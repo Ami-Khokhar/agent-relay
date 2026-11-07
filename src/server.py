@@ -2353,6 +2353,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, _invalid_wait())
         if not _is_valid_wait(wait_ms):
             return self._json(400, _invalid_wait())
+        if step_id is not None and WORKFLOW_ENGINE.public(
+                workflow_id, detail=False, step=step_id) is None:
+            return self._workflow_missing(workflow_id, step_id)
         if WORKFLOW_ENGINE.wait(workflow_id, wait_ms) is None:
             return self._workflow_not_found(workflow_id)
         view = WORKFLOW_ENGINE.public(workflow_id, detail=True, view=view_name, step=step_id)

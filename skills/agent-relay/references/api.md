@@ -196,13 +196,13 @@ Every step carries `startedAt` and `finishedAt`, null until the step starts and 
 `?view=summary` returns a small projection for an orchestrator that only needs to know
 which step finished: no `spec`, and each step carries its identity, `needs`, `status`,
 `attempts`, time windows, `error`, plus `outputChars` (the output's length) and `firstLine`
-(its first line) instead of the full `output`, `taskIds`, and `errorDetail`. The summary is
+(its first line, capped at 200 characters including a trailing `…` when truncated) instead of the full `output`, `taskIds`, and `errorDetail`. The summary is
 smaller than the full view whenever an output is long.
 
 `?step=<stepId>` returns that one step alone, with its full `output`, `taskIds`,
 `attemptTimes`, and (for a failed step) `errorDetail`, and no `spec`. A step the run does
-not have is `404 unknown_step`; a `step` that is not a valid step id shape is
-`400 invalid_step`. Both selectors combine with `?waitMs=`.
+not have is `404 unknown_step`, returned before long-polling; a `step` that is not a valid step id shape is
+`400 invalid_step`. Both selectors combine with `?waitMs=`. With both selectors, `view=summary` determines the selected step's shape: `outputChars` and bounded `firstLine` replace full `output`, `taskIds` and `errorDetail`.
 
 `?waitMs=<ms>` long-polls until the run is terminal or the wait elapses; a wait that ends
 first adds `waitExpired: true`, `waitedMs` and `hint`, exactly as a task wait does. A

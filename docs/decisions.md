@@ -49,3 +49,7 @@ A registry entry was a harness plus launch flags, so a reviewer and an implement
 ## Terminal rollback recovery proves the live drain is gone
 
 A rollback can finalize its durable record before releasing the live drain. Retrying only the disk-barrier refresh could then delete the sole recorded capability while admission stayed closed. Terminal rolled-back recovery now releases with the recorded revision and capability, tolerates an already absent hold, and requires status to report `drain_not_held` before refreshing the barrier and expunging the record. Every other status or transport result retains the record for an explicit retry; no service action is repeated.
+
+## Workflow summary previews stay bounded and selectors are checked before waiting
+
+A single-line output could fill a summary with the entire transcript, and an absent step selector could wait for the whole run before returning its existing error. Summary `firstLine` is now bounded to 200 characters including a trailing ellipsis on truncation, while `outputChars` retains the full size and the detail view retains the full text. A valid-shaped but absent step is rejected before a long poll. When both selectors are present, the step selector chooses the step and the summary selector chooses its shape; clamped MCP retries preserve both selectors.

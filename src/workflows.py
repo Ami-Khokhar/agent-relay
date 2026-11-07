@@ -60,6 +60,7 @@ MAX_EVENT_FEED = 4096
 # and the reason they failed last, so only the tail of each stream belongs in the summary.
 CAUSE_TAIL_LINES = 3
 CAUSE_MAX_CHARS = 2000
+SUMMARY_FIRST_LINE_CHARS = 200
 QUOTA_CAUSE_RE = re.compile(r"usage limit|rate.?limit|quota|too many requests", re.IGNORECASE)
 
 
@@ -494,8 +495,9 @@ class WorkflowEngine:
 
     def public(self, workflow_id, detail=True, view=None, step=None):
         """The run as clients see it. ``view="summary"`` projects each step down to its
-        identity, status, times and output size plus first line; ``step`` narrows the steps
-        to that one id with its full output and errorDetail. Both leave out the spec, and
+        identity, status, times and output size plus its first line (at most 200
+        characters, with a trailing … when truncated). ``step`` narrows the steps
+        to that one id; summary still decides its shape when both are present. Both leave out the spec, and
         either returns None when the run (or the step) is unknown."""
         if not RUN_ID_RE.fullmatch(workflow_id or ""):
             return None
@@ -1099,8 +1101,11 @@ class WorkflowEngine:
             output = step["output"] or ""
             view["attemptTimes"] = [dict(window) for window in step["attemptTimes"]]
             view["outputChars"] = len(output)
-            lines = output.splitlines()
-            view["firstLine"] = lines[0] if lines else None
+            lines = output[:SUMMARY_FIRST_LINE_CHARS + 1].splitlines()
+            first_line = lines[0] if lines else None
+            if first_line is not None and len(first_line) > SUMMARY_FIRST_LINE_CHARS:
+                first_line = first_line[:SUMMARY_FIRST_LINE_CHARS - 1] + "…"
+            view["firstLine"] = first_line
             return view
         if detail:
             view["taskIds"] = list(step["taskIds"])
