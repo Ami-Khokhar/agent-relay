@@ -33,8 +33,11 @@ from, read once at startup. Each of its fields is `"unknown"` when the relay doe
 from a git checkout or git cannot answer. A relay older than this field omits `revision`.
 `update` is the last `scripts/update.sh` attempt recorded for this checkout, read on every
 request: `outcome` is `up_to_date`, `updated`, `restarted` or `failed`, and `pendingRestart`
-says a restart is still recorded as pending. It is `null` when the script has never run for
-this install, and a relay older than this field omits `update`.
+says a restart is still recorded as pending. It is `null` when no attempt is recorded for
+this checkout (the script has never run here, or its record could not be read), and a relay
+older than this field omits `update`. Only a plain regular file is read: a symlink, a FIFO,
+a directory or an oversized record at that path reports as no attempt instead of blocking
+the health check.
 `maxTimeoutMs` is `null` when no hard cap is configured, and `taskRetentionMs` is `null` when
 no retention period is set. `active` counts running tasks
 and `queued` counts waiting tasks (the same distinction as the task statuses;

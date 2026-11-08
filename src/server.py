@@ -17,6 +17,7 @@ import re
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -269,12 +270,14 @@ def update_status(root):
 
     The script writes it beside the pending-restart marker it already keeps in ``.git``, so a
     deferred restart or a failed pull reaches /healthz instead of only the log. Anything
-    unreadable — no run yet, a checkout without one, a symlink, a foreign shape — reports as
-    no attempt rather than failing a health check.
+    unreadable or not a plain regular file — no run yet, a checkout without one, a symlink, a
+    FIFO, a directory, a foreign shape — reports as no attempt rather than failing a health
+    check: a special file would block the open, and /healthz must never hang a thread.
     """
     path = os.path.join(root, ".git", "agent-relay-update-status.json")
     try:
-        if os.path.islink(path) or os.path.getsize(path) > 64 * 1024:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
             return None
         with open(path, "r", encoding="utf-8") as handle:
             value = json.load(handle)

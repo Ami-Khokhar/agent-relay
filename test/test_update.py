@@ -104,6 +104,28 @@ class UpdateScriptTests(unittest.TestCase):
             finally:
                 relay.close()
 
+    def test_a_pull_that_cannot_fast_forward_records_a_failed_attempt(self):
+        """Divergent histories make `git pull --ff-only` refuse; the refusal is
+        recorded like every other attempt, not only written to the log."""
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            with open(os.path.join(checkout, "local.txt"), "w", encoding="utf-8") as handle:
+                handle.write("local\n")
+            git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+            for args in (("add", "."), ("commit", "-qm", "local")):
+                subprocess.run(["git", *args], cwd=checkout, env=git_env, check=True,
+                               capture_output=True, text=True)
+            advance_repo(seed, "c-remote")
+
+            result = run_update(checkout)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("could not fast-forward", result.stderr)
+            status = self._status(checkout)
+            self.assertEqual(status["outcome"], "failed")
+            self.assertIs(status["pendingRestart"], False)
+
     def test_new_commit_restarts_and_verifies_health(self):
         """A real relay runs on a helper-chosen port; uname/launchctl are stubbed
         through PATH so the restart branch runs without touching launchd."""
@@ -137,6 +159,8 @@ class UpdateScriptTests(unittest.TestCase):
                                  subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout,
                                                 check=True, capture_output=True,
                                                 text=True).stdout.strip())
+                # The producer's record and the relay's reader agree, field for field.
+                self.assertEqual(server.update_status(checkout), status)
             finally:
                 relay.close()
 
@@ -159,6 +183,9 @@ class UpdateScriptTests(unittest.TestCase):
                 result = self._run(env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("skipping restart", result.stdout)
+                status = self._status(checkout)
+                self.assertEqual(status["outcome"], "updated")
+                self.assertIs(status["pendingRestart"], True)
 
                 # Another commit arrives while the task is still running.
                 advance_repo(seed, "c-newer")
@@ -250,6 +277,9 @@ class UpdateScriptTests(unittest.TestCase):
                 self.assertIn("skipping restart", result.stdout)
                 with open(env["AGENT_RELAY_RESTART_LOG"], encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), "")
+                status = self._status(checkout)
+                self.assertEqual(status["outcome"], "updated")
+                self.assertIs(status["pendingRestart"], True)
             finally:
                 relay.close()
 
@@ -933,6 +963,29 @@ class DeployedRevisionTests(unittest.TestCase):
                                   "from": "a" * 40, "to": "b" * 40, "pendingRestart": True})
             finally:
                 relay.close()
+
+    def test_healthz_answers_with_no_attempt_when_the_record_is_a_special_file(self):
+        """Only a plain regular file is opened: a FIFO would block forever and take
+        a /healthz thread with it, so the request must still answer within its timeout."""
+        for place in ("fifo", "directory"):
+            with self.subTest(place=place):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = self._checkout(tmp)
+                    status = os.path.join(repo, ".git", "agent-relay-update-status.json")
+                    if place == "fifo":
+                        os.mkfifo(status)
+                    else:
+                        os.makedirs(status)
+                    relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]},
+                                  server=os.path.join(repo, "src", "server.py"))
+                    try:
+                        with urlrequest.urlopen(f"{relay.base}/healthz", timeout=5) as response:
+                            health = json.loads(response.read().decode("utf-8"))
+                        self.assertEqual(response.status, 200)
+                        self.assertIs(health["ok"], True)
+                        self.assertIsNone(health["update"])
+                    finally:
+                        relay.close()
 
 
 class HealthzCountsTests(unittest.TestCase):
