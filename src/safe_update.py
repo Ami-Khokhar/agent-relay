@@ -7,8 +7,8 @@ interactive, private, 15-minute device-local consent record, and ``stage``
 builds an isolated private repository holding the exact approved commit —
 only for a positively identified clean canonical source checkout, only
 while the recorded consent is still valid, and never by executing any
-staged content. Nothing is installed, activated or restarted by these
-commands. This issue adds ``activate``, the first activation consumer: it
+staged content. ``inspect``, ``approve``, ``consume`` and ``stage`` install,
+activate and restart nothing. ``activate`` is the activation consumer: it
 walks a prepared transaction through its journaled phases, swaps the verified
 source with trusted hook- and filter-disabled git, restarts only a positively
 validated per-user launchd/systemd service, and verifies the restarted relay
@@ -376,8 +376,9 @@ def cmd_activate(transaction_id, install_dir, *, base_url=None, inspect=None,
     barrier until the authenticated endpoint again reports the exact prior
     revision. A rollback step that itself fails keeps the recovery_required
     record, its barrier and an actionable remedy: the operator finishes it
-    with ``recover``. A step that failed before the first effect still leaves
-    the prepared transaction recoverable through recover-abort.
+    with ``recover``. Only a preflight refusal before the journal advances
+    leaves the prepared transaction abortable through ``recover-abort``;
+    failures during the journal walk follow the rollback path above.
     """
     state_dir = _state_dir()
     resolved = Path(install_dir).resolve()
@@ -705,7 +706,7 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
                 deadline_s=None):
     """Recover a failed activation to the exact, verified prior revision.
 
-    Runs the rollback of this issue's ``recovery_required`` transactions
+    Runs the rollback of this installation's ``recovery_required`` transactions
     (``rollback_transaction``) through the same restricted source/service
     boundaries activation used, and no other. Only this install's recorded
     transaction is recovered: a wrong-device journal is refused by the reader,

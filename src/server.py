@@ -2153,7 +2153,6 @@ class Handler(BaseHTTPRequestHandler):
                             "admissionClosed": UPDATE_BARRIER is not None,
                             "barrier": UPDATE_BARRIER})
                 return self._json(405, {"error": "method_not_allowed"})
-                return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/admin/update/drain":
                 # Loopback only: the drain body carries the capability that
                 # reopens admission, and it is of use only to the local updater.
