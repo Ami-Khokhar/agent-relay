@@ -55,8 +55,10 @@ def _checkout_commit():
     """Short HEAD of the checkout this server runs from, read from .git itself.
 
     git is never run: an MCP process must not trust a git found on PATH (the relay refuses
-    that for itself, for the same reason). "unknown" whenever it cannot be read — no
-    checkout, a bare or packed ref, an unreadable file — and initialize still works.
+    that for itself, for the same reason). Returns "unknown" when there is no .git to read,
+    when HEAD or the ref it names is unreadable or malformed, when the layout is one this
+    reader does not follow, or when what it finds is too short to name a commit; initialize
+    works whatever comes back.
     """
     root = os.path.dirname(SOURCE_DIR)
     git_dir = os.path.join(root, ".git")
@@ -70,17 +72,29 @@ def _checkout_commit():
         with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as handle:
             head = handle.read().strip()
         if not head.startswith("ref: "):
-            return head[:7]
-        ref = head[5:].strip()
-        try:
-            with open(os.path.join(git_dir, ref), encoding="utf-8") as handle:
-                return handle.read().strip()[:7]
-        except OSError:  # a ref git packed instead of keeping loose
-            with open(os.path.join(git_dir, "packed-refs"), encoding="utf-8") as handle:
-                for line in handle:
-                    if not line.startswith("#") and line.rstrip().endswith(" " + ref):
-                        return line.split()[0][:7]
-            return "unknown"
+            commit = head
+        else:
+            # HEAD lives in this worktree's own git directory; the ref it names lives in
+            # the common one, which a linked worktree records in a `commondir` file.
+            ref_dir = git_dir
+            common = os.path.join(git_dir, "commondir")
+            if os.path.isfile(common):
+                with open(common, encoding="utf-8") as handle:
+                    ref_dir = handle.read().strip()
+                if not os.path.isabs(ref_dir):
+                    ref_dir = os.path.join(git_dir, ref_dir)
+            ref = head[5:].strip()
+            commit = None
+            try:
+                with open(os.path.join(ref_dir, ref), encoding="utf-8") as handle:
+                    commit = handle.read().strip()
+            except OSError:  # a ref git packed instead of keeping loose
+                with open(os.path.join(ref_dir, "packed-refs"), encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.startswith("#") and line.rstrip().endswith(" " + ref):
+                            commit = line.split()[0]
+                            break
+        return commit[:7] if commit and len(commit) >= 7 else "unknown"
     except (OSError, ValueError, IndexError):
         return "unknown"
 
