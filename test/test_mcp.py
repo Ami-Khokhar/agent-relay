@@ -224,16 +224,14 @@ class McpHandlerTests(unittest.TestCase):
         upstream = FakeUpstream(lambda method, path, body: (200, {"id": "task-1", "status": "running"}))
         handle = mcp_server.create_http_handler(upstream.url, timeout=5)
         try:
-            started = time.monotonic()
             result = handle({"method": "tools/call", "params": {
                 "name": "wait_task", "arguments": {"taskId": "task-1"}}})
-            elapsed = time.monotonic() - started
             self.assertNotIn("isError", result)
             task = result["structuredContent"]
             self.assertEqual(task["status"], "running")
             self.assertNotIn("waitExpired", task)
-            self.assertLess(elapsed, 1.0)
-            # No wait was asked for, so the relay is asked for the task alone.
+            # The request path, not a wall-clock bound, is what proves nothing was waited on:
+            # a wait would arrive as waitMs on the query string.
             self.assertEqual([call[1] for call in upstream.calls], ["/v1/tasks/task-1"])
 
             tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
@@ -763,6 +761,15 @@ class McpHandlerTests(unittest.TestCase):
                 handle({"method": "tools/call", "params": {
                     "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "timeoutMs": 1.5}}})
             self.assertEqual(second.exception.code, -32602)
+            # A wait_task refusal lives inside the no-wait branch now: it must still be
+            # raised before any HTTP call reaches the relay.
+            for bad_wait in (0, -1, 1.5, True):
+                with self.subTest(bad_wait=bad_wait):
+                    with self.assertRaises(mcp_server.RpcError) as refused:
+                        handle({"method": "tools/call", "params": {
+                            "name": "wait_task",
+                            "arguments": {"taskId": "task-1", "maxWaitMs": bad_wait}}})
+                    self.assertEqual(refused.exception.code, -32602)
             self.assertEqual(len(upstream.calls), 0)
         finally:
             upstream.close()

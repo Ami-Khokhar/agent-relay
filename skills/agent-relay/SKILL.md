@@ -460,10 +460,11 @@ every task it started. A run that does not finish inside `waitMs` returns the sa
 To learn about whichever run in a session changes first — an orchestrator running several
 workflows — read the session's change feed instead of polling each run:
 `GET /v1/workflows/events?sessionId=<id>&after=<seq>&waitMs=<ms>` (or the
-`wait_workflow_events` tool) long-polls and returns each step or run status change in order:
-`workflowId`, `stepId` (`null` for a run-level change), `oldStatus`, `newStatus`, and a
-rising `seq`. Pass the last `seq` seen as `after`; an empty `events` list means the wait
-ended with no change.
+`wait_workflow_events` tool with a `maxWaitMs`) long-polls and returns each step or run
+status change in order: `workflowId`, `stepId` (`null` for a run-level change), `oldStatus`,
+`newStatus`, and a rising `seq`. Pass the last `seq` seen as `after`. Without a `maxWaitMs`
+the tool returns the changes recorded so far at once; with one, an empty `events` list means
+the wait ended with no change.
 
 **Host pressure.** `GET /v1/pressure` reads what this machine can tell you without root: the
 kernel's memory-pressure level, free-memory percentage, swap in use, and any thermal speed limit.
