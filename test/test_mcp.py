@@ -755,8 +755,9 @@ class McpHandlerTests(unittest.TestCase):
                 handle({"method": "tools/call", "params": {
                     "name": "delegate", "arguments": {"agentId": "fake", "input": "work", "timeoutMs": 1.5}}})
             self.assertEqual(second.exception.code, -32602)
-            # A wait_task refusal lives inside the no-wait branch now: it must still be
-            # raised before any HTTP call reaches the relay.
+            # The wait_task refusal is inside the branch that handles a supplied maxWaitMs,
+            # so it could be lost with that branch: it must still be raised before any HTTP
+            # call reaches the relay.
             for bad_wait in (0, -1, 1.5, True):
                 with self.subTest(bad_wait=bad_wait):
                     with self.assertRaises(mcp_server.RpcError) as refused:
