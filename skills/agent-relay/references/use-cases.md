@@ -7,10 +7,10 @@ from these patterns.
 Before any pattern: confirm the target CLIs exist (`which <command>`), register them, start
 the relay, and verify with `GET /v1/agents`.
 
-Throughout, "delegate" means `POST /v1/tasks` (or the MCP `delegate` tool), and it returns as
-soon as the relay queues the task. Read a task's state when you need it with
-`GET /v1/tasks/:id` (or MCP `get_task`), and recover task IDs after an orchestrator context
-reset with `GET /v1/tasks?sessionId=...` (or `list_tasks`).
+Throughout, "delegate" means `POST /v1/tasks` (or the MCP `delegate` tool), and without a
+`waitMs` it returns as soon as the relay queues the task. Read a task's state when you need
+it with `GET /v1/tasks/:id` (or MCP `get_task`), and recover task IDs after an orchestrator
+context reset with `GET /v1/tasks?sessionId=...` (or `list_tasks`).
 
 When you want the result before going on, wait for it: prefer the long poll —
 `GET /v1/tasks/:id?waitMs=<ms>` (or MCP `wait_task` with a `maxWaitMs`) — over a `get_task`
