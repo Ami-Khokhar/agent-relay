@@ -49,6 +49,10 @@ STDIO_ARGV = (
 )
 
 
+def newer_version(installed):
+    return "%d.0.0" % (int(installed.split(".")[0]) + 1)
+
+
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
