@@ -229,7 +229,7 @@ class McpClient:
     cache so initialize never reads or rewrites the developer's real notice cache;
     close() removes only that temporary cache, never a caller-supplied one."""
 
-    def __init__(self, relay_url, env=None):
+    def __init__(self, relay_url, env=None, server=MCP_SERVER):
         env = dict(env or {})
         self.cache_home = None
         if not env.get("XDG_CACHE_HOME"):
@@ -237,7 +237,7 @@ class McpClient:
             env["XDG_CACHE_HOME"] = self.cache_home.name
         env = {**os.environ, "A2A_RELAY_URL": relay_url, "AGENT_RELAY_TOKEN": TOKEN, **env}
         self.proc = subprocess.Popen(
-            [PYTHON, MCP_SERVER], cwd=ROOT, env=env,
+            [PYTHON, server], cwd=ROOT, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.lock = threading.Lock()

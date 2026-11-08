@@ -362,7 +362,14 @@ A task whose time runs out while the relay is still locating git metadata ends `
 
 The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
-- `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo }`
+- `initialize` → `{ protocolVersion: "2025-06-18", capabilities, serverInfo, instructions }`.
+  `instructions` carries the usage guidance, an optional cached release notice, and — when the
+  install changed on disk after this process started — a notice that says so in words, naming
+  the checkout's current commit and the commit this server loaded, and asking the client to
+  restart the MCP server (a new session or an MCP reconnect). The notice is raised only for a
+  source file this process actually imported, so a change elsewhere in the install never raises
+  it, and the server never restarts itself: the client owns that process, and the relay picks
+  up its own code on its next restart. Without such a change `instructions` has no notice.
 - `tools/list` → the fourteen tools below
 - `ping`
 - `tools/call`

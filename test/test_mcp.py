@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,12 +95,16 @@ class McpHandlerTests(unittest.TestCase):
         self.assertEqual(result["protocolVersion"], "2025-06-18")
         instructions = result["instructions"]
         self.assertTrue(instructions.strip())
-        self.assertLess(len(instructions), 1024)
+        # 1536 rather than 1024: a stale server appends the restart notice, so the bound
+        # has room for it while still catching unbounded growth of the instructions.
+        self.assertLess(len(instructions), 1536)
         for keyword in ("delegate", "wait_task", "list_agents", "pi", "codex", "sessionId",
                         "orchestrat", "fan out", "shell"):
             self.assertIn(keyword, instructions)
         # Waiting is an opt-in, not the documented next step after a submission.
         self.assertNotIn("then wait_task", instructions)
+        # Nothing changed under this process, so it has no restart advice to give.
+        self.assertNotIn("changed on disk since this MCP server started", instructions)
 
     def test_tool_descriptions_name_the_harnesses_and_their_arguments(self):
         handle = mcp_server.create_http_handler("http://127.0.0.1:1", timeout=1)
@@ -1256,6 +1261,74 @@ class McpServeTests(unittest.TestCase):
                 for stream in (proc.stdin, proc.stdout, proc.stderr):
                     if stream is not None:
                         stream.close()
+
+    def test_initialize_reports_an_install_that_changed_under_a_running_server(self):
+        """A client holds this process for a whole session, so the one signal it can act on
+        is initialize saying the checkout moved on. Only the files this process imported are
+        watched: a change to a file it never loaded must not nag."""
+        marker = "changed on disk since this MCP server started"
+        params = {"protocolVersion": "2025-06-18", "capabilities": {},
+                  "clientInfo": {"name": "stale-test", "version": "1"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "checkout")
+            copied = os.path.join(repo, "src")
+            os.makedirs(copied)
+            for name in sorted(os.listdir(os.path.join(ROOT, "src"))):
+                if name.endswith(".py"):
+                    shutil.copy(os.path.join(ROOT, "src", name), os.path.join(copied, name))
+            git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+            def git(*args):
+                subprocess.run(["git", *args], cwd=repo, env=git_env, check=True,
+                               capture_output=True, text=True)
+
+            def head():
+                return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo,
+                                      check=True, capture_output=True,
+                                      text=True).stdout.strip()
+
+            git("init", "-q", "-b", "main")
+            git("add", ".")
+            git("commit", "-qm", "first")
+            loaded_commit = head()
+
+            client = McpClient("http://127.0.0.1:1", env={"A2A_RELAY_AUTOSTART": "0"},
+                               server=os.path.join(copied, "mcp_server.py"))
+            try:
+                fresh = client.call("initialize", params)["result"]["instructions"]
+                self.assertNotIn(marker, fresh)
+
+                # server.py is never imported by this process, so its change is not its business.
+                with open(os.path.join(copied, "server.py"), "a", encoding="utf-8") as handle:
+                    handle.write("\n# a change the MCP server does not import\n")
+                self.assertNotIn(marker,
+                                 client.call("initialize", params)["result"]["instructions"])
+
+                # A file it did import: the notice appears once, word for word, with both
+                # commits, and it says to restart rather than claiming one happened.
+                mine = os.path.join(copied, "mcp_server.py")
+                with open(mine, "a", encoding="utf-8") as handle:
+                    handle.write("\n# already in this process's memory\n")
+                # The timestamp moves forward explicitly: a filesystem with one-second
+                # granularity would otherwise hide the change from the comparison.
+                stamp = time.time() + 5
+                os.utime(mine, (stamp, stamp))
+                git("add", ".")
+                git("commit", "-qm", "second")
+                current = head()
+                self.assertNotEqual(current, loaded_commit)
+
+                stale = client.call("initialize", params)["result"]["instructions"]
+                self.assertEqual(stale, fresh + (
+                    " The install has already changed on disk since this MCP server started"
+                    f" (checkout now {current}, this server loaded {loaded_commit})."
+                    " Restart this MCP server — a new session or an MCP reconnect —"
+                    " to serve the new code; the relay picks it up on its next restart."))
+                self.assertEqual(stale.count(marker), 1)
+                self.assertLess(len(stale), 1536)
+            finally:
+                client.close()
 
 
 if __name__ == "__main__":

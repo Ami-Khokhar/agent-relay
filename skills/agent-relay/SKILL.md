@@ -214,6 +214,11 @@ old means the running relay is stale: run `scripts/update.sh`. `/healthz` also r
 registry did not parse — the relay prints a timestamped `Configuration error: ...` line
 and exits on a bad registry, so check the server log.
 
+If `initialize` says the install has already changed on disk since this MCP server started,
+the client is holding a process that serves old code. Say so once, then start a new session
+or reconnect the MCP server to pick it up; the server never restarts itself, and the relay
+takes its own code on its next restart.
+
 ## 5. Delegate work
 
 ### Reporting an agent-relay problem
