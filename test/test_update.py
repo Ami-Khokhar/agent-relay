@@ -165,8 +165,9 @@ class UpdateScriptTests(unittest.TestCase):
                 relay.close()
 
     def test_a_restart_the_service_manager_refuses_is_recorded_as_failed(self):
-        """A launchctl that refuses the kickstart is the record no other test reaches:
-        the attempt is `failed` and the pending marker stays, so a later run retries it."""
+        """A launchctl that refuses the kickstart records `failed` with the pending marker
+        left on disk, so a later run retries it: one of the two failure records, the other
+        being the one scripts/update.sh writes when /healthz never answers after a restart."""
         with tempfile.TemporaryDirectory() as tmp:
             seed = init_repo(os.path.join(tmp, "seed"))
             checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
@@ -388,8 +389,10 @@ class UpdateScriptTests(unittest.TestCase):
         if service_restart_log is None:
             service_restart_log = os.path.join(stubs, "restarts.log")
         open(service_restart_log, "w").close()
-        # restart_fails stands in for a launchctl that refuses the kickstart, which is the
-        # one record_status call site no test reaches when every stub succeeds.
+        # restart_fails stands in for a launchctl that refuses the kickstart: one of the two
+        # record_status call sites no test reaches when every stub succeeds. The other is the
+        # `failed true` scripts/update.sh:186 writes when /healthz never answers after a
+        # restart, which no test drives either.
         launchctl = (f"echo \"stubbed restart: $*\" >> {service_restart_log}\n"
                      + ("exit 1\n" if restart_fails else ""))
         for name, body in (
