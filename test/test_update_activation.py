@@ -5,10 +5,11 @@ phases: it proves the drain, the stage, the checkout and the per-user service
 definition before any effect; swaps the source with the journaled exact
 git activation; restarts the service; and verifies the restarted relay only
 through an authenticated endpoint carrying the exact full commit plus the
-transaction's own barrier ownership. Test boundaries are faked at the service
-manager, the HTTP endpoints and the participating git objects; the tests
-never touch a user's own services, and the command spies show no installer,
-no main pull, no root control and no force-kill.
+transaction's own barrier ownership. Activation flows fake the service-manager
+and HTTP request boundaries using temporary git objects. The barrier-refresh
+test instead drives the real HTTP route through a temporary relay. Tests never
+touch a user's own services, and command spies show no installer, main pull,
+root control or force-kill.
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ import update_drain
 import update_service
 import update_staging
 import update_transaction
+from relay_helpers import PYTHON, TOKEN, Relay
 
 TAG = "0.5.0"
 NOW = 1_770_000_000.0
@@ -169,7 +171,7 @@ class _Case(unittest.TestCase):
         self.calls, self.restart_commands = [], []
         self._patch(update_drain, "drain_status", self._fake_drain_status)
         self._patch(update_drain, "_server_revision", lambda _base: self.fixture.old)
-        self._patch(safe_update, "_refresh_barrier", lambda _b, _t: {"admissionClosed": False})
+        self._patch(update_drain, "_request", self._fake_request)
         self.home_patch = patch.dict(os.environ, {"HOME": str(self.fixture.home), "XDG_CONFIG_HOME": ""})
         self.home_patch.start()
         self.addCleanup(self.home_patch.stop)
@@ -183,6 +185,16 @@ class _Case(unittest.TestCase):
         patcher = patch.object(obj, name, replacement)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def _fake_request(self, method, _base, path, *, token=None, **kwargs):
+        self.assertEqual(token, "t" * 32)
+        if method == "GET":
+            # Exercise the real authenticated wrapper with default HTTP responses.
+            self.assertIn(path, (safe_update.BARRIER_PATH, safe_update.AGENTS_PATH))
+            return 200, self._fake_authenticated_get(_base, token, path)
+        self.assertEqual((method, path), ("POST", safe_update.BARRIER_PATH))
+        self.calls.append(("post", path))
+        return 200, {"admissionClosed": False}
 
     def _fake_drain_status(self, _base, transaction_id, *, token=None, revision=None,
                            capability=None, timeout=None):
@@ -217,6 +229,27 @@ class _Case(unittest.TestCase):
         return {"agents": [],
                 "revision": {"commit": self.fixture.target if self.restart_commands
                              else self.fixture.old}}
+
+
+class BarrierRefreshHttpTest(unittest.TestCase):
+    def test_refresh_rereads_disk_and_reopens_after_a_corrupt_barrier_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            relay = Relay({"id": "unused", "command": PYTHON, "args": ["-c", "print('unused')"]},
+                          env={"AGENT_RELAY_STATE_DIR": str(state)})
+            self.addCleanup(relay.close)
+            self.assertFalse(safe_update._refresh_barrier(relay.base, TOKEN)["admissionClosed"])
+            barrier = state / "update" / "admission-barrier.json"
+            barrier.parent.mkdir(mode=0o700, exist_ok=True)
+            barrier.write_text("corrupt")
+            barrier.chmod(0o600)
+            self.assertFalse(safe_update._authenticated_get(
+                relay.base, TOKEN, safe_update.BARRIER_PATH)["admissionClosed"])
+            self.assertTrue(safe_update._refresh_barrier(relay.base, TOKEN)["admissionClosed"])
+            barrier.unlink()
+            self.assertTrue(safe_update._authenticated_get(
+                relay.base, TOKEN, safe_update.BARRIER_PATH)["admissionClosed"])
+            self.assertFalse(safe_update._refresh_barrier(relay.base, TOKEN)["admissionClosed"])
 
 
 class ServiceInspectionTest(_Case):
@@ -627,7 +660,6 @@ class ActivationFlowTest(_Case):
                                         restart=self.fake_restart, deadline_s=1.0)
 
     def test_exact_revision_activation_is_verified_and_finishes(self):
-        self._patch(safe_update, "_authenticated_get", self._fake_authenticated_get)
         old_inventory = self._tree_snapshot(self.fixture.stage)
         rc = self._run()
         self.assertEqual(rc, 0)
@@ -643,7 +675,7 @@ class ActivationFlowTest(_Case):
         kinds = [call[0] for call in self.calls]
         self.assertLess(kinds.index("restart"), kinds.index("get"),
                         "the relay is verified only after the boundary acted")
-        self.assertEqual(kinds[-1], "get", "the last probe is the authenticated barrier")
+        self.assertEqual(kinds[-1], "post", "the final HTTP request refreshes the barrier")
         self.assertEqual(self.calls[-1][1], safe_update.BARRIER_PATH)
         for argv in self.restart_commands:
             self.assertNotIn("git pull", argv)
@@ -665,7 +697,6 @@ class ActivationFlowTest(_Case):
         return snapshot
 
     def test_source_and_identity_mutation_is_refused_before_any_effect(self):
-        self._patch(safe_update, "_authenticated_get", self._fake_authenticated_get)
         (self.repo / "README.md").write_text("# dirty\n")
         with self.assertRaises(identity.UpdateError) as caught:
             self._run()
@@ -691,7 +722,6 @@ class ActivationFlowTest(_Case):
         prepared checkout: activating there would prove and restart its service
         while swapping the prepared root, so it is refused before the journal,
         the barrier or the service boundary moves at all."""
-        self._patch(safe_update, "_authenticated_get", self._fake_authenticated_get)
         other = Path(self.fixture.tmp.name) / "other-checkout"
         _run_git("clone", "-q", "--no-local", str(self.repo), str(other))
         _run_git("-C", str(other), "checkout", "-q", "--detach", self.fixture.old)
@@ -714,12 +744,20 @@ class ActivationFlowTest(_Case):
         def failing_restart(service):
             self.calls.append(("restart", service["kind"]))
             raise identity.UpdateError("the user launchd refused the restart")
+        def failed_service_request(method, base, path, **kwargs):
+            if method == "GET" and path == safe_update.AGENTS_PATH:
+                raise update_drain.DrainError("drain_unreachable", "the failed service is down")
+            return self._fake_request(method, base, path, **kwargs)
+        self._patch(update_drain, "_request", failed_service_request)
         before = self._external_snapshot()
         head_before = _run_git("-C", str(self.repo), "rev-parse", "HEAD")
         with self.assertRaises(identity.UpdateError) as caught:
             safe_update.cmd_activate(TXN, str(self.repo), inspect=self.fake_inspect,
                                      restart=failing_restart, deadline_s=1.0)
-        self.assertIn("recovery", str(caught.exception))
+        self.assertIn("automatic rollback did not complete", str(caught.exception))
+        self.assertIn("user launchd refused", str(caught.exception))
+        self.assertEqual(sum(call[0] == "restart" for call in self.calls), 2,
+                         "activation and automatic rollback both attempt the failed service")
         record = update_transaction.recover_transaction(state_dir=self.state)
         self.assertEqual(record["phase"], "recovery_required",
                          "the interrupted activation is durably recorded and recoverable")
