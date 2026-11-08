@@ -200,6 +200,9 @@ SHUTTING_DOWN = False
 _WARNED_FALLBACK = False
 UNKNOWN_REVISION = {"commit": "unknown", "short": "unknown", "date": "unknown"}
 REVISION = UNKNOWN_REVISION
+# Where this relay's own code lives, so /healthz can read the update status
+# scripts/update.sh records for this checkout.
+CHECKOUT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
 def _trusted_git():
@@ -259,6 +262,28 @@ def deployed_revision(root):
     except (OSError, subprocess.SubprocessError, ValueError):
         return dict(UNKNOWN_REVISION)
     return {"commit": commit, "short": short, "date": date}
+
+
+def update_status(root):
+    """The last `scripts/update.sh` attempt recorded for the checkout at ``root``, or None.
+
+    The script writes it beside the pending-restart marker it already keeps in ``.git``, so a
+    deferred restart or a failed pull reaches /healthz instead of only the log. Anything
+    unreadable — no run yet, a checkout without one, a symlink, a foreign shape — reports as
+    no attempt rather than failing a health check.
+    """
+    path = os.path.join(root, ".git", "agent-relay-update-status.json")
+    try:
+        if os.path.islink(path) or os.path.getsize(path) > 64 * 1024:
+            return None
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    known = ("at", "outcome", "from", "to", "pendingRestart")
+    return {key: value[key] for key in known if key in value} or None
 
 
 def now_iso():
@@ -2069,7 +2094,8 @@ class Handler(BaseHTTPRequestHandler):
                                             "registry": REGISTRY_PATH,
                                             "tasks": len(TASKS), "active": active,
                                             "queued": queued, "limits": _limits(),
-                                            "revision": REVISION})
+                                            "revision": REVISION,
+                                            "update": update_status(CHECKOUT_ROOT)})
                 return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/agents":
                 if method == "GET":
@@ -2460,7 +2486,7 @@ def main():
     except (OSError, ValueError) as exc:
         _log(f"Configuration error: {exc}", err=True)
         return 1
-    REVISION = deployed_revision(str(Path(__file__).resolve().parent.parent))
+    REVISION = deployed_revision(CHECKOUT_ROOT)
     _load_update_barrier()
     if TASK_RETENTION_MS:
         threading.Thread(target=_purge_periodically, daemon=True).start()

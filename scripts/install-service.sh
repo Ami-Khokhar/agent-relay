@@ -217,7 +217,7 @@ if [ "$WITH_UPDATE_TIMER" = "1" ]; then
     <key>PATH</key><string>$SERVICE_PATH</string>
   </dict>
   <key>StartInterval</key><integer>$UPDATE_INTERVAL</integer>
-  <key>RunAtLoad</key><false/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$HOME/Library/Logs/agent-relay/update.log</string>
   <key>StandardErrorPath</key><string>$HOME/Library/Logs/agent-relay/update.log</string>
 </dict>
