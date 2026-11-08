@@ -55,6 +55,19 @@ def _run_git(*args, cwd=None):
     return result.stdout.strip()
 
 
+def _external_inventory(fixture):
+    paths = {"consent": fixture.state / "consent.json",
+             "device": fixture.state / "device-id",
+             "receipt": fixture.stage / update_staging.STAGE_RECEIPT_NAME,
+             "service": fixture.home / "Library" / "LaunchAgents" / "com.agent-relay.plist"}
+    got = {name: "%s:%o" % (hashlib.sha256(path.read_bytes()).hexdigest(),
+                            stat.S_IMODE(path.stat().st_mode))
+           for name, path in paths.items()}
+    got["stateDir"] = "%o" % stat.S_IMODE(fixture.state.stat().st_mode)
+    got["updateDir"] = "%o" % stat.S_IMODE((fixture.state / "update").stat().st_mode)
+    return got
+
+
 class _Fixture:
     """One clean canonical checkout at the old commit, one verified stage at the
     target commit, untouched external state and one prepared transaction."""
@@ -621,6 +634,10 @@ class AwaitRevisionTest(_Case):
 class ActivationFlowTest(_Case):
     """The activate command: journaled exact-revision activation under the lock."""
 
+    def setUp(self):
+        super().setUp()
+        self.fixture.write_plist()
+
     def _run(self):
         return safe_update.cmd_activate(TXN, str(self.repo),
                                         inspect=self.fake_inspect,
@@ -726,7 +743,7 @@ class ActivationFlowTest(_Case):
         self.assertIsNotNone(update_transaction.read_barrier(state_dir=self.state),
                              "the barrier still denies admission after the interruption")
         self.assertEqual(self._external_snapshot(), before,
-                         "external config, token state and service definition are unchanged")
+                         "consent, device id, stage receipt, service definition and state/update modes are unchanged")
 
     def test_unknown_health_leaves_a_durable_recovery_required_state(self):
         self._patch(safe_update, "_authenticated_get", lambda _b, _t, _p: {"ok": True})
@@ -741,16 +758,10 @@ class ActivationFlowTest(_Case):
         refused = update_transaction.admission_blocker(state_dir=self.state)
         self.assertIsNotNone(refused, "the barrier fails every admission closed")
         self.assertEqual(self._external_snapshot(), before,
-                         "external config, token state and service definition are unchanged")
+                         "consent, device id, stage receipt, service definition and state/update modes are unchanged")
 
     def _external_snapshot(self):
-        point = self.state / "consent.json"
-        service = self.fixture.home / "Library" / "LaunchAgents" / "com.agent-relay.plist"
-        self.fixture.write_plist() if not service.exists() else None
-        return {"consent": hashlib.sha256(point.read_bytes()).hexdigest(),
-                "device": (self.state / "device-id").read_bytes(),
-                "service": hashlib.sha256(
-                    service.read_bytes()).hexdigest() if service.exists() else b""}
+        return _external_inventory(self.fixture)
 
     def test_recover_abort_refuses_a_recovery_required_transaction(self):
         self._patch(safe_update, "_authenticated_get", lambda _b, _t, _p: {"ok": True})
