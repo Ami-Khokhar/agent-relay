@@ -244,6 +244,9 @@ class UpdateScriptTests(unittest.TestCase):
                 self.assertIn("skipping restart", result.stdout)
                 with open(env["AGENT_RELAY_RESTART_LOG"], encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), "")
+                status = self._status(checkout)
+                self.assertEqual(status["outcome"], "updated")
+                self.assertIs(status["pendingRestart"], True)
 
                 result = self._run(env)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -251,6 +254,9 @@ class UpdateScriptTests(unittest.TestCase):
                 self.assertIn("relay healthy on port", result.stdout)
                 with open(env["AGENT_RELAY_RESTART_LOG"], encoding="utf-8") as handle:
                     self.assertIn("kickstart", handle.read())
+                status = self._status(checkout)
+                self.assertEqual(status["outcome"], "restarted")
+                self.assertIs(status["pendingRestart"], False)
             finally:
                 stop_http_server(server)
 
