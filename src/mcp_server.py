@@ -26,6 +26,83 @@ from urllib.parse import quote, urlencode, urlsplit
 STATUSES = ("queued", "running", "completed", "failed", "timed_out", "cancelled")
 WORKFLOW_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 FALSE_VALUES = ("0", "false", "no", "off")
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _loaded_sources():
+    """Modification times of the source files this process imported from its own directory.
+
+    An update replaces them on disk while this process keeps running the bytes it started
+    with, so a difference here is exactly "this server is stale". A file it never imported —
+    server.py, for one — cannot make it stale, so it is not watched and never nags.
+    """
+    stamps = {}
+    for module in list(sys.modules.values()):
+        path = getattr(module, "__file__", None)
+        if not path or not str(path).endswith(".py"):
+            continue
+        path = os.path.abspath(str(path))
+        if os.path.dirname(path) != SOURCE_DIR:
+            continue
+        try:
+            stamps[path] = os.stat(path).st_mtime_ns
+        except OSError:
+            continue
+    return stamps
+
+
+def _checkout_commit():
+    """Short HEAD of the checkout this server runs from, read from .git itself.
+
+    git is never run: an MCP process must not trust a git found on PATH (the relay refuses
+    that for itself, for the same reason). "unknown" whenever it cannot be read — no
+    checkout, a bare or packed ref, an unreadable file — and initialize still works.
+    """
+    root = os.path.dirname(SOURCE_DIR)
+    git_dir = os.path.join(root, ".git")
+    try:
+        if os.path.isfile(git_dir):  # a worktree: .git is a file naming the real directory
+            with open(git_dir, encoding="utf-8") as handle:
+                named = handle.read().strip()
+            git_dir = named.split(":", 1)[1].strip() if named.startswith("gitdir:") else named
+            if not os.path.isabs(git_dir):
+                git_dir = os.path.join(root, git_dir)
+        with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as handle:
+            head = handle.read().strip()
+        if not head.startswith("ref: "):
+            return head[:7]
+        ref = head[5:].strip()
+        try:
+            with open(os.path.join(git_dir, ref), encoding="utf-8") as handle:
+                return handle.read().strip()[:7]
+        except OSError:  # a ref git packed instead of keeping loose
+            with open(os.path.join(git_dir, "packed-refs"), encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.startswith("#") and line.rstrip().endswith(" " + ref):
+                        return line.split()[0][:7]
+            return "unknown"
+    except (OSError, ValueError, IndexError):
+        return "unknown"
+
+
+# Captured before anything could change them: initialize compares both against the disk to
+# say whether the install moved on while this server kept running.
+LOADED_SOURCES = _loaded_sources()
+LOADED_COMMIT = _checkout_commit()
+
+STALE_NOTICE = "The install has already changed on disk since this MCP server started"
+
+
+def _stale_notice():
+    """What initialize appends when this server's own sources changed under it."""
+    current = _loaded_sources()
+    if all(current.get(path) == stamp for path, stamp in LOADED_SOURCES.items()):
+        return ""
+    return (
+        f" {STALE_NOTICE} (checkout now {_checkout_commit()}, this server loaded "
+        f"{LOADED_COMMIT}). Restart this MCP server — a new session or an MCP reconnect — "
+        "to serve the new code; the relay picks it up on its next restart."
+    )
 
 
 def _env(*names, default=None):
@@ -657,6 +734,7 @@ def create_http_handler(base_url=None, timeout=None):
                                  f"{notice['version']} is available at {notice['url']}. "
                                  "Mention it once at a convenient checkpoint, not during active work; "
                                  "call check_updates only when the user asks for current release notes.")
+            instructions += _stale_notice()
             return {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": False}},
