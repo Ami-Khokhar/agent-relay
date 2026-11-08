@@ -386,6 +386,21 @@ class ServiceInspectionTest(_Case):
                 with self.assertRaisesRegex(update_service.ServiceError, "inside the checkout"):
                     update_service.inspect_service(self.repo)
 
+    def test_systemd_comment_continuation_keeps_directive_like_text_in_the_environment_receipt(self):
+        unit = self._write_systemd_unit(self.fixture.home / ".config")
+        service = unit.read_text()
+        for comment in ("# hidden", "; hidden"):
+            for directive in ("ExecStartPre=/bin/sh -c unsafe", "ExecStart=/bin/false"):
+                with self.subTest(comment=comment, directive=directive):
+                    unit.write_text(service + "Environment=A=1 " + chr(92) + "\n"
+                                    + comment + "\n" + directive + "\n")
+                    before = unit.read_bytes()
+                    receipt = update_service.inspect_service(self.repo)
+                    self.assertEqual(receipt["environment"].split(), ["A=1"] + directive.split())
+                    self.assertEqual(receipt["programArguments"],
+                                     [sys.executable, str(self.repo / "src" / "server.py")])
+                    self.assertEqual(unit.read_bytes(), before)
+
     def test_systemd_continued_execstart_is_parsed_and_unfinished_continuation_is_refused(self):
         unit = self._write_systemd_unit(self.fixture.home / ".config")
         body = unit.read_text().replace("ExecStart=%s " % sys.executable,
