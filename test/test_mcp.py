@@ -16,7 +16,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from relay_helpers import (MCP_SERVER, PYTHON, ROOT, McpClient, send_json, start_http_server,
-                           stop_http_server)
+                           stop_http_server, newer_version)
 import mcp_server
 import workflows
 
@@ -59,17 +59,11 @@ class FakeReleaseResponse:
         return self.body[:limit]
 
 
-def newer_version(installed):
-    return "%d.0.0" % (int(installed.split(".")[0]) + 1)
-
-
 class FakeReleaseOpener:
     def __init__(self, version):
         self.version = version
 
     def open(self, request, timeout):
-        self.request = request
-        self.timeout = timeout
         return FakeReleaseResponse([{"tag_name": self.version, "prerelease": False,
                                     "draft": False,
                                     "html_url": mcp_server.release_discovery.RELEASE_URL + self.version,

@@ -16,15 +16,12 @@ from urllib.error import URLError
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import release_discovery as discovery
+from relay_helpers import newer_version
 
 
 def release(tag, *, prerelease=False, draft=False, url=None, notes="release notes"):
     return {"tag_name": tag, "prerelease": prerelease, "draft": draft,
             "html_url": url or discovery.RELEASE_URL + tag, "body": notes}
-
-
-def newer_version(installed):
-    return "%d.0.0" % (int(installed.split(".")[0]) + 1)
 
 
 class FakeResponse:
