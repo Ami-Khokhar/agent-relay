@@ -28,6 +28,9 @@ TARGET_DIR="${AGENT_RELAY_DIR:-$HOME/.local/share/agent-relay}"
 PORT="${A2A_RELAY_PORT:-${AGENT_RELAY_PORT:-43124}}"
 LABEL="com.agent-relay"
 PENDING="$TARGET_DIR/.git/agent-relay-pending-restart"
+# Written next to the pending marker, inside .git, so the checkout stays clean
+# and /healthz can report the last attempt without a log dive.
+STATUS="$TARGET_DIR/.git/agent-relay-update-status.json"
 FORCE=0
 NO_RESTART=0
 for arg in "$@"; do
@@ -58,6 +61,27 @@ if "active" not in d or "queued" not in d:
 else:
     print("busy" if d["active"] + d["queued"] > 0 else "idle")
 ' 2>/dev/null || echo unknown
+}
+
+# Record what this run did where the relay can read it: GET /healthz reports
+# this file, so a deferred restart or a failed pull is visible without a dive
+# into the log. Renamed into place, so a reader never sees a half-written
+# record; failing to record warns and never changes the outcome of the update.
+record_status() {
+  local outcome="$1" pending="$2"
+  local tmp="$STATUS.tmp.$$"
+  if printf '{"at":"%s","outcome":"%s","from":"%s","to":"%s","pendingRestart":%s}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$outcome" "${OLD_HEAD:-}" "${NEW_HEAD:-}" "$pending" \
+      > "$tmp" && mv -f "$tmp" "$STATUS"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "warning: could not record the update status at $STATUS" >&2
+}
+
+# true when a restart is still recorded as pending, else false.
+pending_flag() {
+  if [ -f "$PENDING" ]; then printf true; else printf false; fi
 }
 
 restart_service() {
@@ -108,6 +132,7 @@ fi
 OLD_HEAD="$(git -C "$TARGET_DIR" rev-parse HEAD)"
 if ! git -C "$TARGET_DIR" pull --ff-only origin main; then
   echo "warning: could not fast-forward to main; the checkout may need manual attention" >&2
+  record_status failed "$(pending_flag)"
   exit 1
 fi
 NEW_HEAD="$(git -C "$TARGET_DIR" rev-parse HEAD)"
@@ -119,6 +144,7 @@ if [ "$OLD_HEAD" = "$NEW_HEAD" ]; then
     echo "already up to date; completing a restart deferred earlier"
   else
     echo "already up to date ($NEW_HEAD)"
+    record_status up_to_date false
     exit 0
   fi
 else
@@ -130,6 +156,7 @@ if [ "$NO_RESTART" -eq 1 ]; then
   STATE="busy: $(busy)"
   printf '%s' "$NEW_HEAD" > "$PENDING"
   echo "--no-restart: restart deferred ($STATE); the next run without --no-restart will complete it"
+  record_status updated true
   exit 0
 fi
 
@@ -145,15 +172,18 @@ if [ "$STATE" = "busy: idle" ] || [ "$FORCE" -eq 1 ] \
   # check keeps the marker so the next run retries the restart.
   printf '%s' "$NEW_HEAD" > "$PENDING"
   if ! restart_service; then
+    record_status failed true
     exit 1
   fi
   if await_health; then
     rm -f "$PENDING"
     echo "relay healthy on port $PORT"
+    record_status restarted false
     exit 0
   fi
   echo "warning: relay did not answer /healthz within 15s of the restart; check the service logs" >&2
   echo "warning: the pending marker was kept, so the next run will retry the restart" >&2
+  record_status failed true
   exit 1
 fi
 
@@ -161,4 +191,5 @@ fi
 #    the restart.
 printf '%s' "$NEW_HEAD" > "$PENDING"
 echo "skipping restart ($STATE); the next run will complete it, or rerun with --force"
+record_status updated true
 exit 0

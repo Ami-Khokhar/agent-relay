@@ -21,12 +21,23 @@ headers). Error responses close the connection. `GET /healthz` needs no token.
               "maxSteps": 64, "maxWorkflows": 200, "maxForEach": 32,
               "taskRetentionMs": null, "maxDelegationDepth": 2, "maxDelegatedTasks": 20 },
   "revision": { "commit": "131c0c0a3be70175e4bedaf4ef6074d0527f9cb9", "short": "131c0c0",
-                "date": "2026-10-02T19:10:52Z" } }
+                "date": "2026-10-02T19:10:52Z" },
+  "update": { "at": "2026-11-08T07:11:04Z", "outcome": "restarted",
+              "from": "324c1cda792adca3b824feb382af87b08c397727",
+              "to": "3e16ee197e337baa2b73e28ffa3880a2374f3715",
+              "pendingRestart": false } }
 ```
 
 `revision` is the git commit and commit date (ISO 8601) of the checkout the relay started
 from, read once at startup. Each of its fields is `"unknown"` when the relay does not run
 from a git checkout or git cannot answer. A relay older than this field omits `revision`.
+`update` is the last `scripts/update.sh` attempt recorded for this checkout, read on every
+request: `outcome` is `up_to_date`, `updated`, `restarted` or `failed`, and `pendingRestart`
+says a restart is still recorded as pending. It is `null` when no attempt is recorded for
+this checkout (the script has never run here, or its record could not be read), and a relay
+older than this field omits `update`. Only a plain regular file is read: a symlink, a FIFO,
+a directory or an oversized record at that path reports as no attempt instead of blocking
+the health check.
 `maxTimeoutMs` is `null` when no hard cap is configured, and `taskRetentionMs` is `null` when
 no retention period is set. `active` counts running tasks
 and `queued` counts waiting tasks (the same distinction as the task statuses;

@@ -166,7 +166,7 @@ To update a source checkout, run `bash
 it fast-forwards the checkout and restarts the service only when the code changed. The
 first restart is deferred while tasks are in flight (or while the relay cannot report
 counts), and the next run restarts unless tasks are visibly busy. The installer schedules
-a metadata-only release check every 6 hours. It stores a bounded offer in the private local
+a metadata-only release check every 6 hours and when the session loads. It stores a bounded offer in the private local
 cache; an MCP session may show its version and canonical release link once, at a convenient
 checkpoint. `check_updates` fetches bounded release notes only when explicitly called. These
 checks do not install releases or restart the service. When the checkout lacks
@@ -207,8 +207,10 @@ bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints
 `/v1/agents` lists your entries with `adapter`, effective `timeoutMs`, and `capabilities`.
 `/healthz`, `/v1/agents`, and the `list_agents` tool also report `revision`: the commit
 (`commit`, `short`) and commit `date` of the checkout the relay started from. A `date` weeks
-old means the running relay is stale: run `scripts/update.sh`. A field is `"unknown"` when
-the relay does not run from a git checkout or git cannot answer. If the list is empty, the
+old means the running relay is stale: run `scripts/update.sh`. `/healthz` also reports
+`update`, the last `scripts/update.sh` attempt for this checkout (`outcome`, `from`, `to`,
+`pendingRestart`), or `null` when no attempt is recorded here. A `revision` field is
+`"unknown"` when the relay does not run from a git checkout or git cannot answer. If the list is empty, the
 registry did not parse — the relay prints a timestamped `Configuration error: ...` line
 and exits on a bad registry, so check the server log.
 
