@@ -11,6 +11,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -94,7 +95,7 @@ def _checkout_commit():
                         if not line.startswith("#") and line.rstrip().endswith(" " + ref):
                             commit = line.split()[0]
                             break
-        return commit[:7] if commit and len(commit) >= 7 else "unknown"
+        return commit[:7] if commit and re.fullmatch(r"[0-9a-f]{7,40}", commit) else "unknown"
     except (OSError, ValueError, IndexError):
         return "unknown"
 
