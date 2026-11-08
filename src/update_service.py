@@ -250,7 +250,17 @@ def _systemd(path, resolved_root, label):
         # systemd permits repeated Environment directives (our installer emits
         # them). Keep strict duplicate checks for every other directive.
         section, environment, directives = None, [], []
+        continued = ""
         for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
+            line = continued + line.rstrip("\r\n")
+            if line.endswith("\\"):
+                continued = line[:-1] + " "
+                continue
+            continued = ""
+            line += "\n"
             stripped = line.strip()
             if stripped.startswith("["):
                 section = stripped
@@ -262,6 +272,9 @@ def _systemd(path, resolved_root, label):
                     environment.clear()
             else:
                 directives.append(line)
+        if continued:
+            raise ServiceError("the %s service definition ends with an unfinished "
+                               "line continuation; refusing" % label)
         parser.read_string("".join(directives))
     except (OSError, configparser.Error, UnicodeDecodeError) as exc:
         raise ServiceError("the %s service definition is not a readable systemd unit: "
@@ -270,6 +283,9 @@ def _systemd(path, resolved_root, label):
         raise ServiceError("the %s service definition has no [Service] section; "
                            "refusing" % label)
     service = {key.lower(): value for key, value in parser.items("Service")}
+    if "environment" in service:
+        raise ServiceError("the %s service definition only supports Environment= "
+                           "inside [Service]; refusing another environment form" % label)
     service["environment"] = " ".join(environment)
     unexpected = {key.lower() for key in service} - {key.lower() for key in SYSTEMD_KEYS}
     if unexpected:
