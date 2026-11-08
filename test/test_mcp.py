@@ -1097,6 +1097,44 @@ class McpNoticeIsolationTests(unittest.TestCase):
                     self.assertEqual(cached["notifiedVersion"], offer_version)
                     self.assertEqual(notice_cache_bytes(parent_home), sentinel)
 
+def _make_checkout(tmp, *, worktree=False):
+    repo = os.path.join(tmp, "checkout")
+    copied = os.path.join(repo, "src")
+    os.makedirs(copied)
+    for name in sorted(os.listdir(os.path.join(ROOT, "src"))):
+        if name.endswith(".py"):
+            shutil.copy(os.path.join(ROOT, "src", name), os.path.join(copied, name))
+    git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, env=git_env, check=True,
+                       capture_output=True, text=True)
+
+    def head():
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo,
+                              env=git_env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("add", ".")
+    git("commit", "-qm", "first")
+    if worktree:
+        linked = os.path.join(tmp, "linked")
+        git("worktree", "add", "-q", "-b", "linked", linked)
+        repo = linked
+    return repo, git, head
+
+
+def _make_stale(repo):
+    mine = os.path.join(repo, "src", "mcp_server.py")
+    with open(mine, "a", encoding="utf-8") as handle:
+        handle.write("\n# already in this process's memory\n")
+    # Move strictly beyond the previous stamp even on coarse filesystems.
+    stamp = max(time.time(), os.stat(mine).st_mtime) + 5
+    os.utime(mine, (stamp, stamp))
+
+
 class McpServeTests(unittest.TestCase):
     def test_cached_release_notice_is_local_version_only_and_shown_once_by_real_process(self):
         # The offer must outrank whatever pyproject currently declares, so it is derived
@@ -1272,27 +1310,8 @@ class McpServeTests(unittest.TestCase):
         params = {"protocolVersion": "2025-06-18", "capabilities": {},
                   "clientInfo": {"name": "stale-test", "version": "1"}}
         with tempfile.TemporaryDirectory() as tmp:
-            repo = os.path.join(tmp, "checkout")
+            repo, git, head = _make_checkout(tmp)
             copied = os.path.join(repo, "src")
-            os.makedirs(copied)
-            for name in sorted(os.listdir(os.path.join(ROOT, "src"))):
-                if name.endswith(".py"):
-                    shutil.copy(os.path.join(ROOT, "src", name), os.path.join(copied, name))
-            git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
-                       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
-
-            def git(*args):
-                subprocess.run(["git", *args], cwd=repo, env=git_env, check=True,
-                               capture_output=True, text=True)
-
-            def head():
-                return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo,
-                                      check=True, capture_output=True,
-                                      text=True).stdout.strip()
-
-            git("init", "-q", "-b", "main")
-            git("add", ".")
-            git("commit", "-qm", "first")
             loaded_commit = head()
 
             client = McpClient("http://127.0.0.1:1", env={"A2A_RELAY_AUTOSTART": "0"},
@@ -1309,13 +1328,7 @@ class McpServeTests(unittest.TestCase):
 
                 # A file it did import: the notice appears once, word for word, with both
                 # commits, and it says to restart rather than claiming one happened.
-                mine = os.path.join(copied, "mcp_server.py")
-                with open(mine, "a", encoding="utf-8") as handle:
-                    handle.write("\n# already in this process's memory\n")
-                # The timestamp moves forward explicitly: a filesystem with one-second
-                # granularity would otherwise hide the change from the comparison.
-                stamp = time.time() + 5
-                os.utime(mine, (stamp, stamp))
+                _make_stale(repo)
                 git("add", ".")
                 git("commit", "-qm", "second")
                 current = head()
@@ -1339,31 +1352,9 @@ class McpServeTests(unittest.TestCase):
         params = {"protocolVersion": "2025-06-18", "capabilities": {},
                   "clientInfo": {"name": "worktree-test", "version": "1"}}
         with tempfile.TemporaryDirectory() as tmp:
-            repo = os.path.join(tmp, "checkout")
-            os.makedirs(os.path.join(repo, "src"))
-            for name in sorted(os.listdir(os.path.join(ROOT, "src"))):
-                if name.endswith(".py"):
-                    shutil.copy(os.path.join(ROOT, "src", name),
-                                os.path.join(repo, "src", name))
-            git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
-                       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
-
-            def git(*args, cwd=repo):
-                subprocess.run(["git", *args], cwd=cwd, env=git_env, check=True,
-                               capture_output=True, text=True)
-
-            def head(cwd):
-                return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=cwd,
-                                      env=git_env, check=True, capture_output=True,
-                                      text=True).stdout.strip()
-
-            git("init", "-q", "-b", "main")
-            git("add", ".")
-            git("commit", "-qm", "first")
-            linked = os.path.join(tmp, "linked")
-            git("worktree", "add", "-q", "-b", "linked", linked)
+            linked, git, head = _make_checkout(tmp, worktree=True)
             self.assertTrue(os.path.isfile(os.path.join(linked, ".git")))
-            loaded_commit = head(linked)
+            loaded_commit = head()
 
             client = McpClient("http://127.0.0.1:1", env={"A2A_RELAY_AUTOSTART": "0"},
                                server=os.path.join(linked, "src", "mcp_server.py"))
@@ -1371,16 +1362,10 @@ class McpServeTests(unittest.TestCase):
                 fresh = client.call("initialize", params)["result"]["instructions"]
                 self.assertNotIn(marker, fresh)
 
-                mine = os.path.join(linked, "src", "mcp_server.py")
-                with open(mine, "a", encoding="utf-8") as handle:
-                    handle.write("\n# a change made from the linked worktree\n")
-                # The timestamp moves forward explicitly, as in the test above, so a
-                # filesystem with one-second granularity cannot hide the change.
-                stamp = time.time() + 5
-                os.utime(mine, (stamp, stamp))
-                git("add", ".", cwd=linked)
-                git("commit", "-qm", "second", cwd=linked)
-                current = head(linked)
+                _make_stale(linked)
+                git("add", ".")
+                git("commit", "-qm", "second")
+                current = head()
                 self.assertNotEqual(current, loaded_commit)
 
                 stale = client.call("initialize", params)["result"]["instructions"]
@@ -1390,6 +1375,43 @@ class McpServeTests(unittest.TestCase):
                 self.assertNotIn("unknown", stale)
             finally:
                 client.close()
+
+    def test_initialize_names_unknown_for_short_or_malformed_commit_metadata(self):
+        params = {"protocolVersion": "2025-06-18", "capabilities": {},
+                  "clientInfo": {"name": "invalid-commit-test", "version": "1"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _git, _head = _make_checkout(tmp)
+            git_dir = os.path.join(repo, ".git")
+            ref = os.path.join(git_dir, "refs", "heads", "main")
+            packed = os.path.join(git_dir, "packed-refs")
+            for layout in ("detached", "loose", "packed"):
+                for value, expected in (("", "unknown"), ("abc", "unknown"),
+                                        ("not-a-commit", "unknown"), ("a" * 41, "unknown"),
+                                        ("ref:refs/heads/main", "unknown"),
+                                        ("abcdef0", "abcdef0"), ("a" * 40, "a" * 7)):
+                    with self.subTest(layout=layout, value=value):
+                        with open(os.path.join(git_dir, "HEAD"), "w") as handle:
+                            handle.write(value if layout == "detached" else "ref: refs/heads/main")
+                        if os.path.exists(ref):
+                            os.unlink(ref)
+                        if os.path.exists(packed):
+                            os.unlink(packed)
+                        if layout == "loose":
+                            with open(ref, "w") as handle:
+                                handle.write(value)
+                        elif layout == "packed":
+                            with open(packed, "w") as handle:
+                                handle.write(value + " refs/heads/main\n")
+                        client = McpClient("http://127.0.0.1:1", env={"A2A_RELAY_AUTOSTART": "0"},
+                                           server=os.path.join(repo, "src", "mcp_server.py"))
+                        try:
+                            client.call("initialize", params)
+                            _make_stale(repo)
+                            notice = client.call("initialize", params)["result"]["instructions"]
+                            self.assertIn("checkout now " + expected, notice)
+                            self.assertIn("this server loaded " + expected, notice)
+                        finally:
+                            client.close()
 
 
 if __name__ == "__main__":
