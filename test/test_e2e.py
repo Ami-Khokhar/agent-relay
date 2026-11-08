@@ -120,7 +120,7 @@ class EndToEndTests(unittest.TestCase):
             relay.close()
 
 
-    def test_mcp_results_leave_out_the_input_unless_get_task_asks_for_it(self):
+    def test_mcp_omits_snapshot_input_and_reports_running_cancellation_fields(self):
         text = "review this change"
         relay = Relay([
             {"id": "echo", "command": PYTHON, "args": ["-c", "print('done')"]},
