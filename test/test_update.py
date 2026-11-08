@@ -164,6 +164,30 @@ class UpdateScriptTests(unittest.TestCase):
             finally:
                 relay.close()
 
+    def test_a_restart_the_service_manager_refuses_is_recorded_as_failed(self):
+        """A launchctl that refuses the kickstart is the record no other test reaches:
+        the attempt is `failed` and the pending marker stays, so a later run retries it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = init_repo(os.path.join(tmp, "seed"))
+            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+            relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]})
+            try:
+                port = relay.base.rsplit(":", 1)[1]
+                env = self._stub_env(checkout, port, restart_fails=True)
+                advance_repo(seed, "c-new")
+                subprocess.run(["git", "fetch", "origin"], cwd=checkout, check=True,
+                               capture_output=True, text=True)
+
+                result = self._run(env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                status = self._status(checkout)
+                self.assertEqual(status["outcome"], "failed")
+                self.assertIs(status["pendingRestart"], True)
+                self.assertTrue(os.path.exists(
+                    os.path.join(checkout, ".git", "agent-relay-pending-restart")))
+            finally:
+                relay.close()
+
     def test_new_commit_with_busy_relay_skips_restart_unless_forced(self):
         with tempfile.TemporaryDirectory() as tmp:
             seed = init_repo(os.path.join(tmp, "seed"))
@@ -359,15 +383,18 @@ class UpdateScriptTests(unittest.TestCase):
             self.assertIn("setup script not found", result.stderr)
 
     @staticmethod
-    def _stub_env(checkout, port, service_restart_log=None):
+    def _stub_env(checkout, port, service_restart_log=None, restart_fails=False):
         stubs = tempfile.mkdtemp(prefix="a2a-stubs-")
         if service_restart_log is None:
             service_restart_log = os.path.join(stubs, "restarts.log")
         open(service_restart_log, "w").close()
+        # restart_fails stands in for a launchctl that refuses the kickstart, which is the
+        # one record_status call site no test reaches when every stub succeeds.
+        launchctl = (f"echo \"stubbed restart: $*\" >> {service_restart_log}\n"
+                     + ("exit 1\n" if restart_fails else ""))
         for name, body in (
                 ("uname", "echo Darwin\n"),
-                ("launchctl",
-                 f"echo \"stubbed restart: $*\" >> {service_restart_log}\n"),
+                ("launchctl", launchctl),
         ):
             stub = os.path.join(stubs, name)
             with open(stub, "w", encoding="utf-8") as handle:

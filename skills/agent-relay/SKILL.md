@@ -166,15 +166,16 @@ To update a source checkout, run `bash
 it fast-forwards the checkout and restarts the service only when the code changed. The
 first restart is deferred while tasks are in flight (or while the relay cannot report
 counts), and the next run restarts unless tasks are visibly busy. The installer schedules
-a metadata-only release check every 6 hours and when the session loads. It stores a bounded offer in the private local
-cache; an MCP session may show its version and canonical release link once, at a convenient
-checkpoint. `check_updates` fetches bounded release notes only when explicitly called. These
-checks do not install releases or restart the service. When the checkout lacks
-`src/release_discovery.py`, the installer rejects it before creating or scheduling anything:
-rerun `bash skills/agent-relay/scripts/setup.sh` to refresh it, or pass `--no-update-timer`
-to install the relay service only. Older installed timers still run the
-legacy updater until you rerun `install-service.sh` to replace their definitions. Pass
-`--no-update-timer` to remove the timer (`--with-update-timer` remains accepted).
+a metadata-only release check every 6 hours and when the session loads. It stores a
+bounded offer in the private local cache; an MCP session may show its version and
+canonical release link once, at a convenient checkpoint. `check_updates` fetches bounded
+release notes only when explicitly called. These checks do not install releases or restart
+the service. When the checkout lacks `src/release_discovery.py`, the installer rejects it
+before creating or scheduling anything: rerun `bash skills/agent-relay/scripts/setup.sh` to
+refresh it, or pass `--no-update-timer` to install the relay service only. Older installed
+timers still run the legacy updater until you rerun `install-service.sh` to replace their
+definitions. Pass `--no-update-timer` to remove the timer (`--with-update-timer` remains
+accepted).
 
 Register the MCP server in the orchestrating client (point `args` at the absolute path).
 The setup script prints these for your checkout:
@@ -210,9 +211,10 @@ bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints
 old means the running relay is stale: run `scripts/update.sh`. `/healthz` also reports
 `update`, the last `scripts/update.sh` attempt for this checkout (`outcome`, `from`, `to`,
 `pendingRestart`), or `null` when no attempt is recorded here. A `revision` field is
-`"unknown"` when the relay does not run from a git checkout or git cannot answer. If the list is empty, the
-registry did not parse — the relay prints a timestamped `Configuration error: ...` line
-and exits on a bad registry, so check the server log.
+`"unknown"` when the relay does not run from a git checkout or git cannot answer.
+
+If the list is empty, the registry did not parse — the relay prints a timestamped
+`Configuration error: ...` line and exits on a bad registry, so check the server log.
 
 If `initialize` says the install has already changed on disk since this MCP server started,
 the client is holding a process that serves old code. Say so once, then start a new session
