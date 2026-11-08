@@ -122,7 +122,10 @@ class EndToEndTests(unittest.TestCase):
 
     def test_mcp_results_leave_out_the_input_unless_get_task_asks_for_it(self):
         text = "review this change"
-        relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print('done')"]})
+        relay = Relay([
+            {"id": "echo", "command": PYTHON, "args": ["-c", "print('done')"]},
+            {"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(30)"]},
+        ])
         client = McpClient(relay.base)
         try:
             delegated = client.call_tool("delegate", {
@@ -132,10 +135,23 @@ class EndToEndTests(unittest.TestCase):
             fetched = client.call_tool("get_task", {"taskId": task_id})["structuredContent"]
             listed = client.call_tool("list_tasks", {})["structuredContent"]["tasks"][0]
             self.assertEqual(delegated["status"], "completed")
-            cancelled = client.call_tool("cancel_task", {"taskId": task_id})["structuredContent"]
-            for snapshot in (delegated, waited, fetched, listed, cancelled):
+            for snapshot in (delegated, waited, fetched, listed):
                 self.assertNotIn("input", snapshot)
                 self.assertEqual(snapshot["inputChars"], len(text))
+            slow_text = "cancel this still-running command"
+            running = client.call_tool("delegate", {
+                "agentId": "slow", "input": slow_text})["structuredContent"]
+            deadline = time.monotonic() + 5
+            while running["status"] == "queued" and time.monotonic() < deadline:
+                time.sleep(0.01)
+                running = client.call_tool("get_task", {"taskId": running["id"]})["structuredContent"]
+            self.assertEqual(running["status"], "running")
+            cancelled = client.call_tool("cancel_task", {"taskId": running["id"]})["structuredContent"]
+            self.assertEqual(cancelled["id"], running["id"])
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(cancelled["cancellation"], "process_signal")
+            self.assertNotIn("input", cancelled)
+            self.assertEqual(cancelled["inputChars"], len(slow_text))
             opted_in = client.call_tool("get_task", {"taskId": task_id, "includeInput": True})
             self.assertEqual(opted_in["structuredContent"]["input"], text)
         finally:
