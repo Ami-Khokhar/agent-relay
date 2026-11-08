@@ -169,13 +169,13 @@ counts), and the next run restarts unless tasks are visibly busy. The installer 
 a metadata-only release check every 6 hours and when the session loads. It stores a
 bounded offer in the private local cache; an MCP session may show its version and
 canonical release link once, at a convenient checkpoint. `check_updates` fetches bounded
-release notes only when explicitly called. These checks do not install releases or
-restart the service. When the checkout lacks
-`src/release_discovery.py`, the installer rejects it before creating or scheduling anything:
-rerun `bash skills/agent-relay/scripts/setup.sh` to refresh it, or pass `--no-update-timer`
-to install the relay service only. Older installed timers still run the
-legacy updater until you rerun `install-service.sh` to replace their definitions. Pass
-`--no-update-timer` to remove the timer (`--with-update-timer` remains accepted).
+release notes only when explicitly called. These checks do not install releases or restart
+the service. When the checkout lacks `src/release_discovery.py`, the installer rejects it
+before creating or scheduling anything: rerun `bash skills/agent-relay/scripts/setup.sh` to
+refresh it, or pass `--no-update-timer` to install the relay service only. Older installed
+timers still run the legacy updater until you rerun `install-service.sh` to replace their
+definitions. Pass `--no-update-timer` to remove the timer (`--with-update-timer` remains
+accepted).
 
 Register the MCP server in the orchestrating client (point `args` at the absolute path).
 The setup script prints these for your checkout:
