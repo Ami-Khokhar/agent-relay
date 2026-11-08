@@ -356,6 +356,48 @@ class ServiceInspectionTest(_Case):
         with self.assertRaisesRegex(update_service.ServiceError, "inside the checkout"):
             update_service.inspect_service(self.repo)
 
+    def test_systemd_refuses_environment_outside_the_supported_service_equals_form(self):
+        unit = self._write_systemd_unit(self.fixture.home / ".config")
+        service = unit.read_text()
+        for assignment in ("PORT=43124", '"CONFIG=%s"' % (self.repo / "private config.json")):
+            for body in ("[DEFAULT]\nEnvironment=%s\n" % assignment + service,
+                         service + "Environment: %s\n" % assignment):
+                with self.subTest(body=body):
+                    unit.write_text(body)
+                    before = unit.read_bytes()
+                    with self.assertRaisesRegex(update_service.ServiceError, "Environment=.*Service"):
+                        update_service.inspect_service(self.repo)
+                    self.assertEqual(unit.read_bytes(), before)
+
+    def test_systemd_continued_environment_keeps_every_assignment_and_internal_config_checks(self):
+        unit = self._write_systemd_unit(self.fixture.home / ".config")
+        service = unit.read_text()
+        for middle in ("", "# a comment between continued lines\n; another comment\n"):
+            with self.subTest(middle=middle):
+                unit.write_text(service + "Environment=PATH=/usr/bin " + chr(92) + "\n"
+                                + middle + "    A2A_RELAY_PORT=43124\n")
+                before = unit.read_bytes()
+                receipt = update_service.inspect_service(self.repo)
+                self.assertEqual(receipt["environment"].split(),
+                                 ["PATH=/usr/bin", "A2A_RELAY_PORT=43124"])
+                self.assertEqual(unit.read_bytes(), before)
+                unit.write_text(service + "Environment=PATH=/usr/bin " + chr(92) + "\n"
+                                + middle + '    "CONFIG=%s"\n' % (self.repo / "private config.json"))
+                with self.assertRaisesRegex(update_service.ServiceError, "inside the checkout"):
+                    update_service.inspect_service(self.repo)
+
+    def test_systemd_continued_execstart_is_parsed_and_unfinished_continuation_is_refused(self):
+        unit = self._write_systemd_unit(self.fixture.home / ".config")
+        body = unit.read_text().replace("ExecStart=%s " % sys.executable,
+                                       "ExecStart=%s " % sys.executable + chr(92) + "\n    ")
+        unit.write_text(body)
+        receipt = update_service.inspect_service(self.repo)
+        self.assertEqual(receipt["programArguments"],
+                         [sys.executable, str(self.repo / "src" / "server.py")])
+        unit.write_text(body + "Environment=PORT=43124 " + chr(92) + "\n")
+        with self.assertRaisesRegex(update_service.ServiceError, "unfinished line continuation"):
+            update_service.inspect_service(self.repo)
+
     def test_only_environment_can_repeat_and_an_empty_value_resets_it(self):
         unit = self.fixture.home / ".config" / "systemd" / "user" / "agent-relay.service"
         unit.parent.mkdir(parents=True)
