@@ -398,6 +398,18 @@ class ServiceInspectionTest(_Case):
         with self.assertRaisesRegex(update_service.ServiceError, "unfinished line continuation"):
             update_service.inspect_service(self.repo)
 
+    def test_systemd_refuses_a_blank_line_in_a_continuation_before_another_directive(self):
+        unit = self._write_systemd_unit(self.fixture.home / ".config")
+        service = unit.read_text()
+        for directive in ("ExecStartPre=/bin/sh -c unsafe", "ExecStart=/bin/false"):
+            with self.subTest(directive=directive):
+                unit.write_text(service + "Environment=A=1 " + chr(92) + "\n\n"
+                                + directive + "\n")
+                before = unit.read_bytes()
+                with self.assertRaisesRegex(update_service.ServiceError, "empty line.*continuation"):
+                    update_service.inspect_service(self.repo)
+                self.assertEqual(unit.read_bytes(), before)
+
     def test_only_environment_can_repeat_and_an_empty_value_resets_it(self):
         unit = self.fixture.home / ".config" / "systemd" / "user" / "agent-relay.service"
         unit.parent.mkdir(parents=True)
