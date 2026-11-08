@@ -253,6 +253,9 @@ def _systemd(path, resolved_root, label):
         continued = ""
         for line in lines:
             stripped = line.strip()
+            if not stripped and continued:
+                raise ServiceError("the %s service definition has an empty line in a "
+                                   "line continuation; refusing" % label)
             if not stripped or stripped.startswith(("#", ";")):
                 continue
             line = continued + line.rstrip("\r\n")
@@ -286,6 +289,7 @@ def _systemd(path, resolved_root, label):
     if "environment" in service:
         raise ServiceError("the %s service definition only supports Environment= "
                            "inside [Service]; refusing another environment form" % label)
+    # This generated receipt field still participates in SYSTEMD_KEYS validation.
     service["environment"] = " ".join(environment)
     unexpected = {key.lower() for key in service} - {key.lower() for key in SYSTEMD_KEYS}
     if unexpected:
