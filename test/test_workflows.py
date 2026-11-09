@@ -313,9 +313,32 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn("SyntaxError", step["error"])
                 self.assertFalse(step["error"].startswith("agent_quota:"), step["error"])
 
+    def test_source_line_429_does_not_label_a_failure_as_quota(self):
+        for diagnostic in ("src/app.py:429:1: E501 line too long",
+                           'File "src/app.py", line 429\nValueError: bad input'):
+            with self.subTest(diagnostic=diagnostic):
+                script = "import sys; sys.stderr.write(%r); sys.exit(1)" % diagnostic
+                relay = self.start({"id": "broken", "command": PYTHON, "args": ["-c", script]})
+                workflow = run(relay, {"steps": [{"id": "source", "agentId": "broken", "input": "go"}]})
+                step = steps_of(workflow)["source"]
+                self.assertEqual(step["status"], "failed")
+                self.assertIn("429", step["error"])
+                self.assertFalse(step["error"].startswith("agent_quota:"), step["error"])
+
+    def test_stdout_only_limit_text_does_not_classify_the_task_error(self):
+        script = "import sys; print('429 too many requests'); sys.exit(1)"
+        relay = self.start({"id": "broken", "command": PYTHON, "args": ["-c", script]})
+        workflow = run(relay, {"steps": [{"id": "source", "agentId": "broken", "input": "go"}]})
+        step = steps_of(workflow)["source"]
+        self.assertEqual(step["status"], "failed")
+        self.assertEqual(step["errorDetail"], "Agent exited with 1")
+        self.assertIn("429 too many requests", step["output"])
+        self.assertFalse(step["error"].startswith("agent_quota:"), step["error"])
+
     def test_limit_diagnostic_before_traceback_still_labels_the_cause(self):
         for diagnostic in ("quota exceeded", "quota reached", "usage limit", "rate-limit",
-                           "too many requests", "HTTP 429"):
+                           "too many requests", "HTTP 429", "HTTP/1.1 429", "status:429",
+                           "error=429", "code 429"):
             with self.subTest(diagnostic=diagnostic):
                 stderr = diagnostic + "\ntrace one\ntrace two\ntrace three\ntrace four"
                 script = "import sys; sys.stderr.write(%r); sys.exit(1)" % stderr

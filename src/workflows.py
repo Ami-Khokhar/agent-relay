@@ -65,7 +65,8 @@ CAUSE_TAIL_LINES = 3
 CAUSE_MAX_CHARS = 2000
 SUMMARY_FIRST_LINE_CHARS = 200
 QUOTA_CAUSE_RE = re.compile(
-    r"\b(?:usage[ _-]?limit|rate[ _-]?limit|quota[ \t]+(?:exceeded|reached)|too many requests|429)\b",
+    r"\b(?:usage[ _-]?limit|rate[ _-]?limit|quota[ \t]+(?:exceeded|reached)|too many requests|"
+    r"(?:http(?:/\d+(?:\.\d+)?)?|status|error|code)[ /:=]*429)\b",
     re.IGNORECASE)
 
 
@@ -78,23 +79,22 @@ def _tail_lines(text, keep):
     return [line.strip() for line in (text or "").splitlines() if line.strip()][-keep:]
 
 
-def _step_cause(stderr, output):
-    """The short cause for a failed step: the last non-empty lines the agent printed.
+def _step_cause(task_error, output):
+    """The short cause for a failed step: the bounded tail of its task error and output.
 
     The full task error stays in ``errorDetail``. Limit-report phrasing in that diagnostic
-    names the cause ``agent_quota``; output is considered only when the error is empty.
+    names the cause ``agent_quota``. Output contributes to the displayed cause only.
     Classification reads the diagnostic before line truncation so a following traceback
     cannot hide a limit report. The displayed cause stays bounded to the stream tails.
     """
-    lines = _tail_lines(stderr, CAUSE_TAIL_LINES) + _tail_lines(output, CAUSE_TAIL_LINES)
+    lines = _tail_lines(task_error, CAUSE_TAIL_LINES) + _tail_lines(output, CAUSE_TAIL_LINES)
     kept = []
     for line in reversed(lines):
         if kept and sum(len(item) + 1 for item in kept) + len(line) > CAUSE_MAX_CHARS:
             break
         kept.append(line[:CAUSE_MAX_CHARS])
     cause = "\n".join(reversed(kept))
-    diagnostic = stderr or "\n".join(_tail_lines(output, CAUSE_TAIL_LINES))
-    if QUOTA_CAUSE_RE.search(diagnostic):
+    if QUOTA_CAUSE_RE.search(task_error):
         return f"agent_quota: {cause}"
     return cause
 
@@ -901,13 +901,13 @@ class WorkflowEngine:
                 self._end_attempt(step, self._now())
                 return True
             failed = failures[0]
-            stderr = failed.get("error") or ""
-            cause = _step_cause(stderr, failed.get("output") or "")
+            task_error = failed.get("error") or ""
+            cause = _step_cause(task_error, failed.get("output") or "")
             step["status"] = "failed"
-            step["error"] = cause or stderr or failed["status"]
+            step["error"] = cause or task_error or failed["status"]
             # The full task error stays available on request (a single-run view), never in
             # the step error a summary or an event carries.
-            step["errorDetail"] = stderr or None
+            step["errorDetail"] = task_error or None
             step["output"] = failed.get("output") or None
             self._settle(step)
             return True
