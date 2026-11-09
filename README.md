@@ -86,7 +86,7 @@ The relay reads, in order: `A2A_AGENTS_FILE` (or `AGENT_RELAY_AGENTS_FILE`) when
 {
   "agents": [
     { "id": "claude", "name": "Claude Code", "command": "claude", "args": ["--print"], "cwd": "/path/to/project" },
-    { "id": "codex", "name": "Codex", "command": "codex", "args": ["exec", "--skip-git-repo-check", "-s", "workspace-write"], "cwd": "/path/to/git/project", "allowedRoots": ["/path/to/git/project", "/path/to/another/project"] },
+    { "id": "codex", "name": "Codex", "command": "codex", "args": ["exec", "--skip-git-repo-check", "-s", "workspace-write"], "cwd": "/path/to/git/project", "allowedRoots": ["/path/to/git/project", "/path/to/another/project"], "options": { "network": { "on": ["-c", "sandbox_workspace_write.network_access=true"] } } },
     { "id": "pi", "name": "Pi", "command": "pi", "args": ["--print"], "cwd": "/path/to/project" },
     { "id": "opencode", "name": "OpenCode", "command": "opencode", "args": ["run"], "cwd": "/path/to/project" },
     { "id": "wrapped", "name": "Any wrapped harness", "type": "stdio", "command": "python3", "args": ["/path/to/adapter.py"], "cwd": "/path/to/project" },

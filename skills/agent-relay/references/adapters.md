@@ -157,11 +157,12 @@ every destination, not just loopback — so declare it off by default and let on
 steps that need the bind choose it (see `config/agents.example.json`):
 
 ```json
-{ "options": { "network": { "off": [], "on": ["-c", "sandbox_workspace_write.network_access=true"] } } }
+{ "options": { "network": { "on": ["-c", "sandbox_workspace_write.network_access=true"] } } }
 ```
 
 A step that runs such a suite delegates with `"options": {"network": "on"}`; any other
-step leaves the option off and keeps the socket block.
+step omits the option and keeps the socket block. The example declares only the enabling
+`on` value; an explicit `"network": "off"` is not a declared choice.
 
 A task can choose among the per-task `options` the agent declares in its registry entry
 (`"options": {"effort": {"high": ["-c", "model_reasoning_effort=high"]}}`, chosen with
