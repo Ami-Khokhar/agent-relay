@@ -401,6 +401,14 @@ class ServiceInspectionTest(_Case):
                                      [sys.executable, str(self.repo / "src" / "server.py")])
                     self.assertEqual(unit.read_bytes(), before)
 
+    def test_systemd_refuses_forbidden_directives_outside_continuations(self):
+        unit = self._write_systemd_unit(self.fixture.home / ".config")
+        unit.write_text(unit.read_text() + "ExecStartPre=/bin/sh -c unsafe\n")
+        before = unit.read_bytes()
+        with self.assertRaisesRegex(update_service.ServiceError, "forbidden directives"):
+            update_service.inspect_service(self.repo)
+        self.assertEqual(unit.read_bytes(), before)
+
     def test_systemd_continued_execstart_is_parsed_and_unfinished_continuation_is_refused(self):
         unit = self._write_systemd_unit(self.fixture.home / ".config")
         body = unit.read_text().replace("ExecStart=%s " % sys.executable,

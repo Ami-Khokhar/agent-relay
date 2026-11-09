@@ -291,15 +291,15 @@ def _systemd(path, resolved_root, label):
                            "inside [Service]; refusing another environment form" % label)
     # This generated receipt field still participates in SYSTEMD_KEYS validation.
     service["environment"] = " ".join(environment)
-    unexpected = {key.lower() for key in service} - {key.lower() for key in SYSTEMD_KEYS}
-    if unexpected:
-        raise ServiceError("the %s service definition carries unsupported directives %s; "
-                           "refusing" % (label, ", ".join(sorted(unexpected))))
     forbidden = {key.lower() for key in service} & {key.lower() for key in SYSTEMD_FORBIDDEN}
     if forbidden:
         raise ServiceError("the %s service definition carries forbidden directives %s "
                            "(arbitrary commands or external configuration); refusing"
                            % (label, ", ".join(sorted(forbidden))))
+    unexpected = {key.lower() for key in service} - {key.lower() for key in SYSTEMD_KEYS}
+    if unexpected:
+        raise ServiceError("the %s service definition carries unsupported directives %s; "
+                           "refusing" % (label, ", ".join(sorted(unexpected))))
     if "execstart" not in service or "workingdirectory" not in service:
         raise ServiceError("the %s service definition names no ExecStart and "
                            "WorkingDirectory; refusing an ambiguous definition" % label)
