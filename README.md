@@ -197,7 +197,7 @@ A task passes `"options": {"effort": "high"}` (the MCP `delegate` tool and `POST
 
 ### Worker roles
 
-A worker is a harness plus the arguments that choose its model and effort. A **role** adds the job that worker is for and carries the instructions for it, so the same harness and model can be registered twice — once as a reviewer, once as an implementer — and the caller sends only the task. Roles are declared at the top level of the registry and each agent names one:
+A worker is a harness plus the arguments that choose its model and effort. A **role** adds the job that worker is for and carries the instructions for it, so the same harness can be registered twice — once as a reviewer, once as an implementer — with arguments choosing each worker’s model and effort, while the caller sends only the task. Roles are declared at the top level of the registry and each agent names one:
 
 ```json
 {

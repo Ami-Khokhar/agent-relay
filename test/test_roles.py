@@ -229,17 +229,37 @@ class RoleRegistryTests(unittest.TestCase):
     def test_readme_worker_roles_load_with_distinct_roles_and_model_arguments(self):
         with open(os.path.join(os.path.dirname(EXAMPLE_REGISTRY), "..", "README.md"),
                   encoding="utf-8") as handle:
-            section = handle.read().split("### Worker roles\n", 1)[1]
-        example = json.loads(section.split("```json\n", 1)[1].split("\n```", 1)[0])
-        agents = self.load(example)
+            text = handle.read()
+        heading = "### Worker roles\n"
+        self.assertIn(heading, text,
+                      "README.md must contain the Worker roles heading; restore it or update this test.")
+        _, _, section = text.partition(heading)
+        section = section.partition("\n##")[0]
+        self.assertIn("```json\n", section,
+                      "README.md Worker roles needs a fenced JSON registry example.")
+        _, _, fenced = section.partition("```json\n")
+        self.assertIn("\n```", fenced, "Close the README.md Worker roles JSON fence.")
+        document, _, _ = fenced.partition("\n```")
+        try:
+            example = json.loads(document)
+        except json.JSONDecodeError as exc:
+            self.fail("Fix the README.md Worker roles JSON example: %s" % exc)
+        try:
+            agents = self.load(example)
+        except ValueError as exc:
+            self.fail("Fix the README.md Worker roles registry so it loads: %s" % exc)
+        roles = [agent.get("role") for agent in agents.values()]
+        self.assertTrue(all(roles), "Every README.md Worker roles agent must name a role.")
+        self.assertEqual(sorted(roles), ["implementer", "reviewer"],
+                         "README.md must show exactly one implementer and one reviewer.")
         by_role = {agent["role"]: agent for agent in agents.values()}
-        self.assertEqual(set(by_role), {"reviewer", "implementer"})
-        args = by_role["implementer"]["args"]
-        self.assertNotEqual(args, by_role["reviewer"]["args"])
-        self.assertIn("--model", args)
+        args = by_role["implementer"].get("args", [])
+        self.assertNotEqual(args, by_role["reviewer"].get("args", []),
+                            "README.md role workers must illustrate distinct model arguments.")
+        self.assertIn("--model", args, "README.md implementer needs an explicit --model argument.")
         model_index = args.index("--model") + 1
-        self.assertLess(model_index, len(args))
-        self.assertTrue(args[model_index].strip())
+        self.assertLess(model_index, len(args), "Give README.md --model a value.")
+        self.assertTrue(args[model_index].strip(), "Give README.md --model a non-empty value.")
 
     def test_the_shipped_example_loads_where_it_is_and_after_a_copy(self):
         """A user or setup.sh copies the example to the per-user config dir, so the copy must load."""
