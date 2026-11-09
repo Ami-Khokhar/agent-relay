@@ -176,9 +176,10 @@ before creating or scheduling anything. If `scripts/update.sh` and a `.git` dire
 exist in that checkout, the installer prints a command with this template:
 `AGENT_RELAY_DIR=<checkout> bash <checkout>/scripts/update.sh --no-restart`.
 Do not paste the template: use the installer's already shell-quoted command, which
-names the absolute target, then rerun the installer. When the updater or Git checkout
-directory is missing, the error names the missing paths and asks you to re-clone or
-restore a complete checkout there. Or pass `--no-update-timer` to install the relay
+names the absolute target, then rerun the installer. When the updater is missing or
+`.git` is not a directory, the error names the missing updater or unsupported Git
+layout and asks you to re-clone or restore a complete checkout there. A `.git` file
+is reported as present but unsupported by this updater, not as a missing path. Or pass `--no-update-timer` to install the relay
 service only. If the target lacks `src/server.py`, point
 `AGENT_RELAY_DIR` at an existing checkout containing it and rerun the installer;
 setup run inside another checkout selects that checkout rather than cloning the target.

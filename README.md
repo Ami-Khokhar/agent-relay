@@ -57,8 +57,10 @@ and a `.git` directory, the error prints a command in this template:
 `AGENT_RELAY_DIR=<checkout> bash <checkout>/scripts/update.sh --no-restart`.
 This is a template, not a command to paste: use the installer's already shell-quoted
 command, which sets the absolute target explicitly, then rerun the installer.
-If the updater or Git checkout directory is missing, the error instead names the
-missing paths and asks you to re-clone or restore a complete checkout at that target.
+If the updater is missing or `.git` is not a directory, the error instead names the
+missing updater or unsupported Git layout and asks you to re-clone or restore a
+complete checkout at that target. A `.git` file is reported as present but unsupported
+by this updater, rather than as a missing path.
 Or pass `--no-update-timer` to install the service only.
 If the target lacks `src/server.py`, set `AGENT_RELAY_DIR` to an existing checkout
 containing that file and rerun the installer; setup run inside a different checkout

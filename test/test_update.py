@@ -761,6 +761,7 @@ exit 0
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("release_discovery.py not found", result.stderr)
             self.assertIn(f"{checkout}/scripts/update.sh not found", result.stderr)
+            self.assertNotIn(f"{checkout}/.git directory not found", result.stderr)
             self.assertIn(f"restore a complete Git checkout at {checkout}", result.stderr)
             self.assertNotIn("AGENT_RELAY_DIR=", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
@@ -784,6 +785,7 @@ exit 0
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("release_discovery.py not found", result.stderr)
             self.assertIn(f"{checkout}/scripts/update.sh not found", result.stderr)
+            self.assertNotIn(f"{checkout}/.git directory not found", result.stderr)
             self.assertIn(f"restore a complete Git checkout at {checkout}", result.stderr)
             self.assertNotIn("AGENT_RELAY_DIR=", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
@@ -809,9 +811,45 @@ exit 0
                 result = self._install(env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"{checkout}/.git directory not found", result.stderr)
+                self.assertNotIn(f"{checkout}/scripts/update.sh not found", result.stderr)
                 self.assertIn(f"restore a complete Git checkout at {checkout}", result.stderr)
                 self.assertIn("--no-update-timer", result.stderr)
                 self.assertNotIn("AGENT_RELAY_DIR=", result.stderr)
+                for path in ("Library/LaunchAgents", ".config/systemd/user",
+                             ".local/state/agent-relay"):
+                    self.assertFalse(os.path.exists(os.path.join(tmp, path)), path)
+                self.assertEqual(self._take_log(tmp), [])
+
+    def test_gitfile_checkout_refusal_names_the_unsupported_layout_without_effects(self):
+        for system in ("Darwin", "Linux"):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as tmp:
+                seed = init_repo(os.path.join(tmp, "seed"))
+                self._fake_checkout(seed, release_check=False)
+                os.makedirs(os.path.join(seed, "scripts"))
+                shutil.copyfile(UPDATE, os.path.join(seed, "scripts", "update.sh"))
+                advance_repo(seed, "partial source with updater")
+                checkout = os.path.join(tmp, "linked checkout")
+                subprocess.run(["git", "-C", seed, "worktree", "add", "-qb", "linked", checkout],
+                               check=True, capture_output=True, text=True)
+                gitfile = os.path.join(checkout, ".git")
+                with open(gitfile, "rb") as handle:
+                    original = handle.read()
+                env = self._env(tmp, checkout, system=system)
+
+                result = self._install(env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{checkout}/.git is a file", result.stderr)
+                self.assertIn("this updater requires a .git directory", result.stderr)
+                self.assertNotIn(f"{checkout}/.git directory not found", result.stderr)
+                self.assertNotIn(f"{checkout}/scripts/update.sh not found", result.stderr)
+                self.assertNotIn("AGENT_RELAY_DIR=", result.stderr)
+                self.assertIn(f"restore a complete Git checkout at {checkout}", result.stderr)
+                self.assertIn("--no-update-timer", result.stderr)
+                with open(gitfile, "rb") as handle:
+                    self.assertEqual(handle.read(), original)
+                status = subprocess.run(["git", "-C", checkout, "status", "--porcelain"],
+                                        check=True, capture_output=True, text=True)
+                self.assertEqual(status.stdout, "")
                 for path in ("Library/LaunchAgents", ".config/systemd/user",
                              ".local/state/agent-relay"):
                     self.assertFalse(os.path.exists(os.path.join(tmp, path)), path)
