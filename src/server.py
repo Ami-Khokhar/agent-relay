@@ -70,13 +70,18 @@ TRUSTED_GIT_PATHS = ("/usr/bin/git", "/bin/git")
 
 
 def _log(message, err=False):
-    """One line for the relay's log (relay.log): a UTC ISO 8601 timestamp, then the message.
+    """One UTC ISO 8601 timestamped line for the relay's stdout/stderr log streams.
 
-    Launches capture stdout and stderr into the same file, so both streams carry the prefix
-    and every line of the log can be placed in time.
+    MCP autostart and launchd capture these streams in relay.log; systemd uses its journal.
+    Both streams carry the prefix so each event can be placed in time.
     """
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(f"{stamp} {message}", file=sys.stderr if err else sys.stdout, flush=True)
+
+
+def _startup_error(message):
+    _log(message, err=True)
+    raise SystemExit(1)
 
 
 def _env(*names, default=None):
@@ -99,9 +104,9 @@ def _positive_int(default, *names):
     try:
         value = int(raw)
     except ValueError:
-        sys.exit(f"{names[0]} must be a positive integer")
+        _startup_error(f"{names[0]} must be a positive integer")
     if value <= 0:
-        sys.exit(f"{names[0]} must be a positive integer")
+        _startup_error(f"{names[0]} must be a positive integer")
     return value
 
 
@@ -112,9 +117,9 @@ def _non_negative_int(default, *names):
     try:
         value = int(raw)
     except ValueError:
-        sys.exit(f"{names[0]} must be a non-negative integer")
+        _startup_error(f"{names[0]} must be a non-negative integer")
     if value < 0:
-        sys.exit(f"{names[0]} must be a non-negative integer")
+        _startup_error(f"{names[0]} must be a non-negative integer")
     return value
 
 
@@ -154,13 +159,13 @@ PRESSURE_INTERVAL_MS = _positive_int(5000, "AGENT_RELAY_PRESSURE_INTERVAL_MS",
 try:
     PRESSURE_HOLD_MS = pressure.guard_hold_ms()
 except ValueError as error:
-    sys.exit(str(error))
+    _startup_error(str(error))
 # The verdict at or above which a new workflow is refused; read once, at startup, so a bad value
 # stops the relay before any run can be submitted instead of being noticed on the first one.
 try:
     pressure.admit_below()
 except ValueError as error:
-    sys.exit(str(error))
+    _startup_error(str(error))
 # Terminal tasks (their input, output, error, and cwd) are dropped this long after they finish;
 # 0 keeps them until they are evicted for space or the relay restarts.
 TASK_RETENTION_MS = _non_negative_int(0, "AGENT_RELAY_TASK_RETENTION_MS",
@@ -220,7 +225,7 @@ def _trusted_git():
     override = _env("AGENT_RELAY_GIT")
     if override is not None:
         if not (os.path.isabs(override) and os.path.isfile(override) and os.access(override, os.X_OK)):
-            sys.exit("AGENT_RELAY_GIT must be an absolute path to an executable file")
+            _startup_error("AGENT_RELAY_GIT must be an absolute path to an executable file")
         return override
     return next((path for path in TRUSTED_GIT_PATHS
                  if os.path.isfile(path) and os.access(path, os.X_OK)), None)

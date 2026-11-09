@@ -121,6 +121,36 @@ class RelayTests(unittest.TestCase):
                                r"Configuration error: Invalid command agent: bad")
         self.assertNotIn("Traceback (most recent call last)", text)
 
+    def test_invalid_startup_settings_write_one_timestamped_error_and_exit(self):
+        cases = [
+            ("AGENT_RELAY_MAX_WAIT_MS", "invalid", "must be a positive integer"),
+            ("AGENT_RELAY_MAX_WAIT_MS", "0", "must be a positive integer"),
+            ("AGENT_RELAY_TASK_RETENTION_MS", "invalid", "must be a non-negative integer"),
+            ("AGENT_RELAY_TASK_RETENTION_MS", "-1", "must be a non-negative integer"),
+            ("AGENT_RELAY_PRESSURE_HOLD_MS", "invalid", "must be a non-negative integer"),
+            ("AGENT_RELAY_ADMIT_BELOW", "invalid", "must be one of ok, warn or critical"),
+            ("AGENT_RELAY_GIT", "relative/git", "must be an absolute path to an executable file"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            # A missing registry prevents any listen even if a setting's refusal regresses.
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("AGENT_RELAY_", "A2A_"))}
+            env["AGENT_RELAY_AGENTS_FILE"] = os.path.join(tmp, "absent-agents.json")
+            env["AGENT_RELAY_STATE_DIR"] = os.path.join(tmp, "state")
+            for name, value, message in cases:
+                with self.subTest(setting=name, value=value):
+                    result = subprocess.run([PYTHON, SERVER], env={**env, name: value},
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    lines = result.stderr.splitlines()
+                    self.assertEqual(len(lines), 1, result.stderr)
+                    self.assertRegex(lines[0],
+                                     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00 ")
+                    self.assertTrue(lines[0].endswith(f"{name} {message}"), result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(os.path.exists(env["AGENT_RELAY_STATE_DIR"]))
+
     def test_returns_413_for_oversized_requests_and_command_arguments(self):
         body_limited = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "print(1)"]},
                              env={"A2A_RELAY_MAX_BODY_BYTES": "64"})

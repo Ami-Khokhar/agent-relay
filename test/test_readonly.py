@@ -1,6 +1,8 @@
 """Read-only delegation: a readOnly profile in the registry, enforced by args and a macOS sandbox."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -1195,10 +1197,12 @@ class TrustedGitTests(unittest.TestCase):
         plain = os.path.join(self.dir, "plain")
         write(plain, "not executable")
         for bad in ("git", "bin/git", os.path.join(self.dir, "missing"), self.dir, plain):
-            with mock.patch.dict(os.environ, {"AGENT_RELAY_GIT": bad}):
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGENT_RELAY_GIT": bad}), contextlib.redirect_stderr(stderr):
                 with self.assertRaises(SystemExit, msg=bad) as caught:
                     server._trusted_git()
-            self.assertIn("AGENT_RELAY_GIT must be an absolute path to an executable file", str(caught.exception))
+            self.assertEqual(caught.exception.code, 1)
+            self.assertIn("AGENT_RELAY_GIT must be an absolute path to an executable file", stderr.getvalue())
 
     def test_the_relay_does_not_start_with_a_bad_override(self):
         relay = None
