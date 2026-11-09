@@ -135,8 +135,9 @@ Per-agent optional fields:
   input so the input cannot be read as an option. See "Read-only tasks" below.
 - `role` — a role id from the registry's top-level `roles` block, for example
   `"role": "reviewer"`. The role's instructions go to every task this agent runs, so the same
-  harness and model can be registered twice under two roles. `list_agents` shows `role` and
-  `roleDescription`, so pick a worker by role. See "Worker roles" below.
+  harness can be registered under two roles, with `args` choosing each worker's model and
+  effort. `list_agents` shows `role` and `roleDescription`, so pick a worker by role. See
+  "Worker roles" below.
 - `capabilities` may only declare what is true; the relay rejects `nativeSessions: true`,
   `streaming: true`, and `newTasks: false` in this version.
 
