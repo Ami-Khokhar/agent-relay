@@ -81,3 +81,7 @@ This supersedes the instruction-bound, commit-validity and sentence-count portio
 ## The local commit reader supports full SHA-256 IDs too
 
 This supersedes the 40-character ceiling in "Fresh instructions keep their original bound and invalid commit metadata stays unknown". The reader accepts the existing 7–40 lowercase-hex form or a full 64-character lowercase-hex SHA-256 ID, displaying the first seven characters in either case. Lengths 41–63 remain refused deliberately: they are neither the existing short/SHA-1 form nor a full SHA-256 ID. Consequence: real SHA-256 loose, packed and detached checkouts retain their notices without widening acceptance to malformed intermediate-length metadata; git is still never executed by the MCP reader.
+
+## needsPolicy changes admission, not the run outcome
+
+A fan-in may tolerate a failed branch without making the run successful. `any` requires a nonempty `needs` list, waits for all needs to become terminal and at least one to complete, and renders status/error markers for non-completed terminal ancestors. Unfinished ancestors remain empty; `all` keeps non-completed terminal ancestors empty too. Failed or skipped branches still fail the run, while cancellation still cancels it. Step views retain the submitted policy (`null` when omitted), and journals predating `needsPolicy` resume with `all` behavior. Consequence: clients must distinguish the fan-in step's success from the whole run's outcome and must not infer live scheduler state from an unfinished ancestor's template output.

@@ -162,7 +162,7 @@ Step fields:
 | `agentId` | yes | Must match a registry id. |
 | `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. |
 | `needs` | no | Step ids that must complete first. Acyclic; forward references allowed. |
-| `needsPolicy` | no | `"all"` (default) or `"any"`. With `all`, the step runs only when every need completed. With `any`, the step starts once every need is terminal and at least one completed — a fan-in that tolerates a failed branch; in the step's rendered input, `{{id.output}}` of a need that failed or timed out becomes a marker like `[id did not complete: status=failed error=…]` naming its status and error. With `any` and no completed need the step is still skipped with `dependency_not_completed`. |
+| `needsPolicy` | no | `"all"` (default) or `"any"`. `any` requires at least one `needs` entry, otherwise `400 invalid_needs_policy`. With `all`, every need must complete. With `any`, every need must be terminal and at least one completed; without a completed need the step is skipped with `dependency_not_completed`. In an `any` prompt, `{{id.output}}` of a failed (including timed-out), skipped or cancelled ancestor becomes a marker like `[id did not complete: status=failed error=…]`. Unfinished ancestors stay empty under either policy; `all` also keeps non-completed terminal ancestors empty. A tolerated failed/skipped branch still makes the run `failed`; run cancellation remains `cancelled`. |
 | `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
 | `retries` | no | `0` to `5`; extra attempts after a task fails or times out. |
 | `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
@@ -197,7 +197,7 @@ the step starts, exactly as a registry change would be for a queued task.
 ### `GET /v1/workflows/:id`
 
 Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
-`finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `status`,
+`finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `needsPolicy`, `status`,
 `attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, `error`, and
 (for a failed step) `errorDetail`.
 Every step carries `startedAt` and `finishedAt`, null until the step starts and finishes;
@@ -439,6 +439,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `spec` | single run only | The document as submitted, without the internal dependency closure. |
 | `error` | failed/cancelled | Names the first step that did not succeed; when that step failed, its short cause is appended after `: `. |
 | `steps[].id` / `agentId` / `needs` | always | As submitted. |
+| `steps[].needsPolicy` | always | `"any"` or `"all"` as submitted; `null` when omitted (which behaves as `all`). |
 | `steps[].status` | always | Step status values. |
 | `steps[].attempts` | always | How many times the step has run, restored from the journal on resume. |
 | `steps[].startedAt` / `steps[].finishedAt` | always | ISO-8601, null until the step starts and finishes; a step that never ran keeps both null. Restored from the journal on resume. |

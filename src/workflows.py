@@ -2,17 +2,20 @@
 """Declarative workflow engine for agent-relay.
 
 A workflow document names steps; each step runs as an ordinary relay task on one
-registered agent. Steps are wired together with ``needs``, so the engine submits a step
-only once every step it depends on has completed, and records each step's output for the
-steps that follow::
+registered agent. Steps are wired together with ``needs``. By default a step starts
+only after every need completed; ``needsPolicy: "any"`` instead waits for every need
+to be terminal and at least one to complete. The engine records each step's output for
+the steps that follow::
 
     {"name": "ship-fix", "steps": [
         {"id": "write",  "agentId": "claude", "input": "Fix the failing test"},
         {"id": "review", "agentId": "codex",  "needs": ["write"], "input": "{{write.output}}"}
     ]}
 
-Input strings are templates. ``{{stepId.output}}`` resolves against a completed
-dependency, ``{{item}}`` and ``{{index}}`` against a ``foreach`` expansion. Steps may fan
+Input strings are templates. ``{{stepId.output}}`` reads an ancestor's completed
+output. Unfinished ancestors stay empty; an ``any`` step substitutes status/error
+markers for failed, skipped or cancelled ancestors, while an ``all`` step keeps those
+empty too. ``{{item}}`` and ``{{index}}`` resolve against a ``foreach`` expansion. Steps may fan
 out with ``foreach``, re-run on a task failure with ``retries``, loop until their
 output matches a regular expression with ``repeat``, and fail when a task's own output
 matches a regular expression with ``failIfOutputMatches`` — each item of a ``foreach``

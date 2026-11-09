@@ -197,10 +197,12 @@ WORKFLOW_SPEC = {
                                                    "step starts: `all` (the default) waits for "
                                                    "every need and skips the step if one fails; "
                                                    "`any` starts once every need is terminal and "
-                                                   "at least one completed, with "
-                                                   "{{id.output}} of a need that failed or timed "
-                                                   "out replaced by a marker naming its status "
-                                                   "and error."},
+                                                   "at least one completed. It requires at least one needs entry "
+                                                   "(otherwise 400 invalid_needs_policy). Non-completed terminal "
+                                                   "ancestors (failed, including timeouts, skipped or cancelled) "
+                                                   "render as status/error markers; unfinished ancestors stay empty. "
+                                                   "The policy does not change the run outcome: a failed/skipped "
+                                                   "branch still fails the run, and run cancellation stays cancelled."},
                     "foreach": {"type": "array", "minItems": 1,
                                 "items": {"type": "string", "minLength": 1, "maxLength": 1024},
                                 "description": "Run this step once per item, in parallel, with "
@@ -370,7 +372,7 @@ TOOLS = [
     },
     {
         "name": "run_workflow",
-        "description": "Submit a whole multi-agent workflow in one call: named steps, each bound to a registered agent, wired together with needs. Pass the workflow document inline as `spec`, or as `specPath`: the absolute path of a JSON file on the machine running this server, which the server reads and submits unchanged, exactly as if the document had been passed as `spec`. Pass exactly one of the two. Use this instead of calling delegate repeatedly when you already know the shape of the work: a pipeline (A writes, B reviews, C fixes), a fan-out over several items, or a review loop. The relay starts a step only once every step it needs has completed, threads each output into the next prompt, and owns the queue, timeouts, cancellation, and retries. A step whose dependency did not succeed is skipped and the run fails, unless it sets needsPolicy to 'any': then the step still runs once every need is terminal and at least one completed, reading the finished outputs and a marker in place of each failed need's output, so a compare-and-pick fan-in survives one timed-out branch. The relay refuses the run with device_pressure while the host verdict is at or above `admitBelow` (`AGENT_RELAY_ADMIT_BELOW`, default critical), so call get_pressure first when the run will be long. Returns the run with every step's status; pass waitMs to block until it finishes. Get valid agentId values from list_agents first. The spec schema in tools/list describes every step field.",
+        "description": "Submit a whole multi-agent workflow in one call: named steps, each bound to a registered agent, wired together with needs. Pass the workflow document inline as `spec`, or as `specPath`: the absolute path of a JSON file on the machine running this server, which the server reads and submits unchanged, exactly as if the document had been passed as `spec`. Pass exactly one of the two. Use this instead of calling delegate repeatedly when you already know the shape of the work: a pipeline (A writes, B reviews, C fixes), a fan-out over several items, or a review loop. By default, the relay starts a step only once every step it needs has completed, threads each output into the next prompt, and owns the queue, timeouts, cancellation, and retries. A step whose dependency did not succeed is skipped unless it sets needsPolicy to 'any', which requires at least one needs entry (otherwise 400 invalid_needs_policy). Then the step runs once every need is terminal and at least one completed, reading completed outputs and status/error markers for failed (including timed-out), skipped or cancelled ancestors; unfinished ancestors stay empty. The run still fails if a branch failed or was skipped, and cancelling the run still ends it as cancelled. The relay refuses the run with device_pressure while the host verdict is at or above `admitBelow` (`AGENT_RELAY_ADMIT_BELOW`, default critical), so call get_pressure first when the run will be long. Returns the run with every step's status; pass waitMs to block until it finishes. Get valid agentId values from list_agents first. The spec schema in tools/list describes every step field.",
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "anyOf": [{"required": ["spec"]}, {"required": ["specPath"]}],

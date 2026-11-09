@@ -648,6 +648,48 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["fast-build"]["needsPolicy"], None)
         self.assertEqual(finished["review"]["needsPolicy"], "any")
 
+    def test_any_fan_in_and_all_child_render_unfinished_and_failed_ancestors_distinctly(self):
+        release = self.path("release-running-ancestor")
+        hold = ("import os, pathlib, time\n"
+                "while not pathlib.Path(os.environ['WF_RELEASE']).exists(): time.sleep(0.01)\n"
+                "print('late output')\n")
+        relay = self.start([echo(), {"id": "hold", "command": PYTHON,
+                                    "args": ["-c", hold], "env": {"WF_RELEASE": release}}])
+        status, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "slow", "agentId": "hold", "input": "wait for release"},
+            {"id": "bad", "agentId": "echo", "input": "BLOCKED", "failIfOutputMatches": "^BLOCKED"},
+            {"id": "skip", "agentId": "echo", "needs": ["bad", "slow"], "input": "never run"},
+            {"id": "good", "agentId": "echo", "input": "ok"},
+            {"id": "pick", "agentId": "echo", "needs": ["skip", "good"], "needsPolicy": "any",
+             "input": "slow=<{{slow.output}}> bad=<{{bad.output}}> skip=<{{skip.output}}>"},
+            {"id": "final", "agentId": "echo", "needs": ["pick"], "needsPolicy": "all",
+             "input": "bad=<{{bad.output}}> skip=<{{skip.output}}> parent=<{{pick.output}}>"},
+        ]})
+        self.assertEqual(status, 202, submitted)
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                status, view = relay.request("GET", f"/v1/workflows/{submitted['id']}")
+                self.assertEqual(status, 200)
+                steps = steps_of(view)
+                if steps["final"]["status"] == "completed" or view["status"] in TERMINAL:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(steps["final"]["status"], "completed", view)
+            self.assertEqual(steps["slow"]["status"], "running")
+            expected = ("slow=<> bad=<[bad did not complete: status=failed "
+                        "error=output_matched_fail_pattern]> skip=<[skip did not complete: "
+                        "status=skipped error=dependency_not_completed]>")
+            self.assertEqual(steps["pick"]["output"], expected)
+            self.assertEqual(steps["final"]["output"], f"bad=<> skip=<> parent=<{expected}>")
+            self.assertEqual(steps["slow"]["needsPolicy"], None)
+            self.assertEqual(steps["pick"]["needsPolicy"], "any")
+            self.assertEqual(steps["final"]["needsPolicy"], "all")
+        finally:
+            with open(release, "w", encoding="utf-8") as handle:
+                handle.write("finish")
+        self.assertEqual(wait(relay, submitted["id"])["status"], "failed")
+
     def test_a_needs_policy_any_step_is_skipped_when_no_need_completed(self):
         relay = self.start({"id": "failer", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]})
         workflow = run(relay, {"steps": [
@@ -739,7 +781,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["first"]["attemptTimes"], kept["attemptTimes"])
         self.assertEqual(finished["second"]["output"], "recovered")
 
-    def test_resume_reads_a_journal_written_before_fail_if_output_matches_existed(self):
+    def test_resume_reads_a_journal_without_fail_patterns_or_needs_policy(self):
         mark = self.path("legacy-journal-mark")
         agents = [
             echo(),
@@ -755,13 +797,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(wait(relay, workflow_id)["status"], "failed")
         self.stop(relay)
 
-        # Rewrite the journal the way a pre-failIfOutputMatches version wrote it.
+        # Rewrite the journal as a version predating both optional fields wrote it.
         journal = os.path.join(self.state, "workflows", f"{workflow_id}.jsonl")
         with open(journal, encoding="utf-8") as handle:
             records = [json.loads(line) for line in handle if line.strip()]
         for record in records:
             for step in record.get("spec", {}).get("steps", []):
                 step.pop("failIfOutputMatches", None)
+                step.pop("needsPolicy", None)
         with open(journal, "w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record) + "\n")
