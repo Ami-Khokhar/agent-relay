@@ -22,7 +22,7 @@ import workflows
 
 
 class FakeUpstream:
-    """A fake relay that records calls and replies via a responder callback."""
+    """Record HTTP calls and return callback replies; None closes without a response."""
 
     def __init__(self, responder):
         self.calls = []
@@ -32,7 +32,11 @@ class FakeUpstream:
             length = int(request.headers.get("content-length", 0))
             body = json.loads(request.rfile.read(length).decode("utf-8")) if length else None
             self.calls.append((request.command, request.path, body))
-            status, payload = self.responder(request.command, request.path, body)
+            response = self.responder(request.command, request.path, body)
+            if response is None:
+                request.close_connection = True
+                return
+            status, payload = response
             send_json(request, status, payload)
 
         self.server, self.port = start_http_server(handler)
@@ -599,6 +603,75 @@ class McpHandlerTests(unittest.TestCase):
             for text in ("task-7", "wait_task", "taskId", "Do not submit"):
                 self.assertIn(text, task["waitError"]["message"])
             self.assertEqual([call[0] for call in upstream.calls], ["POST", "GET"])  # no resubmission
+        finally:
+            upstream.close()
+
+    def _assert_failed_wait_keeps_created_task(self, result, created, error):
+        self.assertNotIn("isError", result)
+        task = result["structuredContent"]
+        self.assertEqual({key: task[key] for key in created}, created)
+        self.assertIs(task["waitFailed"], True)
+        self.assertEqual(task["waitError"]["error"], error)
+        self.assertNotIn("waitMs", task)
+        self.assertNotIn("waitClamped", task)
+        for text in (created["id"], "wait_task", "taskId", "Do not submit"):
+            self.assertIn(text, task["waitError"]["message"])
+
+    def test_delegate_preserves_the_created_task_when_a_clamped_poll_fails_after_creation(self):
+        for failure, expected_error in (((502, {"error": "clamped_gateway_failure"}),
+                                         "clamped_gateway_failure"),
+                                        (None, "relay_request_failed")):
+            with self.subTest(error=expected_error):
+                created = {"id": "task-clamped", "sessionId": "s-clamp",
+                           "agentId": "fake", "status": "queued"}
+
+                def responder(method, path, body):
+                    if method == "POST":
+                        return 202, created
+                    if path == "/v1/tasks/task-clamped?waitMs=900000":
+                        return 400, {"error": "invalid_wait"}
+                    if path == "/healthz":
+                        return 200, {"ok": True, "limits": {"maxWaitMs": 600000}}
+                    if path == "/v1/tasks/task-clamped?waitMs=600000":
+                        return failure
+                    raise AssertionError(f"unexpected request: {method} {path}")
+
+                upstream = FakeUpstream(responder)
+                try:
+                    with unittest.mock.patch.dict(os.environ, {
+                            "A2A_RELAY_AUTOSTART": "0", "AGENT_RELAY_AUTOSTART": "0"}):
+                        handle = mcp_server.create_http_handler(upstream.url, timeout=1)
+                        result = handle({"method": "tools/call", "params": {
+                            "name": "delegate", "arguments": {
+                                "agentId": "fake", "input": "work", "waitMs": 900000}}})
+                    self._assert_failed_wait_keeps_created_task(result, created, expected_error)
+                    self.assertEqual([(call[0], call[1]) for call in upstream.calls], [
+                        ("POST", "/v1/tasks"),
+                        ("GET", "/v1/tasks/task-clamped?waitMs=900000"),
+                        ("GET", "/healthz"),
+                        ("GET", "/v1/tasks/task-clamped?waitMs=600000"),
+                    ])
+                finally:
+                    upstream.close()
+
+    def test_delegate_preserves_the_created_task_when_the_connection_drops_after_creation(self):
+        created = {"id": "task-dropped", "sessionId": "s-drop",
+                   "agentId": "fake", "status": "queued"}
+
+        def responder(method, path, body):
+            return (202, created) if method == "POST" else None
+
+        upstream = FakeUpstream(responder)
+        try:
+            with unittest.mock.patch.dict(os.environ, {
+                    "A2A_RELAY_AUTOSTART": "0", "AGENT_RELAY_AUTOSTART": "0"}):
+                handle = mcp_server.create_http_handler(upstream.url, timeout=1)
+                result = handle({"method": "tools/call", "params": {
+                    "name": "delegate", "arguments": {
+                        "agentId": "fake", "input": "work", "waitMs": 3000}}})
+            self._assert_failed_wait_keeps_created_task(result, created, "relay_request_failed")
+            self.assertEqual([(call[0], call[1]) for call in upstream.calls], [
+                ("POST", "/v1/tasks"), ("GET", "/v1/tasks/task-dropped?waitMs=3000")])
         finally:
             upstream.close()
 
