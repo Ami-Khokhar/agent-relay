@@ -1097,7 +1097,8 @@ class McpNoticeIsolationTests(unittest.TestCase):
                     self.assertEqual(cached["notifiedVersion"], offer_version)
                     self.assertEqual(notice_cache_bytes(parent_home), sentinel)
 
-def _make_checkout(tmp, *, worktree=False):
+
+def _make_checkout(tmp, *, worktree=False, object_format="sha1"):
     repo = os.path.join(tmp, "checkout")
     copied = os.path.join(repo, "src")
     os.makedirs(copied)
@@ -1116,7 +1117,7 @@ def _make_checkout(tmp, *, worktree=False):
                               env=git_env, check=True, capture_output=True,
                               text=True).stdout.strip()
 
-    git("init", "-q", "-b", "main")
+    git("init", "-q", "-b", "main", "--object-format=" + object_format)
     git("add", ".")
     git("commit", "-qm", "first")
     if worktree:
@@ -1376,6 +1377,31 @@ class McpServeTests(unittest.TestCase):
             finally:
                 client.close()
 
+    def test_initialize_reports_real_sha256_commits_in_loose_packed_and_detached_layouts(self):
+        params = {"protocolVersion": "2025-06-18", "capabilities": {},
+                  "clientInfo": {"name": "sha256-test", "version": "1"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, git, _head = _make_checkout(tmp, object_format="sha256")
+            with open(os.path.join(repo, ".git", "refs", "heads", "main")) as handle:
+                commit = handle.read().strip()
+            self.assertEqual(len(commit), 64)
+            for layout in ("loose", "packed", "detached"):
+                with self.subTest(layout=layout):
+                    if layout == "packed":
+                        git("pack-refs", "--all", "--prune")
+                    elif layout == "detached":
+                        git("checkout", "--detach", commit)
+                    client = McpClient("http://127.0.0.1:1", env={"A2A_RELAY_AUTOSTART": "0"},
+                                       server=os.path.join(repo, "src", "mcp_server.py"))
+                    try:
+                        client.call("initialize", params)
+                        _make_stale(repo)
+                        notice = client.call("initialize", params)["result"]["instructions"]
+                        self.assertIn("checkout now " + commit[:7], notice)
+                        self.assertIn("this server loaded " + commit[:7], notice)
+                    finally:
+                        client.close()
+
     def test_initialize_names_unknown_for_short_or_malformed_commit_metadata(self):
         params = {"protocolVersion": "2025-06-18", "capabilities": {},
                   "clientInfo": {"name": "invalid-commit-test", "version": "1"}}
@@ -1386,7 +1412,7 @@ class McpServeTests(unittest.TestCase):
             packed = os.path.join(git_dir, "packed-refs")
             for layout in ("detached", "loose", "packed"):
                 for value, expected in (("", "unknown"), ("abc", "unknown"),
-                                        ("not-a-commit", "unknown"), ("a" * 41, "unknown"),
+                                        ("not-a-commit", "unknown"), ("a" * 41, "unknown"), ("a" * 63, "unknown"),
                                         ("ref:refs/heads/main", "unknown"),
                                         ("abcdef0", "abcdef0"), ("a" * 40, "a" * 7)):
                     with self.subTest(layout=layout, value=value):

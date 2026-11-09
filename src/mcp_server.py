@@ -95,7 +95,7 @@ def _checkout_commit():
                         if not line.startswith("#") and line.rstrip().endswith(" " + ref):
                             commit = line.split()[0]
                             break
-        return commit[:7] if commit and re.fullmatch(r"[0-9a-f]{7,40}", commit) else "unknown"
+        return commit[:7] if commit and re.fullmatch(r"(?:[0-9a-f]{7,40}|[0-9a-f]{64})", commit) else "unknown"
     except (OSError, ValueError, IndexError):
         return "unknown"
 
