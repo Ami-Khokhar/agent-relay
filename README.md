@@ -99,7 +99,7 @@ Per-agent fields:
 | `delegateTo` | Agent IDs this agent's tasks may delegate to; `[]` forbids delegation. See [Recursive delegation](#recursive-delegation). |
 | `options` | Named per-task options, each value mapped to fixed args. `command` and `stdio` agents only. See [Per-task options](#per-task-options). |
 | `readOnly` | What a read-only task means for this agent: extra `args` and, on macOS, an optional `sandbox`. `command` and `stdio` agents only. See [Read-only tasks](#read-only-tasks). |
-| `role` | A role id from the registry's top-level `roles` block. Its instructions go to every task this agent runs, so the same harness and model can be registered once as a reviewer and once as an implementer. See [Worker roles](#worker-roles). |
+| `role` | A role id from the registry's top-level `roles` block. Its instructions go to every task this agent runs, so the same harness can be registered under multiple roles while `args` choose each worker's model and effort. See [Worker roles](#worker-roles). |
 
 Codex notes: `codex exec` refuses to run outside a git repository unless `--skip-git-repo-check` is given, and it uses a read-only sandbox unless `-s workspace-write` is added. Both flags are in the example above (checked against codex-cli 0.155.1). Other example flags are entry points; verify them against your installed CLI versions.
 
@@ -197,7 +197,7 @@ A task passes `"options": {"effort": "high"}` (the MCP `delegate` tool and `POST
 
 ### Worker roles
 
-A worker is a harness plus the arguments that choose its model and effort. A **role** adds the job that worker is for and carries the instructions for it, so the same harness can be registered twice — once as a reviewer, once as an implementer — with arguments choosing each worker’s model and effort, while the caller sends only the task. Roles are declared at the top level of the registry and each agent names one:
+A worker is a harness plus the arguments that choose its model and effort. A **role** adds the job that worker is for and carries the instructions for it, so the same harness can be registered twice — once as a reviewer, once as an implementer — with arguments choosing each worker's model and effort, while the caller sends only the task. Roles are declared at the top level of the registry and each agent names one:
 
 ```json
 {
