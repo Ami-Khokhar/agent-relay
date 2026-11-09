@@ -401,6 +401,7 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 self.assertEqual(cache["notifiedVersion"], "0.5.0")
 
     def test_version_length_bound_applies_to_discovery_and_cached_notices(self):
+        notes = "\U0001F680" * discovery.MAX_NOTES
         prefix = "1.0.0-"
         for length in (discovery.MAX_VERSION, discovery.MAX_VERSION + 1):
             tag = prefix + "a" * (length - len(prefix))
@@ -417,13 +418,15 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                     path = directory / "release-notices.json"
                     path.write_text(json.dumps({"offer": {
                         "version": tag, "url": discovery.RELEASE_URL + tag,
-                        "notes": "notes", "checkedAt": time.time()}, "notifiedVersion": None}),
+                        "notes": notes, "checkedAt": time.time()}, "notifiedVersion": None}),
                         encoding="utf-8")
                     path.chmod(0o600)
                     before = path.read_bytes()
                     notice = discovery.cached_notice("0.0.0")
                     if length == discovery.MAX_VERSION:
                         self.assertEqual(notice, {"version": tag, "url": discovery.RELEASE_URL + tag})
+                        self.assertLessEqual(path.stat().st_size, discovery.MAX_CACHE)
+                        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["offer"]["notes"], notes)
                         self.assertIsNone(discovery.cached_notice("0.0.0"))
                     else:
                         self.assertIsNone(notice)
