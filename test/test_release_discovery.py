@@ -400,6 +400,35 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 self.assertIsNone(cache["offer"])
                 self.assertEqual(cache["notifiedVersion"], "0.5.0")
 
+    def test_version_length_bound_applies_to_discovery_and_cached_notices(self):
+        prefix = "1.0.0-"
+        for length in (discovery.MAX_VERSION, discovery.MAX_VERSION + 1):
+            tag = prefix + "a" * (length - len(prefix))
+            with self.subTest(length=length):
+                offer = discovery.discover("0.0.0", include_prereleases=True,
+                                           releases=[release(tag, prerelease=True)])
+                if length == discovery.MAX_VERSION:
+                    self.assertEqual(offer["version"], tag)
+                else:
+                    self.assertIsNone(offer)
+                with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+                    directory = Path(temp) / "agent-relay"
+                    directory.mkdir(mode=0o700)
+                    path = directory / "release-notices.json"
+                    path.write_text(json.dumps({"offer": {
+                        "version": tag, "url": discovery.RELEASE_URL + tag,
+                        "notes": "notes", "checkedAt": time.time()}, "notifiedVersion": None}),
+                        encoding="utf-8")
+                    path.chmod(0o600)
+                    before = path.read_bytes()
+                    notice = discovery.cached_notice("0.0.0")
+                    if length == discovery.MAX_VERSION:
+                        self.assertEqual(notice, {"version": tag, "url": discovery.RELEASE_URL + tag})
+                        self.assertIsNone(discovery.cached_notice("0.0.0"))
+                    else:
+                        self.assertIsNone(notice)
+                        self.assertEqual(path.read_bytes(), before)
+
     def test_maximum_astral_notes_survive_cache_round_trip_and_deliver_once(self):
         notes = "\U0001F680" * discovery.MAX_NOTES
         offer = discovery.discover("0.3.0", releases=[release("0.4.0", notes=notes)])
