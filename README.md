@@ -210,7 +210,7 @@ A worker is a harness plus the arguments that choose its model and effort. A **r
   },
   "agents": [
     { "id": "pi-reviewer", "command": "pi", "args": ["--print"], "cwd": "/path/to/project", "role": "reviewer" },
-    { "id": "pi-implementer", "command": "pi", "args": ["--print"], "cwd": "/path/to/project", "role": "implementer" }
+    { "id": "pi-implementer", "command": "pi", "args": ["--print", "--model", "glm-5.3-flash"], "cwd": "/path/to/project", "role": "implementer" }
   ]
 }
 ```
