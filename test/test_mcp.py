@@ -1026,6 +1026,12 @@ class McpHandlerTests(unittest.TestCase):
                     "failIfOutputMatches"):
             self.assertTrue(step["properties"][key].get("description"), f"{key} has no description")
         self.assertEqual(step["properties"]["failIfOutputMatches"]["type"], "string")
+        policy_help = step["properties"]["needsPolicy"]["description"]
+        self.assertIn("at least one needs entry", policy_help)
+        self.assertIn("invalid_needs_policy", policy_help)
+        self.assertIn("skipped", policy_help)
+        self.assertIn("cancelled", policy_help)
+        self.assertIn("run still fails", tools["run_workflow"]["description"])
         self.assertIn("list_agents", step["properties"]["agentId"]["description"])
         self.assertIn("{{id.output}}", step["properties"]["id"]["description"])
 
