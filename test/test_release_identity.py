@@ -140,6 +140,7 @@ class ReleaseIdentityTest(unittest.TestCase):
                 self.resolve(bad, fetch_json=fake)
             self.assertEqual(fake.calls, [], "an invalid tag must cause no requests")
 
+    def test_overlong_stable_tag_refuses_before_any_request(self):
         # Build metadata keeps this semantic version stable, so only the length guard refuses it.
         prefix = "1.0.0+"
         overlong = prefix + "a" * (discovery.MAX_VERSION + 1 - len(prefix))
@@ -147,6 +148,15 @@ class ReleaseIdentityTest(unittest.TestCase):
         with self.assertRaisesRegex(identity.UpdateError, "release tag is too long"):
             self.resolve(overlong, fetch_json=fake)
         self.assertEqual(fake.calls, [], "an overlong stable tag must cause no requests")
+
+    def test_maximum_length_stable_tag_resolves_through_release_metadata(self):
+        prefix = "1.0.0+"
+        tag = prefix + "a" * (discovery.MAX_VERSION - len(prefix))
+        fake = fake_api(tag=tag, asset=asset_bytes(tag=tag))
+        resolved, _, _ = self.resolve(tag, fetch_json=fake)
+        self.assertEqual(resolved["tag"], tag)
+        self.assertEqual(resolved["commit"], COMMIT)
+        self.assertEqual(len(fake.calls), 3)
 
     def test_noncanonical_release_metadata_is_rejected(self):
         bad = release()
