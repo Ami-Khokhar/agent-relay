@@ -81,8 +81,8 @@ if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
 fi
 if [ ! -f "$TARGET_DIR/src/server.py" ]; then
   echo "error: $TARGET_DIR does not look like an agent-relay checkout" >&2
-  echo "       set AGENT_RELAY_DIR or run bash skills/agent-relay/scripts/setup.sh" >&2
-  echo "       (from the agent-relay repository root)" >&2
+  echo "       set AGENT_RELAY_DIR to an existing checkout containing src/server.py" >&2
+  echo "       then rerun this installer" >&2
   exit 1
 fi
 # The scheduled release check runs the checkout's checker; validate it before
@@ -91,8 +91,10 @@ fi
 if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -f "$TARGET_DIR/src/release_discovery.py" ]; then
   echo "error: $TARGET_DIR/src/release_discovery.py not found; the scheduled" >&2
   echo "       release check runs it" >&2
-  echo "       run bash scripts/update.sh from the checkout to refresh it," >&2
-  echo "       or pass --no-update-timer to install the service only" >&2
+  echo "       refresh this checkout without restarting its service:" >&2
+  printf '       AGENT_RELAY_DIR=%q bash %q --no-restart\n' \
+    "$TARGET_DIR" "$TARGET_DIR/scripts/update.sh" >&2
+  echo "       then rerun this installer, or pass --no-update-timer for the service only" >&2
   exit 1
 fi
 
