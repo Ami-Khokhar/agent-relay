@@ -17,10 +17,10 @@ reader, or one that does not answer, ``temperatureC`` is null with the reason at
 rather than guessed. A missing thermal reading from ``pmset`` means the OS has recorded no
 throttle, which is the ordinary state on a cool machine.
 
-Which verdicts refuse a new run is the owner's line, not a constant: ``AGENT_RELAY_ADMIT_BELOW``
-names the level at or above which a submission is refused (default ``critical``, today's rule),
-and the reading reports that line beside the verdict so the refusal and ``GET /v1/pressure``
-cannot disagree.
+Which verdicts refuse a new run is the owner's line, not a constant.
+``AGENT_RELAY_ADMIT_BELOW`` or its ``A2A_RELAY_ADMIT_BELOW`` alias names the level at or above
+which a submission is refused (default ``critical``). The reading reports that line beside
+the verdict so the refusal and ``GET /v1/pressure`` cannot disagree.
 
 The probes are macOS-only. On another host every signal is null, the verdict is ``ok``, and the
 guard never stops a run: the reading is absent rather than guessed, and a caller that needs a
@@ -341,10 +341,10 @@ def snapshot():
 def should_refuse(reading):
     """The refusal body for a run that must not start, or None.
 
-    The run is refused while the verdict is at or above ``admitBelow``, the owner's line in
-    ``AGENT_RELAY_ADMIT_BELOW``. The message names the reading that decided the verdict; a calm
-    host refused only by an ``ok`` line has no reading to name, so that message names the
-    setting instead of telling the owner to free memory on a machine that is not under pressure.
+    The run is refused while the verdict is at or above ``admitBelow``, the owner's line from
+    ``AGENT_RELAY_ADMIT_BELOW`` or its ``A2A_RELAY_ADMIT_BELOW`` alias. The message names the
+    reading that decided the verdict; a calm host refused by an ``ok`` line has no reading to
+    name, so the message identifies the admission setting and its two spellings.
     """
     verdict, admit = reading["verdict"], reading["admitBelow"]
     if VERDICT_ORDER[verdict] < VERDICT_ORDER[admit]:
@@ -354,7 +354,8 @@ def should_refuse(reading):
                    + "; ".join(reading["reasons"]) + ". Address the readings above and retry; "
                    "GET /v1/pressure shows the current reading.")
     else:
-        message = (f"The owner set AGENT_RELAY_ADMIT_BELOW={admit}, so no workflow starts "
+        message = ("The admission line (AGENT_RELAY_ADMIT_BELOW or A2A_RELAY_ADMIT_BELOW) "
+                   f"is {admit}, so no workflow starts "
                    f"while the verdict is {verdict}; raise it to warn or critical to admit "
                    "work. GET /v1/pressure shows the current reading.")
     return {

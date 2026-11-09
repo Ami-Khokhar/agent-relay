@@ -322,19 +322,24 @@ class PressureTests(unittest.TestCase):
             client.close()
 
     def test_an_ok_admission_line_refuses_a_calm_host_and_names_the_setting(self):
-        # A calm host has no reading to name, so the refusal names the setting that refused it
-        # instead of telling the owner to free memory on a machine that is not under pressure.
-        relay = self.start(echo(), env={"AGENT_RELAY_ADMIT_BELOW": "ok"})
-        status, body = relay.request("POST", "/v1/workflows", {
-            "steps": [{"id": "only", "agentId": "echo", "input": "never runs"}]})
-        self.assertEqual(status, 503)
-        self.assertEqual(body["error"], "device_pressure")
-        self.assertEqual(body["pressure"]["verdict"], "ok")
-        self.assertEqual(body["pressure"]["reasons"], [])
-        self.assertIn("The owner set AGENT_RELAY_ADMIT_BELOW=ok", body["message"])
-        self.assertIn("the verdict is ok", body["message"])
-        self.assertIn("raise it to warn or critical to admit work", body["message"])
-        self.assertNotIn("Free some memory", body["message"])
+        # A calm host has no reading to name, so the refusal identifies the admission setting.
+        for name in ("AGENT_RELAY_ADMIT_BELOW", "A2A_RELAY_ADMIT_BELOW"):
+            with self.subTest(setting=name):
+                env = {"AGENT_RELAY_ADMIT_BELOW": None, "A2A_RELAY_ADMIT_BELOW": None,
+                       "AGENT_RELAY_TEMP_READER": None, "AGENT_RELAY_TEMP_WARN_C": None,
+                       name: "ok"}
+                relay = self.start(echo(), env=env)
+                status, body = relay.request("POST", "/v1/workflows", {
+                    "steps": [{"id": "only", "agentId": "echo", "input": "never runs"}]})
+                self.assertEqual(status, 503)
+                self.assertEqual(body["error"], "device_pressure")
+                self.assertEqual(body["pressure"]["verdict"], "ok")
+                self.assertEqual(body["pressure"]["reasons"], [])
+                self.assertIn("The admission line (AGENT_RELAY_ADMIT_BELOW or A2A_RELAY_ADMIT_BELOW) is ok",
+                              body["message"])
+                self.assertIn("the verdict is ok", body["message"])
+                self.assertIn("raise it to warn or critical to admit work", body["message"])
+                self.assertNotIn("Free some memory", body["message"])
 
     def test_an_admit_line_that_is_not_ok_warn_or_critical_stops_the_relay(self):
         with self.assertRaises(RuntimeError) as caught:
