@@ -172,7 +172,7 @@ bounded offer in the private local cache; an MCP session may show its version an
 canonical release link once, at a convenient checkpoint. `check_updates` fetches bounded
 release notes only when explicitly called. These checks do not install releases or restart
 the service. When the checkout lacks `src/release_discovery.py`, the installer rejects it
-before creating or scheduling anything: rerun `bash skills/agent-relay/scripts/setup.sh` to
+before creating or scheduling anything: run `bash scripts/update.sh` from the checkout to
 refresh it, or pass `--no-update-timer` to install the relay service only. Older installed
 timers still run the legacy updater until you rerun `install-service.sh` to replace their
 definitions. Pass `--no-update-timer` to remove the timer (`--with-update-timer` remains
