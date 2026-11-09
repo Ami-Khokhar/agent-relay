@@ -716,7 +716,7 @@ exit 0
             self.assertFalse([line for line in self._take_log(tmp)
                               if "update.timer" in line])
 
-    def test_missing_checkout_fails_before_creating_files_or_calling_service_managers(self):
+    def test_missing_checkout_refuses_without_effects_then_accepts_an_existing_target(self):
         for system in ("Darwin", "Linux"):
             with self.subTest(system=system), tempfile.TemporaryDirectory() as tmp:
                 checkout = os.path.join(tmp, "checkout")
@@ -726,13 +726,21 @@ exit 0
                 result = self._install(env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("does not look like an agent-relay checkout", result.stderr)
-                self.assertIn("bash skills/agent-relay/scripts/setup.sh", result.stderr)
-                self.assertIn("from the agent-relay repository root", result.stderr)
+                self.assertIn("set AGENT_RELAY_DIR to an existing checkout containing src/server.py",
+                              result.stderr)
+                self.assertIn("then rerun this installer", result.stderr)
                 self.assertEqual(os.listdir(checkout), [])
                 for path in ("Library/LaunchAgents", ".config/systemd/user",
                              ".local/state/agent-relay"):
                     self.assertFalse(os.path.exists(os.path.join(tmp, path)), path)
                 self.assertEqual(self._take_log(tmp), [])
+
+                existing = os.path.join(tmp, "existing-checkout")
+                self._fake_checkout(existing)
+                retried = self._install({**env, "AGENT_RELAY_DIR": existing})
+                self.assertEqual(retried.returncode, 0, retried.stderr)
+                self.assertEqual(os.listdir(checkout), [])
+                self.assertTrue(self._take_log(tmp), "the selected checkout was not installed")
 
     def test_missing_checker_fails_before_scheduling_on_darwin(self):
         """A checkout without the release checker is rejected before any timer
@@ -745,10 +753,10 @@ exit 0
 
             result = self._install(env)
             self.assertNotEqual(result.returncode, 0)
-            self.assertTrue(os.path.exists(
-                os.path.join(ROOT, "scripts", "update.sh")))
             self.assertIn("release_discovery.py not found", result.stderr)
-            self.assertIn("bash scripts/update.sh from the checkout", result.stderr)
+            self.assertIn(f"AGENT_RELAY_DIR={checkout} bash {checkout}/scripts/update.sh",
+                          result.stderr)
+            self.assertIn("--no-restart", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
             self.assertFalse(os.path.exists(
                 os.path.join(agents, "com.agent-relay.update.plist")))
@@ -767,10 +775,10 @@ exit 0
 
             result = self._install(env)
             self.assertNotEqual(result.returncode, 0)
-            self.assertTrue(os.path.exists(
-                os.path.join(ROOT, "scripts", "update.sh")))
             self.assertIn("release_discovery.py not found", result.stderr)
-            self.assertIn("bash scripts/update.sh from the checkout", result.stderr)
+            self.assertIn(f"AGENT_RELAY_DIR={checkout} bash {checkout}/scripts/update.sh",
+                          result.stderr)
+            self.assertIn("--no-restart", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
             self.assertFalse(os.path.exists(
                 os.path.join(units, "agent-relay-update.timer")))
@@ -781,6 +789,56 @@ exit 0
             calls = "".join(self._take_log(tmp))
             self.assertNotIn("enable", calls)
             self.assertNotIn("daemon-reload", calls)
+
+    def test_printed_checker_remedy_refreshes_the_named_checkout_without_restarting(self):
+        for system, relative in (("Darwin", False), ("Linux", False), ("Linux", True)):
+            with self.subTest(system=system, relative=relative), tempfile.TemporaryDirectory() as tmp:
+                seed = init_repo(os.path.join(tmp, "seed"))
+                os.makedirs(os.path.join(seed, "scripts"))
+                shutil.copyfile(UPDATE, os.path.join(seed, "scripts", "update.sh"))
+                self._fake_checkout(seed, release_check=False)
+                advance_repo(seed, "installer and updater")
+                checkout = clone_repo(seed, os.path.join(tmp, "check out's $data"))
+                target = os.path.relpath(checkout, ROOT) if relative else checkout
+                env = self._env(tmp, target, system=system)
+                checker = os.path.join(seed, "src", "release_discovery.py")
+                with open(checker, "w", encoding="utf-8") as handle:
+                    handle.write("# restored by the remote update\n")
+                advance_repo(seed, "restore release checker")
+
+                result = self._install(env)
+                self.assertNotEqual(result.returncode, 0)
+                commands = [line.strip() for line in result.stderr.splitlines()
+                            if line.strip().startswith("AGENT_RELAY_DIR=")]
+                self.assertEqual(len(commands), 1, result.stderr)
+                self.assertEqual(self._take_log(tmp), [])
+                health, port = start_http_server(
+                    lambda request: send_json(request, 200,
+                                              {"ok": True, "active": 0, "queued": 0}))
+                try:
+                    # Execute the printed remedy from elsewhere, without relying on
+                    # the target variable passed to the installer by its caller.
+                    command_env = {**env, "A2A_RELAY_PORT": str(port)}
+                    command_env.pop("AGENT_RELAY_DIR")
+                    run_dir = os.path.join(tmp, "unrelated", "nested")
+                    os.makedirs(run_dir)
+                    refreshed = subprocess.run(
+                        ["bash", "-c", commands[0]], cwd=run_dir, env=command_env,
+                        capture_output=True, text=True, timeout=30)
+                    self.assertEqual(refreshed.returncode, 0,
+                                     refreshed.stdout + refreshed.stderr)
+                finally:
+                    stop_http_server(health)
+                with open(os.path.join(checkout, "src", "release_discovery.py"),
+                          encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "# restored by the remote update\n")
+                self.assertFalse(os.path.exists(os.path.join(tmp, ".local", "share",
+                                                            "agent-relay")))
+                self.assertEqual(self._take_log(tmp), [], "the updater restarted a service")
+                self.assertIs(UpdateScriptTests._status(checkout)["pendingRestart"], True)
+                installed = self._install(env)
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                self.assertTrue(self._take_log(tmp), "the restored checkout was not installed")
 
     def test_server_only_checkout_installs_the_service_without_a_timer(self):
         """--no-update-timer is the opt-out for checkouts without the release
