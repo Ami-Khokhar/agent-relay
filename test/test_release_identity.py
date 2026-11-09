@@ -140,6 +140,14 @@ class ReleaseIdentityTest(unittest.TestCase):
                 self.resolve(bad, fetch_json=fake)
             self.assertEqual(fake.calls, [], "an invalid tag must cause no requests")
 
+        # Build metadata keeps this semantic version stable, so only the length guard refuses it.
+        prefix = "1.0.0+"
+        overlong = prefix + "a" * (discovery.MAX_VERSION + 1 - len(prefix))
+        fake = fake_api(tag=overlong)
+        with self.assertRaisesRegex(identity.UpdateError, "release tag is too long"):
+            self.resolve(overlong, fetch_json=fake)
+        self.assertEqual(fake.calls, [], "an overlong stable tag must cause no requests")
+
     def test_noncanonical_release_metadata_is_rejected(self):
         bad = release()
         bad["html_url"] = "https://example.com/agent-relay/releases/tag/" + TAG

@@ -19,8 +19,9 @@ continues to work on non-POSIX systems using user-cache defaults and atomic repl
 but only POSIX transactions use the cross-process lock, so concurrent non-POSIX clients
 can deliver duplicate notices. README and DESIGN describe that limitation rather than
 promising cross-process deduplication everywhere. The 256-character version bound applies
-both to discovered tags and cached offers; together with bounded notes it keeps legitimate
-offers within the 32 KiB read cap.
+to discovered tags, cached offers and the stable tags resolved by release_identity before
+any HTTP request. For cached offers, the version bound together with bounded notes keeps
+legitimate offers within the 32 KiB read cap.
 
 ## A foreach step matches fail patterns per item
 
