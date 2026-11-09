@@ -64,7 +64,9 @@ MAX_EVENT_FEED = 4096
 CAUSE_TAIL_LINES = 3
 CAUSE_MAX_CHARS = 2000
 SUMMARY_FIRST_LINE_CHARS = 200
-QUOTA_CAUSE_RE = re.compile(r"usage limit|rate.?limit|quota|too many requests", re.IGNORECASE)
+QUOTA_CAUSE_RE = re.compile(
+    r"\b(?:usage[ _-]?limit|rate[ _-]?limit|quota[ \t]+(?:exceeded|reached)|too many requests|429)\b",
+    re.IGNORECASE)
 
 
 def _text(value, limit):
@@ -79,9 +81,10 @@ def _tail_lines(text, keep):
 def _step_cause(stderr, output):
     """The short cause for a failed step: the last non-empty lines the agent printed.
 
-    The whole transcript stays on the task and in the step's ``errorDetail``. A quota or
-    rate-limit line names the cause ``agent_quota`` (with any stated retry time inside it),
-    so a caller can wait or switch agents without reading the transcript.
+    The full task error stays in ``errorDetail``. Limit-report phrasing in that diagnostic
+    names the cause ``agent_quota``; output is considered only when the error is empty.
+    Classification reads the diagnostic before line truncation so a following traceback
+    cannot hide a limit report. The displayed cause stays bounded to the stream tails.
     """
     lines = _tail_lines(stderr, CAUSE_TAIL_LINES) + _tail_lines(output, CAUSE_TAIL_LINES)
     kept = []
@@ -90,7 +93,8 @@ def _step_cause(stderr, output):
             break
         kept.append(line[:CAUSE_MAX_CHARS])
     cause = "\n".join(reversed(kept))
-    if QUOTA_CAUSE_RE.search(cause):
+    diagnostic = stderr or "\n".join(_tail_lines(output, CAUSE_TAIL_LINES))
+    if QUOTA_CAUSE_RE.search(diagnostic):
         return f"agent_quota: {cause}"
     return cause
 
@@ -742,12 +746,15 @@ class WorkflowEngine:
                 if "cancelled" in statuses:
                     self._finish(workflow, "cancelled")
                 elif "failed" in statuses or "skipped" in statuses:
-                    culprit = next(step for step in workflow["steps"]
-                                   if step["status"] in ("failed", "skipped"))
+                    culprit = next((step for step in workflow["steps"]
+                                    if step["status"] == "failed"), None)
+                    if culprit is None:
+                        culprit = next(step for step in workflow["steps"]
+                                       if step["status"] == "skipped")
                     message = f"step {culprit['id']} {culprit['status']}"
                     if culprit["status"] == "failed" and culprit.get("error"):
                         # The run's own error carries the cause, so the summary a caller sees
-                        # first is the last line the agent printed, not just the step id.
+                        # first includes the short diagnostic cause, not just the step id.
                         message = f"{message}: {culprit['error']}"
                     workflow["error"] = message
                     self._finish(workflow, "failed")
@@ -898,7 +905,7 @@ class WorkflowEngine:
             cause = _step_cause(stderr, failed.get("output") or "")
             step["status"] = "failed"
             step["error"] = cause or stderr or failed["status"]
-            # The full transcript stays available on request (a single-run view), never in
+            # The full task error stays available on request (a single-run view), never in
             # the step error a summary or an event carries.
             step["errorDetail"] = stderr or None
             step["output"] = failed.get("output") or None

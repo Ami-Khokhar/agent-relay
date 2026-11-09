@@ -448,8 +448,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].attemptTimes` | always | One `{startedAt, finishedAt}` window per attempt, oldest first; `finishedAt` is null for an attempt still open. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
 | `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
-| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the agent's stderr and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` in front when those lines name a usage limit, rate limit, or quota (any stated retry time stays inside the text). |
-| `steps[].errorDetail` | failed step, single run view only | The failing task's full stderr, behind its own field so the summary stays short; the list view never carries it. |
+| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the agent's stderr and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` for diagnostic usage/rate-limit reports, quota exceeded/reached, "too many requests" or HTTP 429. Classification reads the full task error before tail truncation, or the output tail only when the error is empty; ordinary quota prose is not a limit report. |
+| `steps[].errorDetail` | failed step, single run view only | The failing task's full error text (stderr for a command agent), absent when no task ran; the list view never carries it. |
 
 ## Workflow journals
 
