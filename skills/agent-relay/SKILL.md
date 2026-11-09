@@ -446,13 +446,14 @@ status/error markers; unfinished ancestors stay empty, and `all` keeps non-compl
 ancestors empty too. This changes step admission, not the run outcome: failed/skipped branches
 still fail the run, and cancellation still cancels it.
 
-Run statuses: `queued` → `running` → one of `completed`, `failed`, `cancelled`. A step moves
-`pending` → `running` → one of `completed`, `failed`, `skipped`, `cancelled`; `skipped` means
-its dependency policy could not be satisfied (a non-completed need for `all`, or no completed
-need for `any`). Every step reports `needsPolicy` as submitted, or `null` when omitted, and
-carries `startedAt` and `finishedAt`, null until it starts and finishes. A run view adds
-`attemptTimes`, one `{startedAt, finishedAt}` window per attempt — so a report can give each
-step its own time window without reading task ids.
+Run statuses: `queued` → `running` → one of `completed`, `failed`, `cancelled`. A step
+runs through `pending` → `running` → one of `completed`, `failed`, `cancelled`, or goes
+directly `pending` → `skipped` when its dependency policy cannot be satisfied (a
+non-completed need for `all`, or no completed need for `any`). Every step reports
+`needsPolicy` as submitted, or `null` when omitted, and carries `startedAt` and
+`finishedAt`, null until it starts and finishes. A run view adds `attemptTimes`, one
+`{startedAt, finishedAt}` window per attempt — so a report can give each step its own time
+window without reading task ids.
 
 ```
 {"name": "review-loop", "steps": [
