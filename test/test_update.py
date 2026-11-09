@@ -749,14 +749,15 @@ exit 0
             checkout = os.path.join(tmp, "checkout")
             env = self._env(tmp, checkout)
             self._fake_checkout(checkout, release_check=False)
+            os.makedirs(os.path.join(checkout, ".git"))
             agents = os.path.join(tmp, "Library", "LaunchAgents")
 
             result = self._install(env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("release_discovery.py not found", result.stderr)
-            self.assertIn(f"AGENT_RELAY_DIR={checkout} bash {checkout}/scripts/update.sh",
-                          result.stderr)
-            self.assertIn("--no-restart", result.stderr)
+            self.assertIn(f"{checkout}/scripts/update.sh not found", result.stderr)
+            self.assertIn(f"restore a complete Git checkout at {checkout}", result.stderr)
+            self.assertNotIn("AGENT_RELAY_DIR=", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
             self.assertFalse(os.path.exists(
                 os.path.join(agents, "com.agent-relay.update.plist")))
@@ -771,14 +772,15 @@ exit 0
             checkout = os.path.join(tmp, "checkout")
             env = self._env(tmp, checkout, system="Linux")
             self._fake_checkout(checkout, release_check=False)
+            os.makedirs(os.path.join(checkout, ".git"))
             units = os.path.join(tmp, ".config", "systemd", "user")
 
             result = self._install(env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("release_discovery.py not found", result.stderr)
-            self.assertIn(f"AGENT_RELAY_DIR={checkout} bash {checkout}/scripts/update.sh",
-                          result.stderr)
-            self.assertIn("--no-restart", result.stderr)
+            self.assertIn(f"{checkout}/scripts/update.sh not found", result.stderr)
+            self.assertIn(f"restore a complete Git checkout at {checkout}", result.stderr)
+            self.assertNotIn("AGENT_RELAY_DIR=", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
             self.assertFalse(os.path.exists(
                 os.path.join(units, "agent-relay-update.timer")))
@@ -789,6 +791,26 @@ exit 0
             calls = "".join(self._take_log(tmp))
             self.assertNotIn("enable", calls)
             self.assertNotIn("daemon-reload", calls)
+
+    def test_missing_git_metadata_omits_the_refresh_command_even_when_an_updater_exists(self):
+        for system in ("Darwin", "Linux"):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as tmp:
+                checkout = os.path.join(tmp, "partial checkout")
+                self._fake_checkout(checkout, release_check=False)
+                os.makedirs(os.path.join(checkout, "scripts"))
+                shutil.copyfile(UPDATE, os.path.join(checkout, "scripts", "update.sh"))
+                env = self._env(tmp, checkout, system=system)
+
+                result = self._install(env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{checkout}/.git directory not found", result.stderr)
+                self.assertIn(f"restore a complete Git checkout at {checkout}", result.stderr)
+                self.assertIn("--no-update-timer", result.stderr)
+                self.assertNotIn("AGENT_RELAY_DIR=", result.stderr)
+                for path in ("Library/LaunchAgents", ".config/systemd/user",
+                             ".local/state/agent-relay"):
+                    self.assertFalse(os.path.exists(os.path.join(tmp, path)), path)
+                self.assertEqual(self._take_log(tmp), [])
 
     def test_printed_checker_remedy_refreshes_the_named_checkout_without_restarting(self):
         for system, relative in (("Darwin", False), ("Linux", False), ("Linux", True)):

@@ -172,12 +172,14 @@ bounded offer in the private local cache; an MCP session may show its version an
 canonical release link once, at a convenient checkpoint. `check_updates` fetches bounded
 release notes only when explicitly called. These checks do not install releases or restart
 the service. When the checkout lacks `src/release_discovery.py`, the installer rejects it
-before creating or scheduling anything. Use the shell-quoted command printed by the
-installer: it sets `AGENT_RELAY_DIR` explicitly and runs that checkout's updater with
-`--no-restart`. For example, replace both paths in
-`AGENT_RELAY_DIR="/absolute/path/to/checkout" bash "/absolute/path/to/checkout/scripts/update.sh" --no-restart`
-with the checkout to refresh, then rerun the installer. Or pass `--no-update-timer`
-to install the relay service only. If the target lacks `src/server.py`, point
+before creating or scheduling anything. If `scripts/update.sh` and a `.git` directory
+exist in that checkout, the installer prints a command with this template:
+`AGENT_RELAY_DIR=<checkout> bash <checkout>/scripts/update.sh --no-restart`.
+Do not paste the template: use the installer's already shell-quoted command, which
+names the absolute target, then rerun the installer. When the updater or Git checkout
+directory is missing, the error names the missing paths and asks you to re-clone or
+restore a complete checkout there. Or pass `--no-update-timer` to install the relay
+service only. If the target lacks `src/server.py`, point
 `AGENT_RELAY_DIR` at an existing checkout containing it and rerun the installer;
 setup run inside another checkout selects that checkout rather than cloning the target.
 Older installed timers still run the legacy updater until you rerun `install-service.sh` to replace their
