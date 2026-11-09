@@ -439,7 +439,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `sessionId` | always | Shared by every task the run starts. |
 | `createdAt` / `startedAt` / `finishedAt` | as applicable | ISO-8601; `startedAt` and `finishedAt` are null until reached. |
 | `spec` | single run only | The document as submitted, without the internal dependency closure. |
-| `error` | failed/cancelled | Names the first step that did not succeed; when that step failed, its short cause is appended after `: `. |
+| `error` | failed/cancelled | Names the first failed step in document order, or the first skipped step when none failed; a failed step's short cause is appended after `: `. |
 | `steps[].id` / `agentId` / `needs` | always | As submitted. |
 | `steps[].needsPolicy` | always | `"any"` or `"all"` as submitted; `null` when omitted (which behaves as `all`). |
 | `steps[].status` | always | Step status values. |
@@ -448,7 +448,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].attemptTimes` | always | One `{startedAt, finishedAt}` window per attempt, oldest first; `finishedAt` is null for an attempt still open. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
 | `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
-| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the agent's stderr and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` for diagnostic usage/rate-limit reports, quota exceeded/reached, "too many requests" or HTTP 429. Classification reads the full task error before tail truncation, or the output tail only when the error is empty; ordinary quota prose is not a limit report. |
+| `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the task error and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` for diagnostic usage/rate-limit reports, quota exceeded/reached, "too many requests" or HTTP 429. Classification reads only the full task error before tail truncation and requires HTTP/status context for 429; ordinary quota prose and stdout-only limit text do not set the quota label. |
 | `steps[].errorDetail` | failed step, single run view only | The failing task's full error text (stderr for a command agent), absent when no task ran; the list view never carries it. |
 
 ## Workflow journals

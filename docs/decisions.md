@@ -1,5 +1,14 @@
 # Decisions
 
+## Quota labels require task-error diagnostics and contextual HTTP status codes
+
+This supersedes the output-tail classification fallback in the workflow-cause decision below.
+Failed tasks already carry a task error, including a relay-generated message when command
+stderr is empty. Classification therefore uses that error only; stdout-only limit text
+stays visible in the cause and output without setting the quota label. Numeric 429 reports
+need HTTP, status, error or code context, so source line numbers cannot relabel failures.
+The existing explicit limit phrases and failed-step ordering remain unchanged.
+
 ## Workflow causes prioritize failed steps and diagnostic limit reports
 
 Forward dependencies can put a skipped dependent before the step that actually failed.
