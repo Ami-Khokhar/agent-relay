@@ -500,6 +500,11 @@ exit 0
         return {name: values for name, values in directives.items()
                 if name == section}
 
+    def _systemd_section_for(self, body, section, unit):
+        sections = self._systemd_section(body, section)
+        self.assertIn(section, sections, f"{unit} is missing its [{section}] section")
+        return sections[section]
+
     @staticmethod
     def _take_log(tmp):
         """Return the service-manager calls since the last call, then clear the log."""
@@ -881,21 +886,16 @@ exit 0
             unit = os.path.join(tmp, ".config", "systemd", "user", "agent-relay-update.service")
             with open(unit, encoding="utf-8") as handle:
                 body = handle.read()
-            sections = self._systemd_section(body, "Service")
-            self.assertIn("Service", sections,
-                          "agent-relay-update.service is missing its [Service] section")
-            service = sections["Service"]
+            service = self._systemd_section_for(body, "Service", "agent-relay-update.service")
             self.assertIn(("ExecStart",
                            f"{PYTHON} {checkout}/src/release_discovery.py --cache-offer"),
                           service)
             self.assertNotIn("scripts/update.sh", body)
             # The description says what the oneshot really does: a release check
             # that only caches metadata, asserted structurally on the Unit section.
-            sections = self._systemd_section(body, "Unit")
-            self.assertIn("Unit", sections,
-                          "agent-relay-update.service is missing its [Unit] section")
+            unit_section = self._systemd_section_for(body, "Unit", "agent-relay-update.service")
             self.assertIn(("Description", "agent-relay metadata-only release check"),
-                          sections["Unit"])
+                          unit_section)
 
     def test_checker_units_carry_no_relay_environment_while_the_relay_keeps_its_configuration(self):
         """The release-check units get only PATH: no A2A_RELAY_PORT and no
@@ -923,17 +923,13 @@ exit 0
                         units = os.path.join(tmp, ".config", "systemd", "user")
                         with open(os.path.join(units, "agent-relay.service"),
                                   encoding="utf-8") as handle:
-                            sections = self._systemd_section(handle.read(), "Service")
-                        self.assertIn("Service", sections,
-                                      "agent-relay.service is missing its [Service] section")
-                        relay = sections["Service"]
+                            relay = self._systemd_section_for(
+                                handle.read(), "Service", "agent-relay.service")
                         self.assertIn(("Environment", "A2A_RELAY_PORT=43124"), relay)
                         with open(os.path.join(units, "agent-relay-update.service"),
                                   encoding="utf-8") as handle:
-                            sections = self._systemd_section(handle.read(), "Service")
-                        self.assertIn("Service", sections,
-                                      "agent-relay-update.service is missing its [Service] section")
-                        checker = sections["Service"]
+                            checker = self._systemd_section_for(
+                                handle.read(), "Service", "agent-relay-update.service")
                     self.assertEqual([name for name, _ in checker
                                       if name == "Environment"], ["Environment"])
                     self.assertTrue([value for name, value in checker
