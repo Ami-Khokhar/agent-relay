@@ -20,8 +20,9 @@ HTTP is a transport, while MCP and A2A are protocols. They can coexist around on
 
 The installed timer runs only the bounded canonical release metadata checker. It stores the
 validated offer in a local cache without marking it as offered. On POSIX, the cache uses
-restrictive directory and file permissions; elsewhere it relies on the operating system's
-user-cache defaults. MCP initialization reads and
+restrictive directory and file permissions and serializes whole transactions across processes;
+elsewhere it relies on the operating system's user-cache defaults and atomic replacement,
+without cross-process deduplication. MCP initialization reads and
 validates that cache without network access, then offers at most one version and canonical
 release URL notice per version to the client. Release notes are returned only by an explicit
 `check_updates` call as bounded data. Neither path installs a release, pulls source, restarts
