@@ -1,5 +1,13 @@
 # Decisions
 
+## The example network option declares only its enabling value
+
+The Codex example's default args keep its socket restriction; selecting `network: on` adds
+the owner's explicit network grant. The example therefore declares only `on`: callers
+omit the option for the default rather than selecting an unused empty-args `off` value.
+The README and adapter recipe show that same declaration. This changes the example only;
+owner registries may still declare other values, including values that map to no args.
+
 ## Quota labels require task-error diagnostics and contextual HTTP status codes
 
 This supersedes the output-tail classification fallback in the workflow-cause decision below.

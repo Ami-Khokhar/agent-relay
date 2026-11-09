@@ -10,12 +10,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-from relay_helpers import PRINT_ARGV, PYTHON, STDIO_ARGV, McpClient, Relay
+from relay_helpers import PRINT_ARGV, PYTHON, ROOT, STDIO_ARGV, McpClient, Relay
 import server
 
 EFFORT = {"low": ["-c", "model_reasoning_effort=low"], "high": ["-c", "model_reasoning_effort=high"]}
-EXAMPLE_REGISTRY = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "agents.example.json")
+EXAMPLE_REGISTRY = os.path.join(ROOT, "config", "agents.example.json")
 
 
 def fake(**extra):
@@ -198,8 +197,26 @@ class ExampleRegistryTests(unittest.TestCase):
     def test_the_example_registry_offers_the_codex_network_option_off_by_default(self):
         codex = server.load_registry(EXAMPLE_REGISTRY)["codex"]
         self.assertEqual(codex["options"]["network"],
-                         {"off": [], "on": ["-c", "sandbox_workspace_write.network_access=true"]})
+                         {"on": ["-c", "sandbox_workspace_write.network_access=true"]})
         self.assertNotIn("sandbox_workspace_write.network_access", " ".join(codex["args"]))
+
+    def test_example_network_option_is_omitted_or_enabled_and_refuses_explicit_off(self):
+        codex = server.load_registry(EXAMPLE_REGISTRY)["codex"]
+        # Only the command boundary changes: print argv instead of launching Codex.
+        relay = Relay(fake(args=[*PRINT_ARGV, *codex["args"]], options=codex["options"]))
+        self.addCleanup(relay.close)
+        default = relay.run_task(agentId="fake", input="default")
+        self.assertEqual(default["status"], "completed")
+        self.assertEqual(json.loads(default["output"]), [*codex["args"], "default"])
+        enabled = relay.run_task(agentId="fake", input="enabled", options={"network": "on"})
+        self.assertEqual(enabled["status"], "completed")
+        self.assertEqual(json.loads(enabled["output"]),
+                         [*codex["args"], "-c", "sandbox_workspace_write.network_access=true", "enabled"])
+        before = relay.request("GET", "/v1/tasks")[1]["tasks"]
+        status, refused = relay.submit(agentId="fake", input="refused", options={"network": "off"})
+        self.assertEqual(status, 400, refused)
+        self.assertEqual(refused["error"], "invalid_option_value")
+        self.assertEqual(relay.request("GET", "/v1/tasks")[1]["tasks"], before)
 
 
 if __name__ == "__main__":
