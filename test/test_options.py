@@ -194,10 +194,8 @@ class OptionsRegistryTests(unittest.TestCase):
 
 
 class ExampleRegistryTests(unittest.TestCase):
-    def test_the_example_registry_offers_the_codex_network_option_off_by_default(self):
+    def test_the_example_registry_keeps_the_codex_network_option_off_by_omission(self):
         codex = server.load_registry(EXAMPLE_REGISTRY)["codex"]
-        self.assertEqual(codex["options"]["network"],
-                         {"on": ["-c", "sandbox_workspace_write.network_access=true"]})
         self.assertNotIn("sandbox_workspace_write.network_access", " ".join(codex["args"]))
 
     def test_example_network_option_is_omitted_or_enabled_and_refuses_explicit_off(self):
@@ -205,6 +203,10 @@ class ExampleRegistryTests(unittest.TestCase):
         # Only the command boundary changes: print argv instead of launching Codex.
         relay = Relay(fake(args=[*PRINT_ARGV, *codex["args"]], options=codex["options"]))
         self.addCleanup(relay.close)
+        status, listing = relay.request("GET", "/v1/agents")
+        self.assertEqual(status, 200)
+        self.assertEqual([(agent["id"], agent.get("options", {}).get("network"))
+                          for agent in listing["agents"]], [("fake", ["on"])])
         default = relay.run_task(agentId="fake", input="default")
         self.assertEqual(default["status"], "completed")
         self.assertEqual(json.loads(default["output"]), [*codex["args"], "default"])
