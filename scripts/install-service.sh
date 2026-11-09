@@ -91,8 +91,8 @@ fi
 if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -f "$TARGET_DIR/src/release_discovery.py" ]; then
   echo "error: $TARGET_DIR/src/release_discovery.py not found; the scheduled" >&2
   echo "       release check runs it" >&2
-  echo "       rerun bash skills/agent-relay/scripts/setup.sh to refresh the" >&2
-  echo "       checkout, or pass --no-update-timer to install the service only" >&2
+  echo "       run bash scripts/update.sh from the checkout to refresh it," >&2
+  echo "       or pass --no-update-timer to install the service only" >&2
   exit 1
 fi
 

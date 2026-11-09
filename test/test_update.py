@@ -716,6 +716,24 @@ exit 0
             self.assertFalse([line for line in self._take_log(tmp)
                               if "update.timer" in line])
 
+    def test_missing_checkout_fails_before_creating_files_or_calling_service_managers(self):
+        for system in ("Darwin", "Linux"):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as tmp:
+                checkout = os.path.join(tmp, "checkout")
+                os.makedirs(checkout)
+                env = self._env(tmp, checkout, system=system)
+
+                result = self._install(env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("does not look like an agent-relay checkout", result.stderr)
+                self.assertIn("bash skills/agent-relay/scripts/setup.sh", result.stderr)
+                self.assertIn("from the agent-relay repository root", result.stderr)
+                self.assertEqual(os.listdir(checkout), [])
+                for path in ("Library/LaunchAgents", ".config/systemd/user",
+                             ".local/state/agent-relay"):
+                    self.assertFalse(os.path.exists(os.path.join(tmp, path)), path)
+                self.assertEqual(self._take_log(tmp), [])
+
     def test_missing_checker_fails_before_scheduling_on_darwin(self):
         """A checkout without the release checker is rejected before any timer
         file is created or any service-manager scheduling call is made."""
@@ -728,10 +746,9 @@ exit 0
             result = self._install(env)
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(os.path.exists(
-                os.path.join(ROOT, "skills", "agent-relay", "scripts",
-                             "setup.sh")))
+                os.path.join(ROOT, "scripts", "update.sh")))
             self.assertIn("release_discovery.py not found", result.stderr)
-            self.assertIn("bash skills/agent-relay/scripts/setup.sh", result.stderr)
+            self.assertIn("bash scripts/update.sh from the checkout", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
             self.assertFalse(os.path.exists(
                 os.path.join(agents, "com.agent-relay.update.plist")))
@@ -751,10 +768,9 @@ exit 0
             result = self._install(env)
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(os.path.exists(
-                os.path.join(ROOT, "skills", "agent-relay", "scripts",
-                             "setup.sh")))
+                os.path.join(ROOT, "scripts", "update.sh")))
             self.assertIn("release_discovery.py not found", result.stderr)
-            self.assertIn("bash skills/agent-relay/scripts/setup.sh", result.stderr)
+            self.assertIn("bash scripts/update.sh from the checkout", result.stderr)
             self.assertIn("--no-update-timer", result.stderr)
             self.assertFalse(os.path.exists(
                 os.path.join(units, "agent-relay-update.timer")))
