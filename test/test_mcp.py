@@ -1031,6 +1031,8 @@ class McpHandlerTests(unittest.TestCase):
         self.assertIn("invalid_needs_policy", policy_help)
         self.assertIn("skipped", policy_help)
         self.assertIn("cancelled", policy_help)
+        self.assertIn("With `any`", policy_help)
+        self.assertIn("`all` keeps non-completed ancestors empty", policy_help)
         self.assertIn("run still fails", tools["run_workflow"]["description"])
         self.assertIn("list_agents", step["properties"]["agentId"]["description"])
         self.assertIn("{{id.output}}", step["properties"]["id"]["description"])

@@ -198,9 +198,10 @@ WORKFLOW_SPEC = {
                                                    "every need and skips the step if one fails; "
                                                    "`any` starts once every need is terminal and "
                                                    "at least one completed. It requires at least one needs entry "
-                                                   "(otherwise 400 invalid_needs_policy). Non-completed terminal "
+                                                   "(otherwise 400 invalid_needs_policy). With `any`, non-completed terminal "
                                                    "ancestors (failed, including timeouts, skipped or cancelled) "
                                                    "render as status/error markers; unfinished ancestors stay empty. "
+                                                   "`all` keeps non-completed ancestors empty. "
                                                    "The policy does not change the run outcome: a failed/skipped "
                                                    "branch still fails the run, and run cancellation stays cancelled."},
                     "foreach": {"type": "array", "minItems": 1,
