@@ -91,10 +91,20 @@ fi
 if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -f "$TARGET_DIR/src/release_discovery.py" ]; then
   echo "error: $TARGET_DIR/src/release_discovery.py not found; the scheduled" >&2
   echo "       release check runs it" >&2
-  echo "       refresh this checkout without restarting its service:" >&2
   REFRESH_DIR="$(cd "$TARGET_DIR" && pwd)"
-  printf '       AGENT_RELAY_DIR=%q bash %q --no-restart\n' \
-    "$REFRESH_DIR" "$REFRESH_DIR/scripts/update.sh" >&2
+  if [ -f "$REFRESH_DIR/scripts/update.sh" ] && [ -d "$REFRESH_DIR/.git" ]; then
+    echo "       refresh this checkout without restarting its service:" >&2
+    printf '       AGENT_RELAY_DIR=%q bash %q --no-restart\n' \
+      "$REFRESH_DIR" "$REFRESH_DIR/scripts/update.sh" >&2
+  else
+    if [ ! -f "$REFRESH_DIR/scripts/update.sh" ]; then
+      echo "       $REFRESH_DIR/scripts/update.sh not found" >&2
+    fi
+    if [ ! -d "$REFRESH_DIR/.git" ]; then
+      echo "       $REFRESH_DIR/.git directory not found" >&2
+    fi
+    echo "       re-clone or restore a complete Git checkout at $REFRESH_DIR" >&2
+  fi
   echo "       then rerun this installer, or pass --no-update-timer for the service only" >&2
   exit 1
 fi
