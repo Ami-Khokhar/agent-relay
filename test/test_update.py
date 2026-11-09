@@ -165,10 +165,10 @@ class UpdateScriptTests(unittest.TestCase):
                 relay.close()
 
     def test_a_restart_the_service_manager_refuses_is_recorded_as_failed(self):
-        """A launchctl that refuses the kickstart records `failed` with the pending marker
-        left on disk, so a later run retries it: one of the two `failed true` records,
-        the other being the /healthz timeout after a restart. A refused pull is a third
-        `failed` record, covered by test_a_pull_that_cannot_fast_forward_records_a_failed_attempt."""
+        """Restart refusal leaves pendingRestart true for retry, as does the restart
+        step's /healthz timeout. A refused pull writes a separate failed record whose
+        pendingRestart mirrors any marker already on disk; that path is covered by
+        test_a_pull_that_cannot_fast_forward_records_a_failed_attempt."""
         with tempfile.TemporaryDirectory() as tmp:
             seed = init_repo(os.path.join(tmp, "seed"))
             checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
