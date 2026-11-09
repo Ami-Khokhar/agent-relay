@@ -183,9 +183,9 @@ but unsupported by this updater, not as a missing path. Or pass `--no-update-tim
 install the relay service only. If the target lacks `src/server.py`, point
 `AGENT_RELAY_DIR` at an existing checkout containing it and rerun the installer; setup run
 inside another checkout selects that checkout rather than cloning the target.
-Older installed timers still run the legacy updater until you rerun `install-service.sh` to replace their
-definitions. Pass `--no-update-timer` to remove the timer (`--with-update-timer` remains
-accepted).
+Older installed timers still run the legacy updater until you rerun `install-service.sh`
+to replace their definitions. Pass `--no-update-timer` to remove the timer
+(`--with-update-timer` remains accepted).
 
 Register the MCP server in the orchestrating client (point `args` at the absolute path).
 The setup script prints these for your checkout:
