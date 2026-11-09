@@ -430,7 +430,10 @@ the tests drive each reading without a busy machine.
   it), naming the reading that decided it and carrying the whole reading, so nothing starts on a
   machine that cannot take it. With the default a `warn` verdict still runs work;
   `AGENT_RELAY_ADMIT_BELOW=warn` refuses at `warn` too, for a host whose kernel warns well
-  before it turns critical, and `=ok` refuses every verdict, saying which setting refused it.
+  before it turns critical, and `=ok` refuses every verdict, naming the setting instead of a
+  reading when the host is calm. `A2A_RELAY_ADMIT_BELOW` is an alias; a nonempty
+  `AGENT_RELAY_ADMIT_BELOW` takes precedence. Refusals ask the owner to address the reported
+  readings and retry, rather than assuming every cause can be fixed by freeing memory.
 - **During a run.** With `AGENT_RELAY_PRESSURE_GUARD` on (the default) the relay samples every
   `AGENT_RELAY_PRESSURE_INTERVAL_MS` (default 5000) but only while at least one run is active, so an
   idle relay never shells out. It stops every active run only once the verdict has been `critical`

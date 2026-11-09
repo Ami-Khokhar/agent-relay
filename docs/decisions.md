@@ -1,5 +1,15 @@
 # Decisions
 
+## Pressure admission aliases share validation and cause-neutral refusal advice
+
+The admission threshold accepts the first nonempty `AGENT_RELAY_ADMIT_BELOW` or
+`A2A_RELAY_ADMIT_BELOW`, matching adjacent pressure settings. Startup validates the selected
+value and names that variable on error; each pressure snapshot still reads the setting.
+A refusal with readings asks the owner to address those readings and retry, since swap and
+temperature warnings are not necessarily fixed by freeing memory. A calm host refused by
+an `ok` threshold instead names the setting. Verdict thresholds and active-run stops are
+unchanged.
+
 ## Release discovery is metadata-only
 
 The project has no published releases or tags yet, and its existing updater pulls and restarts source checkouts. Release discovery therefore uses the canonical GitHub HTTPS API with a bounded response and never installs or executes fetched content. Stable releases are the default, prereleases require an explicit option, and no release is a normal result. Later installation work must establish immutable content verification and a separate user consent step.

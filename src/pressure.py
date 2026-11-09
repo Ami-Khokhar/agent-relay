@@ -218,18 +218,20 @@ def guard_hold_ms():
 def admit_below():
     """The verdict at or above which a new workflow is refused, from the relay's own environment.
 
+    The first nonempty AGENT_RELAY_ADMIT_BELOW or A2A_RELAY_ADMIT_BELOW value wins.
     The one implementation of the setting: the preflight refusal refuses from this answer and the
     reading reports it, so the two cannot disagree. No value at all means ``DEFAULT_ADMIT_BELOW``
     (today's critical-only rule), and a value that is not ``ok``, ``warn`` or ``critical`` raises
     ``ValueError``, which the relay reports at startup instead of guessing.
     """
-    value = os.environ.get("AGENT_RELAY_ADMIT_BELOW")
-    if not value:
-        return DEFAULT_ADMIT_BELOW
-    level = value.lower()
-    if level not in VERDICT_ORDER:
-        raise ValueError("AGENT_RELAY_ADMIT_BELOW must be one of ok, warn or critical")
-    return level
+    for name in ("AGENT_RELAY_ADMIT_BELOW", "A2A_RELAY_ADMIT_BELOW"):
+        value = os.environ.get(name)
+        if value:
+            level = value.lower()
+            if level not in VERDICT_ORDER:
+                raise ValueError(f"{name} must be one of ok, warn or critical")
+            return level
+    return DEFAULT_ADMIT_BELOW
 
 
 class CriticalHold:
@@ -349,7 +351,7 @@ def should_refuse(reading):
         return None
     if reading["reasons"]:
         message = (f"This machine is under {verdict} pressure, so no workflow was started: "
-                   + "; ".join(reading["reasons"]) + ". Free some memory and retry; "
+                   + "; ".join(reading["reasons"]) + ". Address the readings above and retry; "
                    "GET /v1/pressure shows the current reading.")
     else:
         message = (f"The owner set AGENT_RELAY_ADMIT_BELOW={admit}, so no workflow starts "
