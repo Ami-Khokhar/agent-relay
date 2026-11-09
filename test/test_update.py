@@ -104,27 +104,42 @@ class UpdateScriptTests(unittest.TestCase):
             finally:
                 relay.close()
 
-    def test_a_pull_that_cannot_fast_forward_records_a_failed_attempt(self):
-        """Divergent histories make `git pull --ff-only` refuse; the refusal is
-        recorded like every other attempt, not only written to the log."""
-        with tempfile.TemporaryDirectory() as tmp:
-            seed = init_repo(os.path.join(tmp, "seed"))
-            checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
-            with open(os.path.join(checkout, "local.txt"), "w", encoding="utf-8") as handle:
-                handle.write("local\n")
-            git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
-                       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
-            for args in (("add", "."), ("commit", "-qm", "local")):
-                subprocess.run(["git", *args], cwd=checkout, env=git_env, check=True,
-                               capture_output=True, text=True)
-            advance_repo(seed, "c-remote")
+    def test_failed_pull_records_whether_a_restart_was_already_pending(self):
+        """A refused fast-forward retains the pending state from an earlier attempt."""
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred), tempfile.TemporaryDirectory() as tmp:
+                seed = init_repo(os.path.join(tmp, "seed"))
+                checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
+                health, port = start_http_server(
+                    lambda request: send_json(request, 200, {"ok": True, "active": 0, "queued": 0}))
+                self.addCleanup(stop_http_server, health)
+                env = self._stub_env(checkout, str(port))
+                self.addCleanup(shutil.rmtree, env["HOME"])
+                self.addCleanup(shutil.rmtree, os.path.dirname(env["AGENT_RELAY_RESTART_LOG"]))
+                marker = os.path.join(checkout, ".git", "agent-relay-pending-restart")
+                if deferred:
+                    advance_repo(seed, "deferred")
+                    result = self._run(env, "--no-restart")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIs(self._status(checkout)["pendingRestart"], True)
+                    with open(marker, "rb") as handle:
+                        pending_before = handle.read()
 
-            result = run_update(checkout)
-            self.assertNotEqual(result.returncode, 0, result.stdout)
-            self.assertIn("could not fast-forward", result.stderr)
-            status = self._status(checkout)
-            self.assertEqual(status["outcome"], "failed")
-            self.assertIs(status["pendingRestart"], False)
+                advance_repo(checkout, "local")
+                advance_repo(seed, "remote")
+                result = self._run(env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("could not fast-forward", result.stderr)
+                status = self._status(checkout)
+                self.assertEqual(status["outcome"], "failed")
+                self.assertIs(status["pendingRestart"], deferred)
+                if deferred:
+                    with open(marker, "rb") as handle:
+                        self.assertEqual(handle.read(), pending_before)
+                else:
+                    self.assertFalse(os.path.exists(marker))
+                with open(env["AGENT_RELAY_RESTART_LOG"]) as handle:
+                    self.assertEqual(handle.read(), "", "no service restart may run")
 
     def test_new_commit_restarts_and_verifies_health(self):
         """A real relay runs on a helper-chosen port; uname/launchctl are stubbed
@@ -168,7 +183,7 @@ class UpdateScriptTests(unittest.TestCase):
         """Restart refusal leaves pendingRestart true for retry, as does the restart
         step's /healthz timeout. A refused pull writes a separate failed record whose
         pendingRestart mirrors any marker already on disk; that path is covered by
-        test_a_pull_that_cannot_fast_forward_records_a_failed_attempt."""
+        test_failed_pull_records_whether_a_restart_was_already_pending."""
         with tempfile.TemporaryDirectory() as tmp:
             seed = init_repo(os.path.join(tmp, "seed"))
             checkout = clone_repo(seed, os.path.join(tmp, "checkout"))
