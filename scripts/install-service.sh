@@ -100,7 +100,9 @@ if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -f "$TARGET_DIR/src/release_discovery.p
     if [ ! -f "$REFRESH_DIR/scripts/update.sh" ]; then
       echo "       $REFRESH_DIR/scripts/update.sh not found" >&2
     fi
-    if [ ! -d "$REFRESH_DIR/.git" ]; then
+    if [ -f "$REFRESH_DIR/.git" ]; then
+      echo "       $REFRESH_DIR/.git is a file; this updater requires a .git directory" >&2
+    elif [ ! -d "$REFRESH_DIR/.git" ]; then
       echo "       $REFRESH_DIR/.git directory not found" >&2
     fi
     echo "       re-clone or restore a complete Git checkout at $REFRESH_DIR" >&2
