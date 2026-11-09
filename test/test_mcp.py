@@ -609,11 +609,13 @@ class McpHandlerTests(unittest.TestCase):
     def _assert_failed_wait_keeps_created_task(self, result, created, error):
         self.assertNotIn("isError", result)
         task = result["structuredContent"]
+        self.assertEqual(set(task), set(created) | {"waitFailed", "waitError"})
         self.assertEqual({key: task[key] for key in created}, created)
         self.assertIs(task["waitFailed"], True)
         self.assertEqual(task["waitError"]["error"], error)
         self.assertNotIn("waitMs", task)
         self.assertNotIn("waitClamped", task)
+        self.assertNotIn("waitExpired", task)
         for text in (created["id"], "wait_task", "taskId", "Do not submit"):
             self.assertIn(text, task["waitError"]["message"])
 
