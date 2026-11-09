@@ -791,15 +791,16 @@ exit 0
             self.assertNotIn("daemon-reload", calls)
 
     def test_printed_checker_remedy_refreshes_the_named_checkout_without_restarting(self):
-        for system in ("Darwin", "Linux"):
-            with self.subTest(system=system), tempfile.TemporaryDirectory() as tmp:
+        for system, relative in (("Darwin", False), ("Linux", False), ("Linux", True)):
+            with self.subTest(system=system, relative=relative), tempfile.TemporaryDirectory() as tmp:
                 seed = init_repo(os.path.join(tmp, "seed"))
                 os.makedirs(os.path.join(seed, "scripts"))
                 shutil.copyfile(UPDATE, os.path.join(seed, "scripts", "update.sh"))
                 self._fake_checkout(seed, release_check=False)
                 advance_repo(seed, "installer and updater")
                 checkout = clone_repo(seed, os.path.join(tmp, "check out's $data"))
-                env = self._env(tmp, checkout, system=system)
+                target = os.path.relpath(checkout, ROOT) if relative else checkout
+                env = self._env(tmp, target, system=system)
                 checker = os.path.join(seed, "src", "release_discovery.py")
                 with open(checker, "w", encoding="utf-8") as handle:
                     handle.write("# restored by the remote update\n")
@@ -819,8 +820,10 @@ exit 0
                     # the target variable passed to the installer by its caller.
                     command_env = {**env, "A2A_RELAY_PORT": str(port)}
                     command_env.pop("AGENT_RELAY_DIR")
+                    run_dir = os.path.join(tmp, "unrelated", "nested")
+                    os.makedirs(run_dir)
                     refreshed = subprocess.run(
-                        ["bash", "-c", commands[0]], cwd=tmp, env=command_env,
+                        ["bash", "-c", commands[0]], cwd=run_dir, env=command_env,
                         capture_output=True, text=True, timeout=30)
                     self.assertEqual(refreshed.returncode, 0,
                                      refreshed.stdout + refreshed.stderr)

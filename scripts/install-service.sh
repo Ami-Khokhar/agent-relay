@@ -92,8 +92,9 @@ if [ "$WITH_UPDATE_TIMER" = "1" ] && [ ! -f "$TARGET_DIR/src/release_discovery.p
   echo "error: $TARGET_DIR/src/release_discovery.py not found; the scheduled" >&2
   echo "       release check runs it" >&2
   echo "       refresh this checkout without restarting its service:" >&2
+  REFRESH_DIR="$(cd "$TARGET_DIR" && pwd)"
   printf '       AGENT_RELAY_DIR=%q bash %q --no-restart\n' \
-    "$TARGET_DIR" "$TARGET_DIR/scripts/update.sh" >&2
+    "$REFRESH_DIR" "$REFRESH_DIR/scripts/update.sh" >&2
   echo "       then rerun this installer, or pass --no-update-timer for the service only" >&2
   exit 1
 fi
