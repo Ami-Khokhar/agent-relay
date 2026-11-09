@@ -823,15 +823,21 @@ exit 0
             unit = os.path.join(tmp, ".config", "systemd", "user", "agent-relay-update.service")
             with open(unit, encoding="utf-8") as handle:
                 body = handle.read()
-            service = self._systemd_section(body, "Service")["Service"]
+            sections = self._systemd_section(body, "Service")
+            self.assertIn("Service", sections,
+                          "agent-relay-update.service is missing its [Service] section")
+            service = sections["Service"]
             self.assertIn(("ExecStart",
                            f"{PYTHON} {checkout}/src/release_discovery.py --cache-offer"),
                           service)
             self.assertNotIn("scripts/update.sh", body)
             # The description says what the oneshot really does: a release check
             # that only caches metadata, asserted structurally on the Unit section.
+            sections = self._systemd_section(body, "Unit")
+            self.assertIn("Unit", sections,
+                          "agent-relay-update.service is missing its [Unit] section")
             self.assertIn(("Description", "agent-relay metadata-only release check"),
-                          self._systemd_section(body, "Unit")["Unit"])
+                          sections["Unit"])
 
     def test_checker_units_carry_no_relay_environment_while_the_relay_keeps_its_configuration(self):
         """The release-check units get only PATH: no A2A_RELAY_PORT and no
@@ -859,11 +865,17 @@ exit 0
                         units = os.path.join(tmp, ".config", "systemd", "user")
                         with open(os.path.join(units, "agent-relay.service"),
                                   encoding="utf-8") as handle:
-                            relay = self._systemd_section(handle.read(), "Service")["Service"]
+                            sections = self._systemd_section(handle.read(), "Service")
+                        self.assertIn("Service", sections,
+                                      "agent-relay.service is missing its [Service] section")
+                        relay = sections["Service"]
                         self.assertIn(("Environment", "A2A_RELAY_PORT=43124"), relay)
                         with open(os.path.join(units, "agent-relay-update.service"),
                                   encoding="utf-8") as handle:
-                            checker = self._systemd_section(handle.read(), "Service")["Service"]
+                            sections = self._systemd_section(handle.read(), "Service")
+                        self.assertIn("Service", sections,
+                                      "agent-relay-update.service is missing its [Service] section")
+                        checker = sections["Service"]
                     self.assertEqual([name for name, _ in checker
                                       if name == "Environment"], ["Environment"])
                     self.assertTrue([value for name, value in checker
