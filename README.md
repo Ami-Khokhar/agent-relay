@@ -343,7 +343,7 @@ Task objects (the submit, get, wait, list and cancel responses, and the MCP tool
 
 ## Run a workflow
 
-A workflow is one JSON document: named steps, each bound to a registered agent, wired together with `needs`. The relay starts a step only once every step it needs has completed and threads each output into the next prompt, so a pipeline, a fan-out, or a review loop is one submission instead of a state machine in the caller.
+A workflow is one JSON document: named steps, each bound to a registered agent, wired together with `needs`. By default, the relay starts a step only once every step it needs has completed and threads each output into the next prompt, so a pipeline, a fan-out, or a review loop is one submission instead of a state machine in the caller.
 
 ```bash
 AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"

@@ -438,13 +438,21 @@ submission response may have been lost. Without a `requestId`, do not auto-retry
 ## Workflow lifecycle
 
 A workflow document names steps; each step is an ordinary task on one registered agent, and
-`needs` wires them together. The relay starts a step only once every step it needs has
-completed. Statuses: `queued` → `running` → one of `completed`, `failed`, `cancelled`. A
-step moves `pending` → `running` → one of `completed`, `failed`, `skipped`, `cancelled`,
-where `skipped` means a step it depended on did not succeed. Every step carries `startedAt`
-and `finishedAt`, null until it starts and finishes, and a run view adds `attemptTimes`, one
-`{startedAt, finishedAt}` window per attempt — so a report can give each step its own time
-window without reading task ids.
+`needs` wires them together. By default, a step starts only after every need completed.
+A step with `needsPolicy: "any"` requires at least one `needs` entry (otherwise
+`400 invalid_needs_policy`) and starts once every need is terminal and at least one completed.
+In an `any` prompt, failed (including timed-out), skipped or cancelled ancestors render as
+status/error markers; unfinished ancestors stay empty, and `all` keeps non-completed
+ancestors empty too. This changes step admission, not the run outcome: failed/skipped branches
+still fail the run, and cancellation still cancels it.
+
+Run statuses: `queued` → `running` → one of `completed`, `failed`, `cancelled`. A step moves
+`pending` → `running` → one of `completed`, `failed`, `skipped`, `cancelled`; `skipped` means
+its dependency policy could not be satisfied (a non-completed need for `all`, or no completed
+need for `any`). Every step reports `needsPolicy` as submitted, or `null` when omitted, and
+carries `startedAt` and `finishedAt`, null until it starts and finishes. A run view adds
+`attemptTimes`, one `{startedAt, finishedAt}` window per attempt — so a report can give each
+step its own time window without reading task ids.
 
 ```
 {"name": "review-loop", "steps": [

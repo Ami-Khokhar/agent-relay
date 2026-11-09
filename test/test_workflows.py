@@ -690,6 +690,44 @@ class WorkflowTests(unittest.TestCase):
                 handle.write("finish")
         self.assertEqual(wait(relay, submitted["id"])["status"], "failed")
 
+    def test_any_fan_in_marks_a_cancelled_child_task_and_all_child_keeps_it_empty(self):
+        relay = self.start([echo(), {"id": "hold", "command": PYTHON, "args": ["-c", SLOW]}])
+        status, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "held", "agentId": "hold", "input": "cancel my child"},
+            {"id": "good", "agentId": "echo", "input": "kept"},
+            {"id": "pick", "agentId": "echo", "needs": ["held", "good"], "needsPolicy": "any",
+             "input": "{{good.output}} / {{held.output}}"},
+            {"id": "final", "agentId": "echo", "needs": ["pick"], "needsPolicy": "all",
+             "input": "cancelled=<{{held.output}}>"},
+        ]})
+        self.assertEqual(status, 202, submitted)
+        deadline = time.time() + 10
+        task = {}
+        while time.time() < deadline:
+            status, view = relay.request("GET", f"/v1/workflows/{submitted['id']}")
+            self.assertEqual(status, 200)
+            held = steps_of(view)["held"]
+            if held["taskIds"]:
+                status, task = relay.request("GET", f"/v1/tasks/{held['taskIds'][0]}")
+                self.assertEqual(status, 200)
+                if task["status"] == "running":
+                    break
+            time.sleep(0.02)
+        self.assertEqual(task.get("status"), "running", view)
+        status, cancelled = relay.request("DELETE", f"/v1/tasks/{held['taskIds'][0]}")
+        self.assertEqual(status, 200)
+        self.assertEqual(cancelled["status"], "cancelled")
+        done = wait(relay, submitted["id"])
+        self.assertEqual(done["status"], "cancelled")
+        steps = steps_of(done)
+        self.assertEqual(steps["held"]["status"], "cancelled")
+        self.assertEqual(steps["held"]["error"], "task_cancelled")
+        self.assertEqual(steps["pick"]["status"], "completed")
+        self.assertEqual(steps["pick"]["output"],
+                         "kept / [held did not complete: status=cancelled error=task_cancelled]")
+        self.assertEqual(steps["final"]["status"], "completed")
+        self.assertEqual(steps["final"]["output"], "cancelled=<>")
+
     def test_a_needs_policy_any_step_is_skipped_when_no_need_completed(self):
         relay = self.start({"id": "failer", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]})
         workflow = run(relay, {"steps": [
