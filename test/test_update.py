@@ -105,7 +105,8 @@ class UpdateScriptTests(unittest.TestCase):
                 relay.close()
 
     def test_failed_pull_records_whether_a_restart_was_already_pending(self):
-        """A refused fast-forward retains the pending state from an earlier attempt."""
+        """A refused pull records false without a marker and true after deferral,
+        preserving existing marker bytes and never restarting the service."""
         for deferred in (False, True):
             with self.subTest(deferred=deferred), tempfile.TemporaryDirectory() as tmp:
                 seed = init_repo(os.path.join(tmp, "seed"))
@@ -138,7 +139,7 @@ class UpdateScriptTests(unittest.TestCase):
                         self.assertEqual(handle.read(), pending_before)
                 else:
                     self.assertFalse(os.path.exists(marker))
-                with open(env["AGENT_RELAY_RESTART_LOG"]) as handle:
+                with open(env["AGENT_RELAY_RESTART_LOG"], encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), "", "no service restart may run")
 
     def test_new_commit_restarts_and_verifies_health(self):
