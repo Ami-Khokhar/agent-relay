@@ -301,6 +301,43 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(error.startswith("agent_quota: "), error)
         self.assertIn("try again at 4:40 PM", error)
 
+    def test_unrelated_quota_prose_does_not_relabel_a_failed_step(self):
+        for diagnostic, output in (("SyntaxError: invalid syntax", "usage limit and quota docs"),
+                                   ("Editing quota and rate-limiter docs\nSyntaxError: bad edit", "")):
+            with self.subTest(diagnostic=diagnostic):
+                script = "import sys; sys.stderr.write(%r); print(%r); sys.exit(1)" % (diagnostic, output)
+                relay = self.start({"id": "broken", "command": PYTHON, "args": ["-c", script]})
+                workflow = run(relay, {"steps": [{"id": "source", "agentId": "broken", "input": "go"}]})
+                step = steps_of(workflow)["source"]
+                self.assertEqual(step["status"], "failed")
+                self.assertIn("SyntaxError", step["error"])
+                self.assertFalse(step["error"].startswith("agent_quota:"), step["error"])
+
+    def test_limit_diagnostic_before_traceback_still_labels_the_cause(self):
+        for diagnostic in ("quota exceeded", "quota reached", "usage limit", "rate-limit",
+                           "too many requests", "HTTP 429"):
+            with self.subTest(diagnostic=diagnostic):
+                stderr = diagnostic + "\ntrace one\ntrace two\ntrace three\ntrace four"
+                script = "import sys; sys.stderr.write(%r); sys.exit(1)" % stderr
+                relay = self.start({"id": "limited", "command": PYTHON, "args": ["-c", script]})
+                workflow = run(relay, {"steps": [{"id": "source", "agentId": "limited", "input": "go"}]})
+                step = steps_of(workflow)["source"]
+                self.assertTrue(step["error"].startswith("agent_quota:"), step["error"])
+                self.assertIn(diagnostic, step["errorDetail"])
+                self.assertIn("agent_quota:", workflow["error"])
+
+    def test_run_cause_prefers_a_failed_step_over_an_earlier_skipped_dependent(self):
+        relay = self.start({"id": "broken", "command": PYTHON,
+                            "args": ["-c", "import sys; sys.stderr.write('real diagnostic'); sys.exit(1)"]})
+        workflow = run(relay, {"steps": [
+            {"id": "dependent", "agentId": "broken", "needs": ["source"], "input": "never"},
+            {"id": "source", "agentId": "broken", "input": "go"}]})
+        self.assertEqual(workflow["status"], "failed")
+        self.assertEqual(steps_of(workflow)["dependent"]["status"], "skipped")
+        self.assertEqual(steps_of(workflow)["source"]["status"], "failed")
+        self.assertTrue(workflow["error"].startswith("step source failed:"), workflow["error"])
+        self.assertIn("real diagnostic", workflow["error"])
+
     def test_the_full_stderr_stays_available_as_error_detail(self):
         relay = self.start({"id": "noisy", "command": PYTHON, "args": ["-c", BANNER_THEN_ERROR]})
         _, submitted = relay.request("POST", "/v1/workflows", {"steps": [

@@ -1,5 +1,15 @@
 # Decisions
 
+## Workflow causes prioritize failed steps and diagnostic limit reports
+
+Forward dependencies can put a skipped dependent before the step that actually failed.
+The run therefore names the first failed step in document order, falling back to a skipped
+step only when no step failed. Quota classification uses explicit limit-report phrasing in
+the task error before its displayed tail is shortened, so a traceback cannot hide the report.
+Only an empty error permits classification from the output tail; ordinary quota prose does
+not label an unrelated failure. Displayed causes remain bounded, and errorDetail retains
+the full task error rather than promising stderr for every adapter and failure mode.
+
 ## Pressure admission aliases share validation and cause-neutral refusal advice
 
 The admission threshold accepts the first nonempty `AGENT_RELAY_ADMIT_BELOW` or
