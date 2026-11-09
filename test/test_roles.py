@@ -226,6 +226,21 @@ class RoleRegistryTests(unittest.TestCase):
                     self.load(config, files)
                 self.assertIn(fragment, str(caught.exception))
 
+    def test_readme_worker_roles_load_with_distinct_roles_and_model_arguments(self):
+        with open(os.path.join(os.path.dirname(EXAMPLE_REGISTRY), "..", "README.md"),
+                  encoding="utf-8") as handle:
+            section = handle.read().split("### Worker roles\n", 1)[1]
+        example = json.loads(section.split("```json\n", 1)[1].split("\n```", 1)[0])
+        agents = self.load(example)
+        by_role = {agent["role"]: agent for agent in agents.values()}
+        self.assertEqual(set(by_role), {"reviewer", "implementer"})
+        args = by_role["implementer"]["args"]
+        self.assertNotEqual(args, by_role["reviewer"]["args"])
+        self.assertIn("--model", args)
+        model_index = args.index("--model") + 1
+        self.assertLess(model_index, len(args))
+        self.assertTrue(args[model_index].strip())
+
     def test_the_shipped_example_loads_where_it_is_and_after_a_copy(self):
         """A user or setup.sh copies the example to the per-user config dir, so the copy must load."""
         expected = {a["role"] for a in server.load_registry(EXAMPLE_REGISTRY).values() if a.get("role")}
