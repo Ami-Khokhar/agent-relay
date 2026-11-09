@@ -289,8 +289,9 @@ the softer readings (kernel warning, 12% free, 70% swap, 75% throttled); otherwi
 it, so a missing probe never fails the call.
 
 `admitBelow` is the owner's admission line: the verdict at or above which the relay refuses a new
-workflow, read from `AGENT_RELAY_ADMIT_BELOW` (default `critical`). The refusal and this field
-come from the same reading, so they cannot disagree.
+workflow, read from the first nonempty `AGENT_RELAY_ADMIT_BELOW` or `A2A_RELAY_ADMIT_BELOW`
+(default `critical`). Invalid values stop startup and name the selected variable. The refusal
+and this field come from the same reading, so they cannot disagree.
 
 `guard` says whether the relay stops active runs on its own, at which verdict, and after how long:
 `holdMs` is `A2A_RELAY_PRESSURE_HOLD_MS` (default 30000), the time the verdict must stay
@@ -301,7 +302,8 @@ critical and the readings that decided it.
 
 `POST /v1/workflows` returns `503 device_pressure` with this body while the verdict is at or
 above `admitBelow` (`AGENT_RELAY_ADMIT_BELOW`, default `critical`), and the message names the
-reading that decided it (or the setting itself when an `ok` line refuses a calm host).
+reading that decided it (or the setting itself when an `ok` line refuses a calm host). The
+remedy asks the owner to address those readings and retry; it is not limited to memory.
 `temperatureC` is null unless the owner allowlists an unprivileged reader in
 `AGENT_RELAY_TEMP_READER` (for example `macmon`); `AGENT_RELAY_TEMP_WARN_C` adds a `warn` reason
 at or above that many degrees. `thermal.speedLimitPercent` is null when macOS has recorded no

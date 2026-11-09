@@ -160,8 +160,8 @@ try:
     PRESSURE_HOLD_MS = pressure.guard_hold_ms()
 except ValueError as error:
     _startup_error(str(error))
-# The verdict at or above which a new workflow is refused; read once, at startup, so a bad value
-# stops the relay before any run can be submitted instead of being noticed on the first one.
+# Validate the admission setting at startup so a bad value stops the relay before any run
+# can be submitted; pressure snapshots read the setting again for each sample.
 try:
     pressure.admit_below()
 except ValueError as error:

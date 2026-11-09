@@ -342,6 +342,50 @@ class PressureTests(unittest.TestCase):
         self.assertIn("AGENT_RELAY_ADMIT_BELOW must be one of ok, warn or critical",
                       str(caught.exception))
 
+    def test_admission_alias_is_used_unless_a_nonempty_primary_setting_wins(self):
+        self.set_signal("level", "1")
+        for primary in (None, "", "critical"):
+            with self.subTest(primary=primary):
+                relay = self.start(echo(), env={"AGENT_RELAY_ADMIT_BELOW": primary,
+                                               "A2A_RELAY_ADMIT_BELOW": "warn",
+                                               "AGENT_RELAY_TEMP_READER": None,
+                                               "AGENT_RELAY_TEMP_WARN_C": None})
+                status, reading = relay.request("GET", "/v1/pressure")
+                self.assertEqual(status, 200)
+                self.assertEqual(reading["admitBelow"], primary or "warn")
+                status, body = relay.request("POST", "/v1/workflows", {
+                    "steps": [{"id": "only", "agentId": "echo", "input": "hello"}]})
+                self.assertEqual(status, 202 if primary else 503)
+                if not primary:
+                    self.assertEqual(body["error"], "device_pressure")
+                    self.assertEqual(body["pressure"]["admitBelow"], "warn")
+
+    def test_an_invalid_admission_alias_stops_startup_and_names_the_alias(self):
+        with self.assertRaisesRegex(RuntimeError, "A2A_RELAY_ADMIT_BELOW must be one of ok, warn or critical"):
+            self.start(echo(), env={"AGENT_RELAY_ADMIT_BELOW": None,
+                                   "A2A_RELAY_ADMIT_BELOW": "sometimes"})
+
+    def test_swap_and_temperature_refusals_give_cause_neutral_remedy(self):
+        for cause in ("swap", "temperature"):
+            with self.subTest(cause=cause):
+                self.set_signal("swap", "total = 2048.00M  used = 1536.00M  free = 512.00M  (encrypted)"
+                                if cause == "swap" else SWAP_IDLE)
+                self.set_signal("temp", '{"temp": {"cpu_temp_avg": 76.5}}'
+                                if cause == "temperature" else TEMP_SAMPLE)
+                relay = self.start(echo(), env={"AGENT_RELAY_ADMIT_BELOW": "warn",
+                    "AGENT_RELAY_TEMP_READER": os.path.join(self.stubs, "reader"),
+                    "AGENT_RELAY_TEMP_WARN_C": "75"})
+                status, body = relay.request("POST", "/v1/workflows", {
+                    "steps": [{"id": "only", "agentId": "echo", "input": "never runs"}]})
+                self.assertEqual(status, 503)
+                self.assertEqual(body["error"], "device_pressure")
+                self.assertEqual(body["pressure"]["verdict"], "warn")
+                self.assertIn("swap is 75% used" if cause == "swap" else "CPU temperature is 76.5C",
+                              body["message"])
+                self.assertIn("Address the readings above and retry", body["message"])
+                self.assertIn("GET /v1/pressure", body["message"])
+                self.assertNotIn("Free some memory", body["message"])
+
     # -------------------------------------------------------------- the kill button
 
     def test_kill_stops_the_run_and_a_resume_finishes_only_the_lost_step(self):
