@@ -470,11 +470,12 @@ warning threshold to its systemd unit (`Environment=AGENT_RELAY_TEMP_READER=...`
 restart that service.
 
 With no reader, an invalid command/path, or a reader that does not answer, `temperatureC`
-is null and `temperatureReason` distinguishes absence, configuration errors and no response.
-`AGENT_RELAY_TEMP_WARN_C` (for example `75`) adds a `warn` reason when the temperature reaches it; it must be a finite number or startup refuses the setting by name.
-Like every other warn reason, temperature alone does not stop work. `pmset -g therm`
-reports a throttle only after macOS records one, so a null `speedLimitPercent` means no throttle
-was recorded, not that the reading failed.
+is null and `temperatureReason` distinguishes absence, configuration errors and no
+response. `AGENT_RELAY_TEMP_WARN_C` (for example `75`) adds a `warn` reason when the
+temperature reaches it; it must be a finite number or startup refuses the setting by
+name. Like every other warn reason, temperature alone does not stop work.
+`pmset -g therm` reports a throttle only after macOS records one, so a null
+`speedLimitPercent` means no throttle was recorded, not that the reading failed.
 
 ## Data access and retention
 
