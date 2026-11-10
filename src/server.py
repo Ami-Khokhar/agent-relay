@@ -153,6 +153,11 @@ STATE_DIR = Path(_env("AGENT_RELAY_STATE_DIR", "A2A_RELAY_STATE_DIR")
 PRESSURE_GUARD = pressure.guard_enabled()
 PRESSURE_INTERVAL_MS = _positive_int(5000, "AGENT_RELAY_PRESSURE_INTERVAL_MS",
                                      "A2A_RELAY_PRESSURE_INTERVAL_MS")
+# Validate the optional temperature threshold before serving; snapshots read it per sample.
+try:
+    pressure.temperature_warn_c()
+except ValueError as error:
+    _startup_error(str(error))
 # How long the verdict must stay critical before the guard stops a run; 0 stops at once. Read
 # once, at startup, so a bad value stops the relay before any run starts instead of being
 # noticed in the middle of one.

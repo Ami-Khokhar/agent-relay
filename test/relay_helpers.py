@@ -85,6 +85,9 @@ class Relay:
             probes["AGENT_RELAY_" + name.upper()] = path
         child_env = {**os.environ, "A2A_RELAY_PORT": str(self.port), "A2A_AGENTS_FILE": self.config,
                      "AGENT_RELAY_TOKEN": TOKEN, "AGENT_RELAY_PRESSURE_GUARD": "0", **probes}
+        # A caller must opt into a test reader; never run the developer's configured probe.
+        child_env.pop("AGENT_RELAY_TEMP_READER", None)
+        child_env.pop("AGENT_RELAY_TEMP_WARN_C", None)
         for name, value in (env or {}).items():
             # A None value means unset, so a test can prove what the relay does without it.
             if value is None:

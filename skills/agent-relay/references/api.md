@@ -306,8 +306,11 @@ reading that decided it (or the setting itself when an `ok` line refuses a calm 
 remedy asks the owner to address those readings and retry; it is not limited to memory.
 `temperatureC` is null unless the owner allowlists an unprivileged reader in
 `AGENT_RELAY_TEMP_READER` (for example `macmon`); `AGENT_RELAY_TEMP_WARN_C` adds a `warn` reason
-at or above that many degrees. `thermal.speedLimitPercent` is null when macOS has recorded no
-throttle.
+at or above that many degrees. The threshold must be finite; invalid or non-finite values
+stop startup with a setting-specific error. A configured reader with invalid quoting or a
+non-absolute/non-executable path leaves temperature null with a configuration reason rather
+than the missing-sensor reason. `thermal.speedLimitPercent` is null when macOS has recorded
+no throttle.
 
 ### `POST /v1/pressure/kill`
 

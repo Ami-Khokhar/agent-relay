@@ -128,6 +128,9 @@ class RelayTests(unittest.TestCase):
             ("AGENT_RELAY_TASK_RETENTION_MS", "invalid", "must be a non-negative integer"),
             ("AGENT_RELAY_TASK_RETENTION_MS", "-1", "must be a non-negative integer"),
             ("AGENT_RELAY_PRESSURE_HOLD_MS", "invalid", "must be a non-negative integer"),
+            ("AGENT_RELAY_TEMP_WARN_C", "75C", "must be a finite number"),
+            ("AGENT_RELAY_TEMP_WARN_C", "nan", "must be a finite number"),
+            ("AGENT_RELAY_TEMP_WARN_C", "inf", "must be a finite number"),
             ("AGENT_RELAY_ADMIT_BELOW", "invalid", "must be one of ok, warn or critical"),
             ("AGENT_RELAY_GIT", "relative/git", "must be an absolute path to an executable file"),
         ]

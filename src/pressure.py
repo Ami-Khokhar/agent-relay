@@ -29,6 +29,7 @@ verdict must not read ``ok`` as a measurement.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -137,19 +138,21 @@ def _temperature_reader():
     The owner names it in the relay's own environment, which a task cannot change. The value is
     a command line whose first word is an absolute path to an executable file — for example
     ``/opt/homebrew/bin/macmon pipe -s 1 -i 200`` — and the rest is passed as that program's
-    arguments. Anything else means no reader: a planted tool must not become the program the
-    relay runs.
+    arguments. Invalid configured values raise ValueError so the reading can report the
+    configuration problem without running a planted tool or searching PATH.
     """
     raw = os.environ.get("AGENT_RELAY_TEMP_READER")
     if not raw:
         return None
     try:
         argv = shlex.split(raw)
-    except ValueError:
-        return None
+    except ValueError as error:
+        raise ValueError(
+            "AGENT_RELAY_TEMP_READER has invalid quoting; provide a valid command line") from error
     if not argv or not (os.path.isabs(argv[0]) and os.path.isfile(argv[0])
                         and os.access(argv[0], os.X_OK)):
-        return None
+        raise ValueError(
+            "AGENT_RELAY_TEMP_READER must start with an absolute path to an executable file")
     return argv
 
 
@@ -169,13 +172,27 @@ def _parse_temperature(text):
 
 def _temperature():
     """The CPU temperature in Celsius and the reason it is missing, or (value, None)."""
-    argv = _temperature_reader()
+    try:
+        argv = _temperature_reader()
+    except ValueError as error:
+        return None, str(error)
     if argv is None:
         return None, TEMPERATURE_REASON
     reading = _parse_temperature(_run(argv[0], argv[1:]))
     if reading is None:
         return None, READER_SILENT_REASON
     return reading, None
+
+
+def temperature_warn_c():
+    """The optional finite Celsius warning threshold; invalid settings are errors."""
+    raw = os.environ.get("AGENT_RELAY_TEMP_WARN_C")
+    if not raw:
+        return None
+    value = _as_float(raw)
+    if value is None or not math.isfinite(value):
+        raise ValueError("AGENT_RELAY_TEMP_WARN_C must be a finite number")
+    return value
 
 
 def _now_iso():
@@ -296,7 +313,7 @@ def snapshot():
     speed_limit = _parse_speed_limit(_run(_probe_path("AGENT_RELAY_PMSET", TRUSTED_PMSET),
                                           ["-g", "therm"]))
     temperature, temperature_reason = _temperature()
-    temp_warn_c = _as_float(os.environ.get("AGENT_RELAY_TEMP_WARN_C"))
+    temp_warn_c = temperature_warn_c()
     swap_percent = round(used * 100 / total) if used is not None and total else None
 
     critical, warn = [], []
