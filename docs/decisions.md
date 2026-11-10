@@ -1,5 +1,15 @@
 # Decisions
 
+## Temperature configuration errors stay visible and tests isolate owner probes
+
+A configured but unusable temperature reader reports a setting-specific temperatureReason;
+it is never run via PATH or described as an absent sensor. The optional Celsius warning
+threshold is validated as finite before the relay starts and by the shared snapshot reader,
+so a typo cannot silently disable its warning. Installed services need these settings in
+their own unit/plist environment. Test relay fixtures strip inherited reader/threshold
+settings before applying explicit test overrides; pressure tests also isolate in-process
+settings, so the suite cannot accidentally run an owner's real temperature probe.
+
 ## The example network option declares only its enabling value
 
 The Codex example's default args keep its socket restriction; selecting `network: on` adds

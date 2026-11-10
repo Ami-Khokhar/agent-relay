@@ -59,6 +59,15 @@ def steps_of(workflow):
 
 class PressureTests(unittest.TestCase):
     def setUp(self):
+        temperature_env = {name: os.environ.pop(name, None)
+                           for name in ("AGENT_RELAY_TEMP_READER", "AGENT_RELAY_TEMP_WARN_C")}
+        def restore_temperature_env():
+            for name, value in temperature_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        self.addCleanup(restore_temperature_env)
         self.dir = tempfile.mkdtemp(prefix="a2a-pressure-")
         self.state = tempfile.mkdtemp(prefix="a2a-pressure-state-")
         self.stubs = os.path.join(self.dir, "stubs")
@@ -155,6 +164,44 @@ class PressureTests(unittest.TestCase):
         self.assertIn("powermetrics", body["temperatureReason"])
         self.assertEqual(body["guard"], {"enabled": True, "stopsAt": "critical",
                                          "holdMs": 30000})
+
+    def test_relay_fixture_ignores_inherited_temperature_settings_but_honors_explicit_reader(self):
+        original = dict(os.environ)
+        try:
+            os.environ["AGENT_RELAY_TEMP_READER"] = os.path.join(self.stubs, "reader")
+            os.environ["AGENT_RELAY_TEMP_WARN_C"] = "1"
+            inherited = Relay(echo())
+            self.relays.append(inherited)
+            status, reading = inherited.request("GET", "/v1/pressure")
+            self.assertEqual(status, 200)
+            self.assertIsNone(reading["temperatureC"])
+            self.assertEqual(reading["verdict"], "ok")
+            self.assertEqual(self.probe_calls(), 0, "an inherited reader ran")
+            explicit = self.start(echo(), env={"AGENT_RELAY_TEMP_READER": os.path.join(self.stubs, "reader")})
+            status, reading = explicit.request("GET", "/v1/pressure")
+            self.assertEqual(status, 200)
+            self.assertEqual(reading["temperatureC"], 43.5)
+            self.assertEqual(reading["verdict"], "ok", "the inherited warning threshold leaked")
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+
+    def test_invalid_temperature_reader_reports_configuration_reason_without_running_it(self):
+        nonexec = os.path.join(self.stubs, "not-executable")
+        with open(nonexec, "w", encoding="utf-8") as handle:
+            handle.write("not executable")
+        for raw in ("reader pipe -s 1", os.path.join(self.stubs, "missing"), nonexec, "'", "   "):
+            with self.subTest(reader=raw):
+                relay = self.start(echo(), env={"AGENT_RELAY_TEMP_READER": raw,
+                    "AGENT_RELAY_TEMP_WARN_C": None,
+                    "PATH": self.stubs + os.pathsep + os.environ.get("PATH", "")})
+                status, reading = relay.request("GET", "/v1/pressure")
+                self.assertEqual(status, 200)
+                self.assertIsNone(reading["temperatureC"])
+                self.assertIn("AGENT_RELAY_TEMP_READER", reading["temperatureReason"])
+                self.assertNotIn("powermetrics", reading["temperatureReason"])
+                with open(os.path.join(self.stubs, "calls"), encoding="utf-8") as handle:
+                    self.assertNotRegex(handle.read(), r"(?m)^reader ")
 
     def test_an_allowlisted_reader_reports_temperature_and_absent_it_stays_null(self):
         # macmon reads Apple Silicon's sensors through IOKit without root. The owner names it in
