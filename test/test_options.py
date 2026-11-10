@@ -198,7 +198,7 @@ class ExampleRegistryTests(unittest.TestCase):
         codex = server.load_registry(EXAMPLE_REGISTRY)["codex"]
         self.assertNotIn("sandbox_workspace_write.network_access", " ".join(codex["args"]))
 
-    def test_example_network_option_is_omitted_or_enabled_and_refuses_explicit_off(self):
+    def test_example_network_option_advertises_only_on_runs_default_and_enabled_args_and_refuses_off(self):
         codex = server.load_registry(EXAMPLE_REGISTRY)["codex"]
         # Only the command boundary changes: print argv instead of launching Codex.
         relay = Relay(fake(args=[*PRINT_ARGV, *codex["args"]], options=codex["options"]))
