@@ -13,9 +13,9 @@ verdict can name the number that produced it. CPU temperature in degrees is not 
 without root on Apple Silicon: ``powermetrics`` refuses a non-root caller and macOS exposes
 no SMC sensor node. The owner may allowlist an unprivileged reader — ``macmon`` reads the
 sensors through IOKit without root — by naming it in ``AGENT_RELAY_TEMP_READER``; with no
-reader, or one that does not answer, ``temperatureC`` is null with the reason attached
-rather than guessed. A missing thermal reading from ``pmset`` means the OS has recorded no
-throttle, which is the ordinary state on a cool machine.
+reader, a misconfigured reader, or one that does not answer, ``temperatureC`` is null with a
+reason that distinguishes the cases. A missing thermal reading from ``pmset`` means the OS
+has recorded no throttle, which is the ordinary state on a cool machine.
 
 Which verdicts refuse a new run is the owner's line, not a constant.
 ``AGENT_RELAY_ADMIT_BELOW`` or its ``A2A_RELAY_ADMIT_BELOW`` alias names the level at or above
