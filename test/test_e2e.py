@@ -6,9 +6,12 @@ import os
 import sys
 import time
 import unittest
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from relay_helpers import PYTHON, McpClient, Relay, send_json, start_http_server, stop_http_server
+from relay_helpers import (PYTHON, McpClient, Relay, send_json, start_http_server,
+                           stop_http_server)
 
 
 class EndToEndTests(unittest.TestCase):
@@ -154,6 +157,79 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(cancelled["inputChars"], len(slow_text))
             opted_in = client.call_tool("get_task", {"taskId": task_id, "includeInput": True})
             self.assertEqual(opted_in["structuredContent"]["input"], text)
+        finally:
+            client.close()
+            relay.close()
+
+
+    def test_delegate_that_waited_on_the_submission_does_not_long_poll_a_second_time(self):
+        """A submission that already blocked for its clamped wait answers with waitExpired:
+        delegate returns that at once instead of long-polling the same wait again, so the
+        call costs one wait, not two, and no follow-up GET ?waitMs= is issued."""
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(30)"]},
+                      env={"A2A_RELAY_MAX_WAIT_MS": "500"})
+        seen = []
+
+        def proxy(request):
+            length = int(request.headers.get("content-length", 0))
+            body = request.rfile.read(length) if length else None
+            seen.append((request.command, request.path))
+            headers = {"content-type": "application/json"}
+            auth = request.headers.get("authorization")
+            if auth:
+                headers["authorization"] = auth
+            forwarded = urlrequest.Request(relay.base + request.path, data=body,
+                                           method=request.command, headers=headers)
+            try:
+                with urlrequest.urlopen(forwarded, timeout=15) as response:
+                    send_json(request, response.status,
+                              json.loads(response.read().decode("utf-8") or "null"))
+            except urlerror.HTTPError as exc:
+                send_json(request, exc.code, json.loads(exc.read().decode("utf-8") or "null"))
+
+        server, port = start_http_server(proxy)
+        client = McpClient(f"http://127.0.0.1:{port}")
+        try:
+            started = time.monotonic()
+            result = client.call_tool(
+                "delegate", {"agentId": "slow", "input": "x", "waitMs": 900000}, timeout=15)
+            elapsed = time.monotonic() - started
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertTrue(task["id"])
+            self.assertEqual(task["waitMs"], 500)
+            self.assertIs(task["waitClamped"], True)
+            self.assertIs(task["waitExpired"], True)
+            # One clamped wait of 0.5 s, not the same wait twice.
+            self.assertLess(elapsed, 0.9)
+            self.assertEqual([path for method, path in seen
+                              if method == "GET" and "waitMs=" in path], [])
+            client.call_tool("cancel_task", {"taskId": task["id"]})
+        finally:
+            client.close()
+            relay.close()
+            stop_http_server(server)
+
+    def test_clamped_retry_submission_asks_for_the_wait_in_its_timeout_budget(self):
+        """The retry POST after an invalid_wait refusal carries the clamped wait, so the relay
+        blocks it for that wait: it needs the same budget as the first attempt, not the plain
+        request timeout, or the client gives up mid-wait and the caller sees an ID-less error
+        while the task runs on."""
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(30)"]},
+                      env={"A2A_RELAY_MAX_WAIT_MS": "3000"})
+        # The client socket budget is below the relay's limit, so the blocking retry POST
+        # outlives it unless the retry borrows the wait for its timeout.
+        client = McpClient(relay.base, env={"AGENT_RELAY_HTTP_TIMEOUT_MS": "1500"})
+        try:
+            result = client.call_tool(
+                "delegate", {"agentId": "slow", "input": "x", "waitMs": 900000}, timeout=20)
+            self.assertNotIn("isError", result)
+            task = result["structuredContent"]
+            self.assertTrue(task["id"])
+            self.assertEqual(task["waitMs"], 3000)
+            self.assertIs(task["waitClamped"], True)
+            self.assertIs(task["waitExpired"], True)
+            client.call_tool("cancel_task", {"taskId": task["id"]}, timeout=20)
         finally:
             client.close()
             relay.close()
