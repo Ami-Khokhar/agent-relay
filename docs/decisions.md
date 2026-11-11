@@ -1,5 +1,21 @@
 # Decisions
 
+## prepare-activation proves the checkout against the stage receipt's source commit
+
+`prepare-activation` compared the active checkout's HEAD with the approved
+release's target commit and refused otherwise, so the real public flow could
+never pass its own activation: `activate` requires the checkout at the
+transaction's starting revision — the running relay's commit, which equals the
+checkout the relay was started from — while the target commit exists only in
+the private stage until the swap. The checkout proof now compares against the
+stage receipt's bound `sourceCommit` (and its `sourceRoot`), which is exactly
+what "changed since staging" means, while release drift stays covered by the
+identity-digest comparison. Consequence: an update flows approve → stage →
+prepare → activate with the checkout at the old revision throughout, and a
+checkout mutated between staging and preparation is still refused before any
+drain effect. The integrated acceptance suite
+(`test/test_safe_update_acceptance.py`) fails without this fix.
+
 ## Temperature configuration errors stay visible and tests isolate owner probes
 
 A configured but unusable temperature reader reports a setting-specific temperatureReason;
