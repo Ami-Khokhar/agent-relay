@@ -784,6 +784,17 @@ def _join_all(threads, seconds):
     return not any(thread.is_alive() for thread in threads)
 
 
+def _timeout_error(task, output, error):
+    """The timeout message plus a bounded tail of what the agent last printed.
+
+    The captured streams share one MAX_OUTPUT budget, so the tail cannot outgrow the limit
+    the other paths already apply. An agent that printed nothing keeps the bare message.
+    """
+    message = f"Agent exceeded {task['timeoutMs']} ms"
+    tail = "\n".join(part for part in (output, error) if part)
+    return f"{message}\n{tail}" if tail else message
+
+
 def _collect(proc, threads):
     """Wait a bounded time for the adapter's I/O threads once the adapter has exited.
 
@@ -1062,7 +1073,8 @@ def _run_command(agent, task):
     output = b"".join(out).decode("utf-8", "replace").strip()
     error = b"".join(err).decode("utf-8", "replace").strip()
     if timed_out:
-        _finish(task, "timed_out", error=f"Agent exceeded {task['timeoutMs']} ms")
+        _finish(task, "timed_out", error=_timeout_error(task, output, error),
+                output=output or None, outputTruncated=capture.truncated or None)
     elif proc.returncode == 0:
         _finish(task, "completed", output=output, outputTruncated=capture.truncated)
     else:
@@ -1090,7 +1102,8 @@ def _run_stdio(agent, task):
     stdout = b"".join(out).decode("utf-8", "replace")
     stderr = b"".join(err).decode("utf-8", "replace")
     if timed_out:
-        _finish(task, "timed_out", error=f"Agent exceeded {task['timeoutMs']} ms")
+        _finish(task, "timed_out", error=_timeout_error(task, stdout.strip(), stderr.strip()),
+                output=stdout.strip() or None, outputTruncated=capture.truncated or None)
         return
     if proc.returncode != 0:
         _finish(task, "failed", error=stderr.strip() or f"Adapter exited with {proc.returncode}",
