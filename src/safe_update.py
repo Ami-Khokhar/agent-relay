@@ -297,7 +297,7 @@ def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=No
     if release_identity.identity_digest(stored) != receipt["identityDigest"]:
         raise UpdateError("the stage receipt was written for a different identity than it stores")
     checkout = update_staging.inspect_checkout(resolved, git=update_staging.default_git())
-    if checkout["commit"] != identity["commit"] or checkout["root"] != receipt["sourceRoot"]:
+    if checkout["commit"] != receipt["sourceCommit"] or checkout["root"] != receipt["sourceRoot"]:
         raise UpdateError("the checkout at %s changed since staging; refusing a mixed "
                           "activation" % resolved)
     _consumed_consent(identity, state_dir)   # consent is consumed once, durably, by staging
