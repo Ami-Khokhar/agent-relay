@@ -4,7 +4,8 @@ The HTTP service is the source of truth. MCP tools are a thin proxy over it.
 
 Every `/v1/` route requires `Authorization: Bearer <token>`. The token is
 `AGENT_RELAY_TOKEN`, else the file `~/.config/agent-relay/token` (override with
-`AGENT_RELAY_TOKEN_FILE`), which the relay creates with mode `0600` on first start. Requests
+`AGENT_RELAY_TOKEN_FILE`), which the relay creates with mode `0600` on first start. A request
+without the token gets `401` whose message names that file. Requests
 carrying an `Origin` header are refused unless that origin is listed in
 `AGENT_RELAY_ALLOWED_ORIGINS` (meant for non-browser clients; the relay sends no CORS
 headers). Error responses close the connection. `GET /healthz` needs no token.
@@ -50,6 +51,7 @@ next run is restarted, since an old relay cannot report counts).
 ```json
 { "agents": [
   { "id": "claude", "name": "Claude Code", "description": "...",
+    "model": "glm-5.3-flash", "tags": ["reviewer"],
     "adapter": "command", "timeoutMs": 900000,
     "cwd": "/path/to/project", "allowedRoots": ["/path/to/project"],
     "options": { "effort": ["low", "high"] },
@@ -63,7 +65,11 @@ next run is restarted, since an old relay cannot report counts).
 
 `revision` is the same object as in `GET /healthz`. `timeoutMs` is the effective timeout for that agent. `cancellation` is `process_signal`
 for command/stdio adapters and `request_only` for HTTP. `role` and `roleDescription` appear only
-when the agent names a role in the registry; the instructions themselves are never listed. `cwd`, `allowedRoots`, and
+when the agent names a role in the registry; the instructions themselves are never listed. `model`
+and `tags` appear only when the registry declares them: `model` is the model that worker runs and
+`tags` are its labels, so a caller selects by data rather than by matching `name` prose.
+`GET /v1/agents?tag=<name>` keeps only the agents carrying that tag — an agent must carry every
+tag the query names, and an unknown tag returns an empty list rather than an error. `cwd`, `allowedRoots`, and
 `delegateTo` (the agents its tasks may delegate to) appear only when configured. `options`
 maps each option name the agent declares to its allowed values, and appears only when the agent
 declares options. `readOnly` is `supported` or `unsupported` for every agent: `supported` means
@@ -339,7 +345,7 @@ Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow ste
 | Status | `error` | Meaning |
 | --- | --- | --- |
 | 400 | `invalid_json`, `invalid_request`, `input_required`, `invalid_session_id`, `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`, `unknown_field`, `invalid_options`, `unknown_option`, `invalid_option_value`, `invalid_read_only`, `read_only_unsupported`, `cwd_required`, `invalid_input`, `invalid_wait`, `invalid_after`, `invalid_include_input`, `invalid_status`, `invalid_limit`, `invalid_parent_task_id`, `unknown_parent_task`, `configuration_error`, and the workflow validation codes listed under `POST /v1/workflows` | Malformed request or registry. |
-| 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route. |
+| 401 | `unauthorized` | Missing or wrong `Authorization: Bearer` token on a `/v1/` route; the message names the token file. |
 | 403 | `forbidden`, `origin_not_allowed`, `delegation_not_allowed` | Admin route called from a non-loopback address; request from a browser origin not in `AGENT_RELAY_ALLOWED_ORIGINS`; parent task's agent does not list the target in `delegateTo` (or is no longer registered). |
 | 404 | `unknown_agent`, `unknown_task`, `unknown_workflow`, `not_found` | Missing agent/task/run/route. |
 | 405 | `method_not_allowed` | Known route, wrong method. |
