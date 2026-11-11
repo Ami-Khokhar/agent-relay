@@ -831,7 +831,10 @@ def create_http_handler(base_url=None, timeout=None):
                     payload["waitMs"] = wait_ms
                 clamped = False
                 try:
-                    value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
+                    # The relay now long-polls the submission itself when waitMs is set, so the
+                    # POST can hold for the whole wait, like the follow-up long poll below.
+                    value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload,
+                                           timeout=max(timeout, wait_ms / 1000.0 + 5) if wait_ms else timeout)
                 except RelayError as exc:
                     if not wait_ms:
                         raise

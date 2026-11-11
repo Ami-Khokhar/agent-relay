@@ -88,13 +88,13 @@ class OptionsTests(unittest.TestCase):
 
     def test_accepts_options_read_only_and_waitMs_together_and_refuses_before_a_task_exists(self):
         relay = self.start(fake(options={"effort": EFFORT}, readOnly={"args": ["--ro"]}))
-        status, submitted = relay.submit(agentId="fake", input="go", options={"effort": "high"},
-                                         readOnly=True, waitMs=1000)
-        self.assertEqual(status, 202, submitted)
-        self.assertEqual((submitted["options"], submitted["readOnly"]), ({"effort": "high"}, True))
-        self.assertNotIn("waitMs", submitted)  # validate-only: never stored on the task
-        task = relay.wait_task(submitted["id"])
+        # A valid waitMs long-polls the submission itself, so the answer is the terminal task.
+        status, task = relay.submit(agentId="fake", input="go", options={"effort": "high"},
+                                    readOnly=True, waitMs=1000)
+        self.assertEqual(status, 200, task)
+        self.assertEqual((task["options"], task["readOnly"]), ({"effort": "high"}, True))
         self.assertEqual(task["status"], "completed", task)
+        self.assertNotIn("waitMs", task)  # validate-only: never stored on the task
         stored = relay.request("GET", "/v1/tasks")[1]["tasks"]
         self.assertEqual(len(stored), 1)
         refused = [
