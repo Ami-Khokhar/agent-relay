@@ -25,6 +25,7 @@ except ImportError:
 
 API_URL = "https://api.github.com/repos/Ami-Khokhar/agent-relay/releases?per_page=20"
 RELEASE_URL = "https://github.com/Ami-Khokhar/agent-relay/releases/tag/"
+RELEASES_PAGE_URL = "https://github.com/Ami-Khokhar/agent-relay/releases"
 MAX_RESPONSE = 512 * 1024
 MAX_NOTES = 2000
 MAX_VERSION = 256
