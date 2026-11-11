@@ -1681,7 +1681,9 @@ def _is_valid_wait(value):
 
 
 def _invalid_wait():
-    return {"error": "invalid_wait", "message": f"waitMs must be an integer from 1 to {MAX_WAIT_MS}"}
+    return {"error": "invalid_wait",
+            "message": (f"waitMs must be an integer from 1 to {MAX_WAIT_MS}; "
+                        "GET /v1/tasks/:id?waitMs= waits on an existing task")}
 
 
 def _wait_for_terminal(task_id, wait_ms):
@@ -2289,6 +2291,20 @@ class Handler(BaseHTTPRequestHandler):
         if error:
             return self._json(error, request)
         status, body = _create_task(request)
+        wait_ms = request.get("waitMs")
+        if status == 202 and wait_ms:
+            # _create_task validated the wait before it created the task, so a submission that
+            # reaches here carries a valid one: block on it the way GET /v1/tasks/:id?waitMs=
+            # does, instead of answering queued and leaving the caller to poll.
+            _drain()
+            result = visible(_wait_for_terminal(body["id"], wait_ms))
+            if result["status"] in ("queued", "running"):
+                # Judge the copy, not the live task: it may finish between the wait and this
+                # check, exactly as the long poll on GET does.
+                result.update(waitExpired=True, waitedMs=wait_ms,
+                              hint="The wait expired before the task finished. Call wait_task "
+                                   "again with the same taskId, or repeat this request.")
+            return self._json(200, result)
         self._json(status, body)
         if status == 202:
             _drain()

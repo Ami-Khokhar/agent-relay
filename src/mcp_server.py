@@ -831,7 +831,10 @@ def create_http_handler(base_url=None, timeout=None):
                     payload["waitMs"] = wait_ms
                 clamped = False
                 try:
-                    value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
+                    # The relay now long-polls the submission itself when waitMs is set, so the
+                    # POST can hold for the whole wait, like the follow-up long poll below.
+                    value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload,
+                                           timeout=max(timeout, wait_ms / 1000.0 + 5) if wait_ms else timeout)
                 except RelayError as exc:
                     if not wait_ms:
                         raise
@@ -847,9 +850,15 @@ def create_http_handler(base_url=None, timeout=None):
                             raise
                         wait_ms, clamped = limit, True
                         payload["waitMs"] = limit
-                    # Nothing was created, so the retry cannot duplicate the task, even with a requestId.
-                    value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload, timeout=timeout)
-                if wait_ms and value.get("status") in ("queued", "running"):
+                    # Nothing was created, so the retry cannot duplicate the task, even with a
+                    # requestId. The relay blocks this POST for the clamped wait, so the retry
+                    # needs the same budget the first attempt got, not the plain timeout.
+                    value = _relay_request(base_url, "/v1/tasks", method="POST", body=payload,
+                                           timeout=max(timeout, wait_ms / 1000.0 + 5))
+                # A submission that waited answers with waitExpired when the wait ran out (a
+                # 202 carries none): long-polling again would double the caller's wait budget.
+                if (wait_ms and value.get("status") in ("queued", "running")
+                        and not value.get("waitExpired")):
                     created_id = value["id"]
                     try:
                         value = _relay_request(

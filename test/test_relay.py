@@ -509,8 +509,11 @@ class RelayTests(unittest.TestCase):
             self.assertEqual((status, listed["tasks"]), (200, []))
 
             # The refusals left nothing behind: the same requestId still makes one new task.
+            # A valid waitMs now long-polls the submission itself, so the task comes back
+            # terminal in one call instead of a 202 and a poll.
             status, task = relay.submit(agentId="quick", input="x", requestId="r-1", waitMs=2000)
-            self.assertEqual(status, 202)
+            self.assertEqual(status, 200)
+            self.assertEqual(task["status"], "completed")
             status, replay = relay.submit(agentId="quick", input="x", requestId="r-1", waitMs=2000)
             self.assertEqual((status, replay["id"]), (200, task["id"]))
             status, listed = relay.request("GET", "/v1/tasks")
@@ -523,7 +526,7 @@ class RelayTests(unittest.TestCase):
         relay = Relay({"id": "quick", "command": PYTHON, "args": ["-c", "print('done')"]},
                       env={"A2A_RELAY_MAX_WAIT_MS": "2000"})
         try:
-            status, task = relay.submit(agentId="quick", input="x", requestId="r-1", waitMs=2000)
+            status, task = relay.submit(agentId="quick", input="x", requestId="r-1")
             self.assertEqual(status, 202)
             # The wait is advisory and never stored, so a replay that repeats every stored field
             # answers with the stored task even when its wait alone would be refused for one.
