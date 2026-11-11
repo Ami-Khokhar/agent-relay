@@ -48,6 +48,7 @@ for arg in "$@"; do
 done
 
 if [ "$UNINSTALL" = "1" ]; then
+  rm -f "$HOME/.local/bin/agent-relay"
   if [ "$(uname -s)" = "Darwin" ]; then
     PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
     launchctl unload "$PLIST" 2>/dev/null || true
@@ -175,6 +176,20 @@ UNIT_EOF
   systemctl --user enable --now agent-relay.service
   echo "installed and started $UNIT"
   echo "log: journalctl --user -u agent-relay -f"
+fi
+
+# The agent-relay command sits in the per-user bin directory the login shell
+# PATH usually contains, so the docs' commands work without an absolute path.
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
+if [ -f "$TARGET_DIR/src/cli.py" ]; then
+  printf '#!/bin/sh\nexec %q %q "$@"\n' "$PYTHON" "$TARGET_DIR/src/cli.py" \
+    > "$BIN_DIR/agent-relay"
+  chmod +x "$BIN_DIR/agent-relay"
+  echo "command installed: $BIN_DIR/agent-relay (run 'agent-relay info' for the"
+  echo "relay URL, artifact page, token path and checkout in use)"
+else
+  echo "warning: $TARGET_DIR/src/cli.py not found; no agent-relay command installed" >&2
 fi
 
 echo "verify: curl -sS http://127.0.0.1:$PORT/healthz"
