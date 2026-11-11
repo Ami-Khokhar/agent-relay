@@ -78,6 +78,34 @@ Run `python3 src/release_discovery.py` to compare the installed version with pub
 
 `python3 src/safe_update.py approve 1.2.3` requires a real interactive terminal and asks you to type the exact version and the full 40-character commit. On a match it records a private device-local consent file (mode 0600, owned by you, under a lock file, bound to the canonical installation realpath, a locally generated device id, the full identity digest, a fresh nonce, and a 15-minute expiry). `python3 src/safe_update.py consume 1.2.3` validates that record — rejecting expired, future, replayed, mutated, wrong-device or changed-path consent — and burns it. Nothing is installed, activated or restarted by any safe-update command; the manifest digest authenticates content only because canonical GitHub maintainers publish it over HTTPS, not through a separate signature. Later stages of the update work will consume the consent through the same CLI.
 
+## Reviewable artifacts
+
+A second small service lets an agent publish an HTML page, and lets you comment on it
+by clicking elements in the browser. Comments come back to the agent as JSON, or as a
+blocking `wait`, and old comments stay attached to the version they were written on.
+Any agent can use it; nothing needs to be registered.
+
+```bash
+python3 src/artifact_cli.py publish report.html --title "Q4 review"
+python3 src/artifact_cli.py inbox quarterly-review --wait 900 --json
+```
+
+Sessions attach to an artifact and outlive their own process, so a later session,
+in a different agent, can rejoin the same page and pick up the comments:
+
+```bash
+python3 src/artifact_cli.py attach quarterly-review --as @codex
+python3 src/artifact_cli.py map            # artifacts, sessions, who is active
+```
+
+Comments can be addressed with `@codex` and only that agent's inbox receives them.
+It ships in two builds with one API: a Rust binary (`cargo build --release
+--manifest-path rust/Cargo.toml`, then `rust/target/release/artifactd serve`) and the
+original Python one. It listens on `http://127.0.0.1:43126`, serves artifact HTML from
+the next port up so an artifact cannot reach the API, and starts on demand. State lives in
+`~/.local/state/agent-relay/artifacts`. The routing rules, the HTTP API, and the
+snippet to paste into an `AGENTS.md` are in [docs/artifacts.md](docs/artifacts.md).
+
 ## Register an agent
 
 The relay reads, in order: `A2A_AGENTS_FILE` (or `AGENT_RELAY_AGENTS_FILE`) when set, then `~/.config/agent-relay/agents.json` when it exists, then `config/agents.json` in the checkout. Copy `config/agents.example.json`, edit it, and reload (see below). Use a `stdio` or `http` adapter for harness-independent integration. A `command` adapter remains available as a convenience for CLIs that accept a prompt as their final argument and print the result.
