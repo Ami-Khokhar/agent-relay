@@ -369,6 +369,29 @@ def load_token():
     return value
 
 
+def token_location():
+    """Where the relay reads its API token from, as a 401 message can print it.
+
+    The default path appears in its documented ``~`` form beside the absolute path the relay
+    opened, so a caller can recognise it either way; a configured file names the default too.
+    """
+    path = token_path()
+    default = Path.home() / ".config" / "agent-relay" / "token"
+    if path == default:
+        return f"~/.config/agent-relay/token ({path})"
+    return f"{path} (default ~/.config/agent-relay/token)"
+
+
+def unauthorized_message():
+    """The message of the 401 a caller gets without the bearer token.
+
+    A bare refusal sends a tool hunting through the config directory for a credential it
+    cannot name, so the reply says where the relay takes the token from.
+    """
+    return ("send Authorization: Bearer <token>; the relay takes it from AGENT_RELAY_TOKEN, "
+            f"else the token file {token_location()}")
+
+
 def is_loopback(host):
     if host == "localhost":
         return True
@@ -570,6 +593,15 @@ def load_registry(path):
         if delegate_to is not None and (not isinstance(delegate_to, list) or not all(
                 isinstance(item, str) for item in delegate_to)):
             raise ValueError(f"Invalid delegateTo: {agent_id}")
+        # Discovery metadata: the listing returns it, no execution path reads it.
+        model = raw.get("model")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            raise ValueError(f"Invalid model: agent {agent_id}: model must be a non-empty string")
+        tags = raw.get("tags")
+        if tags is not None and (not isinstance(tags, list) or not all(
+                isinstance(item, str) and item for item in tags)):
+            raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
+                             "non-empty strings")
         role = raw.get("role")
         if role is not None:
             if not isinstance(role, str):
@@ -782,6 +814,17 @@ def _join_all(threads, seconds):
     for thread in threads:
         thread.join(max(0.0, deadline - time.monotonic()))
     return not any(thread.is_alive() for thread in threads)
+
+
+def _timeout_error(task, output, error):
+    """The timeout message plus a bounded tail of what the agent last printed.
+
+    The captured streams share one MAX_OUTPUT budget, so the tail cannot outgrow the limit
+    the other paths already apply. An agent that printed nothing keeps the bare message.
+    """
+    message = f"Agent exceeded {task['timeoutMs']} ms"
+    tail = "\n".join(part for part in (output, error) if part)
+    return f"{message}\n{tail}" if tail else message
 
 
 def _collect(proc, threads):
@@ -1062,7 +1105,8 @@ def _run_command(agent, task):
     output = b"".join(out).decode("utf-8", "replace").strip()
     error = b"".join(err).decode("utf-8", "replace").strip()
     if timed_out:
-        _finish(task, "timed_out", error=f"Agent exceeded {task['timeoutMs']} ms")
+        _finish(task, "timed_out", error=_timeout_error(task, output, error),
+                output=output or None, outputTruncated=capture.truncated or None)
     elif proc.returncode == 0:
         _finish(task, "completed", output=output, outputTruncated=capture.truncated)
     else:
@@ -1090,7 +1134,8 @@ def _run_stdio(agent, task):
     stdout = b"".join(out).decode("utf-8", "replace")
     stderr = b"".join(err).decode("utf-8", "replace")
     if timed_out:
-        _finish(task, "timed_out", error=f"Agent exceeded {task['timeoutMs']} ms")
+        _finish(task, "timed_out", error=_timeout_error(task, stdout.strip(), stderr.strip()),
+                output=stdout.strip() or None, outputTruncated=capture.truncated or None)
         return
     if proc.returncode != 0:
         _finish(task, "failed", error=stderr.strip() or f"Adapter exited with {proc.returncode}",
@@ -1549,9 +1594,17 @@ def _limits():
     }
 
 
-def _agent_listing():
+def _agent_listing(tags=None):
+    """The agents GET /v1/agents reports.
+
+    ``tags`` (the names a ``?tag=`` query carried) keeps only the agents that declare every
+    one of them, so an unknown tag is an empty list rather than an error. ``model`` and
+    ``tags`` are discovery metadata: they appear only when the registry declares them.
+    """
     listing = []
     for agent in AGENTS.values():
+        if tags is not None and not set(tags) <= set(agent.get("tags") or ()):
+            continue
         entry = {
             "id": agent["id"],
             "name": agent.get("name") or agent["id"],
@@ -1564,6 +1617,10 @@ def _agent_listing():
         }
         if agent.get("description") is not None:
             entry["description"] = agent["description"]
+        if agent.get("model") is not None:
+            entry["model"] = agent["model"]
+        if agent.get("tags") is not None:
+            entry["tags"] = list(agent["tags"])
         if agent.get("cwd") is not None:
             entry["cwd"] = agent["cwd"]
         if agent.get("allowedRoots") is not None:
@@ -2093,7 +2150,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/v1/") and not self._authorized():
                 self.close_connection = True
                 return self._json(401, {"error": "unauthorized",
-                                        "message": "send Authorization: Bearer <token>"},
+                                        "message": unauthorized_message()},
                                   headers={"www-authenticate": "Bearer"})
             if path.startswith("/v1/"):
                 with LOCK:
@@ -2112,7 +2169,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/agents":
                 if method == "GET":
-                    return self._json(200, {"agents": _agent_listing(), "revision": REVISION})
+                    # Re-read the query with blank values kept, so "?tag=" names a tag no
+                    # agent can carry instead of silently dropping the filter.
+                    tags = parse_qs(parsed.query, keep_blank_values=True).get("tag")
+                    return self._json(200, {"agents": _agent_listing(tags),
+                                            "revision": REVISION})
                 return self._json(405, {"error": "method_not_allowed"})
             if path == "/v1/tasks":
                 if method == "POST":

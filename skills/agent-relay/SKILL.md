@@ -119,6 +119,12 @@ Per-agent optional fields:
 - `env` / `inheritEnv` — extra child environment, or names of relay env vars to pass
   through (for example a credential).
 - `description` — free text shown by `GET /v1/agents`.
+- `model` — the model this worker runs (for example `glm-5.3-flash`), returned by
+  `GET /v1/agents`, so a caller picks a worker by data instead of matching `name` prose.
+  Omit it and the listing omits the key.
+- `tags` — labels for this worker (for example `["reviewer"]`), returned by
+  `GET /v1/agents`; `GET /v1/agents?tag=reviewer` lists only the agents carrying that tag,
+  and an unknown tag returns an empty list. Omit it and the listing omits the key.
 - `delegateTo` — agent IDs this agent's tasks may delegate to; `[]` forbids delegation. Omit
   to allow any registered agent.
 - `options` — named per-task options, each value mapped to fixed args, for example
@@ -215,8 +221,9 @@ curl -sS -H "authorization: Bearer $(cat ~/.config/agent-relay/token)" http://12
 bash scripts/smoke.sh <agentId>   # submits "Reply with exactly PONG" and prints the result
 ```
 
-`/v1/agents` lists your entries with `adapter`, effective `timeoutMs`, and `capabilities`.
-`/healthz`, `/v1/agents`, and the `list_agents` tool also report `revision`: the commit
+`/v1/agents` lists your entries with `adapter`, effective `timeoutMs`, and `capabilities`, plus
+`model` and `tags` when you declare them; `?tag=<name>` keeps only the agents carrying that tag
+(an unknown tag returns an empty list). `/healthz`, `/v1/agents`, and the `list_agents` tool also report `revision`: the commit
 (`commit`, `short`) and commit `date` of the checkout the relay started from. A `date` weeks
 old means the running relay is stale: run `scripts/update.sh`. `/healthz` also reports
 `update`, the last `scripts/update.sh` attempt for this checkout (`outcome`, `from`, `to`,

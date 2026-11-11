@@ -106,6 +106,8 @@ Per-agent fields:
 | `allowedRoots` | Directories a caller may select with a per-task `cwd`. A per-task `cwd` outside every root is rejected with `400 cwd_not_allowed`. |
 | `env` / `inheritEnv` | Extra environment for the child, or names of relay variables to pass through. |
 | `description` | Free text shown by `GET /v1/agents`. |
+| `model` | The model this worker runs (for example `glm-5.3-flash`), returned by `GET /v1/agents` so a caller selects by data instead of substring-matching the `name` prose. Omit it and the listing omits the key. |
+| `tags` | Labels for this worker (for example `["reviewer"]`), returned by `GET /v1/agents`. `GET /v1/agents?tag=reviewer` lists only the agents that carry that tag, and an unknown tag returns an empty list rather than an error. Omit it and the listing omits the key. |
 | `url` | Endpoint of an `http` adapter. It receives the full prompt; use `https://` for any non-loopback host. |
 | `allowInsecureHttp` | Set `true` to allow a cleartext `http://` `url` on a non-loopback host; otherwise the registry is rejected. |
 | `delegateTo` | Agent IDs this agent's tasks may delegate to; `[]` forbids delegation. See [Recursive delegation](#recursive-delegation). |
@@ -325,11 +327,30 @@ task prompts, outputs, paths, environment values, and IDs by default. Credential
 and control or bidirectional characters in free text are refused, but that check cannot guarantee
 arbitrary prose is private. A report does not authorize repairs or updates.
 
+## Authentication
+
+Every `/v1/` route — listing agents, submitting, reading and cancelling tasks, reloading the registry — requires `Authorization: Bearer <token>`; `/healthz` needs none. The relay takes the token from `AGENT_RELAY_TOKEN`, else from the file named by `AGENT_RELAY_TOKEN_FILE` (default `~/.config/agent-relay/token`), which it creates with mode `0600` on first start. The MCP interface and `scripts/smoke.sh` read that same file or variable, so a client that starts through MCP needs no separate setup.
+
+```bash
+AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
+curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/agents
+```
+
+A request without the token is refused with `401` whose message names that file, so a tool that fails authentication is pointed at the credential instead of having to find it by listing the config directory:
+
+```bash
+$ curl -s http://127.0.0.1:43124/v1/agents
+{"error":"unauthorized","message":"send Authorization: Bearer <token>; the relay takes it from AGENT_RELAY_TOKEN, else the token file ~/.config/agent-relay/token (/Users/you/.config/agent-relay/token)"}
+```
+
+The relay reads the token once at startup, so restart it after rotating. Who may hold the token and what holding it grants is in [Local security model](#local-security-model).
+
 ## Submit and inspect work
 
 ```bash
 AUTH="authorization: Bearer $(cat ~/.config/agent-relay/token)"
 curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/agents
+curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/agents?tag=reviewer'
 curl -sS -H "$AUTH" http://127.0.0.1:43124/v1/tasks \
   -H 'content-type: application/json' \
   -d '{"agentId":"codex","requestId":"review-2026-09-23-1","input":"Inspect this project and report the main risks","cwd":"/path/to/git/project"}'
@@ -338,6 +359,8 @@ curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/tasks/TASK_ID?waitMs=600000'
 curl -sS -H "$AUTH" 'http://127.0.0.1:43124/v1/tasks/TASK_ID?includeInput=true'
 curl -sS -H "$AUTH" -X DELETE http://127.0.0.1:43124/v1/tasks/TASK_ID
 ```
+
+Each `GET /v1/agents` entry carries `model` and `tags` when the registry declares them, and `?tag=<name>` keeps only the agents carrying that tag — an unknown tag returns an empty list, not an error — so a caller picks a worker by query instead of substring-matching the `name` prose (see [Register an agent](#register-an-agent)).
 
 Add `"options": {"<name>": "<value>"}` to choose among the options the agent declares (see [Per-task options](#per-task-options)), and `"readOnly": true` to require a run that cannot change files (see [Read-only tasks](#read-only-tasks)). Submission returns `202` with a task ID and session ID. Poll the task URL for `queued`, `running`, `completed`, `failed`, `timed_out`, or `cancelled`. `GET /v1/tasks/TASK_ID?waitMs=<ms>` long-polls until the task is terminal or the wait elapses. A `waitMs` that is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS` (default 600000) returns `400 invalid_wait`, and its message names that range. If the wait elapses while the task is still `queued` or `running`, the `200` response carries `waitExpired: true`, `waitedMs` (the wait that elapsed), and a `hint` to wait again; a terminal task carries none of these. `POST /v1/tasks` also accepts `waitMs` and checks it the same way before it creates the task, so a refused wait on a new submission leaves no task behind. The check sits after the idempotent-replay decision: a `requestId` that matches a stored task with identical fields replays it (and never duplicates the work), so the replay ignores an invalid `waitMs` — the wait is advisory and never stored — while a replay with changed fields still returns `409`. The MCP `wait_task` tool clamps a `maxWaitMs` above the relay's limit to that limit (read from `/healthz` `limits.maxWaitMs`) and adds `waitMs` and `waitClamped: true` to the result; the MCP `delegate` tool does the same for `waitMs`, retrying once with the limit, and clamps the follow-up long poll the same way when that poll's wait is refused and `/healthz` reports a usable limit — including after a `requestId` replay returns `200` without re-checking the wait. If the submission created the task but `delegate`'s follow-up long poll then fails with no clamp available — a relay that refuses that wait while its `/healthz` reports no usable limit, an unreachable `/healthz`, or a transport error — `delegate` returns the created task with `waitFailed: true` and a `waitError` naming the failure and pointing at `wait_task` with the same `taskId`; it never resubmits after a successful submission. Claude Code moves an MCP call that runs longer than 120 s to the background, so with it use a `maxWaitMs` of about 110000 or less and call `wait_task` again while `waitExpired` is true. `GET /v1/tasks?sessionId=...&status=...&limit=...` lists stored tasks (most recent first). Supply a unique `requestId` and reuse it when retrying a submission; the relay returns the original task instead of starting duplicate work. Reusing it with different task fields returns `409`. Without a request ID, callers must not automatically retry a submission whose response was lost. The session ID currently groups work for the caller; generic command adapters do not continue native agent conversations.
 

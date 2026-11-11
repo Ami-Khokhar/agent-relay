@@ -41,7 +41,51 @@ class RelayTests(unittest.TestCase):
         relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", "import time; time.sleep(10)"]},
                       env={"A2A_RELAY_TIMEOUT_MS": "50"})
         try:
-            self.assertEqual(relay.run_task(agentId="slow", input="wait")["status"], "timed_out")
+            task = relay.run_task(agentId="slow", input="wait")
+            self.assertEqual(task["status"], "timed_out")
+            self.assertEqual(task["error"], "Agent exceeded 50 ms")
+        finally:
+            relay.close()
+
+    def test_a_timed_out_command_task_keeps_the_last_words_it_printed(self):
+        relay = Relay({"id": "slow", "command": PYTHON,
+                       "args": ["-c", "import sys, time; print('hello', flush=True); sys.stderr.write('boom\\n'); time.sleep(10)"]},
+                      env={"A2A_RELAY_TIMEOUT_MS": "300"})
+        try:
+            task = relay.run_task(agentId="slow", input="wait")
+            self.assertEqual(task["status"], "timed_out")
+            self.assertEqual(task["error"], "Agent exceeded 300 ms\nhello\nboom")
+            self.assertEqual(task["output"], "hello")
+        finally:
+            relay.close()
+
+    def test_a_timed_out_stdio_task_keeps_the_last_words_it_printed(self):
+        script = ("import sys, time\n"
+                  "print('hello', flush=True)\n"
+                  "sys.stderr.write('boom\\n')\n"
+                  "sys.stderr.flush()\n"
+                  "time.sleep(10)\n")
+        relay = Relay({"id": "slow", "type": "stdio", "command": PYTHON, "args": ["-c", script]},
+                      env={"A2A_RELAY_TIMEOUT_MS": "300"})
+        try:
+            task = relay.run_task(agentId="slow", input="wait")
+            self.assertEqual(task["status"], "timed_out")
+            self.assertEqual(task["error"], "Agent exceeded 300 ms\nhello\nboom")
+            self.assertEqual(task["output"], "hello")
+        finally:
+            relay.close()
+
+    def test_a_timed_out_task_that_prints_past_the_cap_is_truncated_under_the_limit(self):
+        relay = Relay({"id": "slow", "command": PYTHON,
+                       "args": ["-c", "import sys, time; sys.stdout.write('x' * 100); sys.stdout.flush(); time.sleep(10)"]},
+                      env={"A2A_RELAY_TIMEOUT_MS": "300", "A2A_RELAY_MAX_OUTPUT_BYTES": "32"})
+        try:
+            task = relay.run_task(agentId="slow", input="wait")
+            self.assertEqual(task["status"], "timed_out")
+            self.assertEqual(len(task["output"].encode("utf-8")), 32)
+            self.assertTrue(task["outputTruncated"])
+            self.assertLessEqual(len(task["error"].encode("utf-8")),
+                                 len("Agent exceeded 300 ms\n") + 32)
         finally:
             relay.close()
 

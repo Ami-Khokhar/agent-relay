@@ -285,7 +285,7 @@ TOOLS = [
     },
     {
         "name": "list_agents",
-        "description": "List the agents registered with the relay, with their adapter, capabilities, timeout, the per-task options each one allows (option names and allowed values), the role it carries (`role` and `roleDescription`, so a worker can be chosen by the job it does), and whether it supports readOnly tasks. Call this first to get valid agentId values. The result also has `revision`: the commit (`commit`, `short`) and commit date (`date`) the relay runs, each \"unknown\" when the relay cannot read its checkout. A `date` weeks old means the install is stale; `revision` is absent on a relay that predates this field.",
+        "description": "List the agents registered with the relay, with their adapter, capabilities, timeout, the per-task options each one allows (option names and allowed values), the role it carries (`role` and `roleDescription`, so a worker can be chosen by the job it does), the model and tags it declares (`model` and `tags`, present only when the registry sets them, so a worker can be chosen by data), and whether it supports readOnly tasks. Call this first to get valid agentId values. The result also has `revision`: the commit (`commit`, `short`) and commit date (`date`) the relay runs, each \"unknown\" when the relay cannot read its checkout. A `date` weeks old means the install is stale; `revision` is absent on a relay that predates this field.",
         "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
