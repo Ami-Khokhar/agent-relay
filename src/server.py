@@ -2431,7 +2431,13 @@ class Handler(BaseHTTPRequestHandler):
             # reaches here carries a valid one: block on it the way GET /v1/tasks/:id?waitMs=
             # does, instead of answering queued and leaving the caller to poll.
             _drain()
-            result = visible(_wait_for_terminal(body["id"], wait_ms))
+            task = _wait_for_terminal(body["id"], wait_ms)
+            if task is None:
+                # The store drops terminal tasks once retention expires or a submission needs the
+                # room, so a wait can outlive the record it waited on. Answer as GET /v1/tasks/:id
+                # does instead of building a copy of a task that is gone.
+                return self._json(404, {"error": "unknown_task"})
+            result = visible(task)
             if result["status"] in ("queued", "running"):
                 # Judge the copy, not the live task: it may finish between the wait and this
                 # check, exactly as the long poll on GET does.
