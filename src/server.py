@@ -2287,11 +2287,11 @@ class Handler(BaseHTTPRequestHandler):
             supplied.strip().encode("utf-8"), TOKEN.encode("utf-8"))
 
     def _submit(self):
-        error, request = self._read_json_body()
+        error, payload = self._read_json_body()
         if error:
-            return self._json(error, request)
-        status, body = _create_task(request)
-        wait_ms = request.get("waitMs")
+            return self._json(error, payload)
+        status, body = _create_task(payload)
+        wait_ms = payload.get("waitMs")
         if status == 202 and wait_ms:
             # _create_task validated the wait before it created the task, so a submission that
             # reaches here carries a valid one: block on it the way GET /v1/tasks/:id?waitMs=
