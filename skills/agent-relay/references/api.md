@@ -67,7 +67,9 @@ next run is restarted, since an old relay cannot report counts).
 for command/stdio adapters and `request_only` for HTTP. `role` and `roleDescription` appear only
 when the agent names a role in the registry; the instructions themselves are never listed. `model`
 and `tags` appear only when the registry declares them: `model` is the model that worker runs and
-`tags` are its labels, so a caller selects by data rather than by matching `name` prose.
+`tags` are its labels, so a caller selects by data rather than by matching `name` prose. Both must be
+non-blank strings, and both are stored trimmed, so the listing shows the value that was validated (which
+is why `?tag=%20reviewer` matches nothing).
 `GET /v1/agents?tag=<name>` keeps only the agents carrying that tag — an agent must carry every
 tag the query names, and an unknown tag returns an empty list rather than an error. `cwd`, `allowedRoots`, and
 `delegateTo` (the agents its tasks may delegate to) appear only when configured. `options`

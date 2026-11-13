@@ -110,8 +110,8 @@ Per-agent fields:
 | `allowedRoots` | Directories a caller may select with a per-task `cwd`. A per-task `cwd` outside every root is rejected with `400 cwd_not_allowed`. |
 | `env` / `inheritEnv` | Extra environment for the child, or names of relay variables to pass through. |
 | `description` | Free text shown by `GET /v1/agents`. |
-| `model` | The model this worker runs (for example `glm-5.3-flash`), returned by `GET /v1/agents` so a caller selects by data instead of substring-matching the `name` prose. Omit it and the listing omits the key. |
-| `tags` | Labels for this worker (for example `["reviewer"]`), returned by `GET /v1/agents`. `GET /v1/agents?tag=reviewer` lists only the agents that carry that tag, and an unknown tag returns an empty list rather than an error. Omit it and the listing omits the key. |
+| `model` | The model this worker runs (for example `glm-5.3-flash`), returned by `GET /v1/agents` so a caller selects by data instead of substring-matching the `name` prose. Must be a non-blank string; it is stored trimmed, so the listing shows the value that was validated. Omit it and the listing omits the key. |
+| `tags` | Labels for this worker (for example `["reviewer"]`), returned by `GET /v1/agents`. Each tag must be a non-blank string, and tags are stored trimmed, so the listing shows the values that were validated — which is why `?tag=%20reviewer` matches nothing. `GET /v1/agents?tag=reviewer` lists only the agents that carry that tag, and an unknown tag returns an empty list rather than an error. Omit it and the listing omits the key. |
 | `url` | Endpoint of an `http` adapter. It receives the full prompt; use `https://` for any non-loopback host. |
 | `allowInsecureHttp` | Set `true` to allow a cleartext `http://` `url` on a non-loopback host; otherwise the registry is rejected. |
 | `delegateTo` | Agent IDs this agent's tasks may delegate to; `[]` forbids delegation. See [Recursive delegation](#recursive-delegation). |
