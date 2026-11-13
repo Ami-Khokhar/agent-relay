@@ -316,12 +316,6 @@ def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=No
         # running relay on any other commit leaves a journaled transaction that
         # can only be refused later, holding admission for nothing.
         note = _release_drain_after_failure(base_url, transaction_id, token, acquired)
-        if not isinstance(drained, str) or not update_drain.COMMIT_RE.fullmatch(drained):
-            raise UpdateError(
-                "the running relay names no exact revision (%r), so it cannot be the "
-                "checkout %s activation would return to; restart the relay from that "
-                "checkout, then prepare again; %s"
-                % (drained, receipt["sourceCommit"], note))
         raise UpdateError(
             "the running relay is at %s, not the staged checkout %s; the drain was "
             "acquired on a revision activation cannot return to. Restart the relay from "
