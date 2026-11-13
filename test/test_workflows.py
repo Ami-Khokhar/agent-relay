@@ -378,6 +378,9 @@ class WorkflowTests(unittest.TestCase):
         listed = listing["workflows"][0]["steps"][0]
         self.assertNotIn("errorDetail", listed)
         self.assertNotIn("output", listed)
+        # attemptTimes is a run-view field: the list view leaves it out, the run view has it.
+        self.assertNotIn("attemptTimes", listed)
+        self.assertIn("attemptTimes", step)
 
     # -------------------------------------------------------- summary and step views
 
@@ -570,6 +573,31 @@ class WorkflowTests(unittest.TestCase):
         error = steps_of(workflow)["only"]["error"]
         self.assertTrue(error.startswith("read_only_unsupported: "), error)
         self.assertIn("no readOnly profile", error)
+
+    def test_a_rejected_attempt_is_timed_while_a_skipped_step_keeps_null_timestamps(self):
+        # The documented contract: startedAt marks the attempt the relay began, so a step
+        # that failed before submitting a task still carries a window while attempts and
+        # attemptTimes stay empty; a step that never started keeps both null.
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "only", "agentId": "echo", "input": "go", "readOnly": True},
+            {"id": "after", "agentId": "echo", "needs": ["only"], "input": "never"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        steps = steps_of(workflow)
+        rejected = steps["only"]
+        self.assertEqual(rejected["status"], "failed")
+        self.assertIsNotNone(rejected["startedAt"])
+        self.assertIsNotNone(rejected["finishedAt"])
+        self.assertLessEqual(rejected["startedAt"], rejected["finishedAt"])
+        self.assertEqual(rejected["attempts"], 0)
+        self.assertEqual(rejected["attemptTimes"], [])
+        skipped = steps["after"]
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertIsNone(skipped["startedAt"])
+        self.assertIsNone(skipped["finishedAt"])
+        self.assertEqual(skipped["attempts"], 0)
+        self.assertEqual(skipped["attemptTimes"], [])
 
     # --------------------------------------------------------------------- loops
 
@@ -1055,6 +1083,41 @@ class WorkflowTests(unittest.TestCase):
             "requestId": "keep-1", "steps": [{"id": "a", "agentId": "echo", "input": "three"}]})
         self.assertEqual(status, 202)
         self.assertNotEqual(again["id"], first["id"])
+
+    def test_refuses_a_new_run_when_a_full_store_holds_no_finished_run(self):
+        # The eviction above always has a terminal run to drop; the 503 needs the other full
+        # store. A run held open by its agent, not by a sleep, makes "still unfinished" an
+        # observed fact: the only way it can end is this test writing the release file.
+        release = self.path("release-capacity-run")
+        hold = ("import os, pathlib, time\n"
+                "while not pathlib.Path(os.environ['WF_RELEASE']).exists(): time.sleep(0.01)\n"
+                "print('released')\n")
+        relay = self.start({"id": "hold", "command": PYTHON, "args": ["-c", hold],
+                            "env": {"WF_RELEASE": release}},
+                           env={"AGENT_RELAY_MAX_WORKFLOWS": "1"})
+        status, held = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "only", "agentId": "hold", "input": "hold the slot"}]})
+        self.assertEqual(status, 202, held)
+        _, current = relay.request("GET", f"/v1/workflows/{held['id']}")
+        self.assertNotIn(current["status"], TERMINAL)
+
+        status, body = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "only", "agentId": "hold", "input": "no room"}]})
+        self.assertEqual(status, 503, body)
+        self.assertEqual(body["error"], "workflow_capacity_reached")
+        # The refusal left the store alone: the held run is still the only one.
+        _, listing = relay.request("GET", "/v1/workflows")
+        self.assertEqual([workflow["id"] for workflow in listing["workflows"]], [held["id"]])
+
+        with open(release, "w", encoding="utf-8") as handle:
+            handle.write("finish")
+        self.assertEqual(wait(relay, held["id"])["status"], "completed")
+        # With the run finished, the same full store now makes room and admits new work.
+        status, accepted = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "only", "agentId": "hold", "input": "room again"}]})
+        self.assertEqual(status, 202, accepted)
+        self.assertNotEqual(accepted["id"], held["id"])
+        self.assertEqual(wait(relay, accepted["id"])["status"], "completed")
 
     def test_refuses_more_steps_than_the_limit(self):
         relay = self.start(echo(), env={"AGENT_RELAY_MAX_STEPS": "2"})
