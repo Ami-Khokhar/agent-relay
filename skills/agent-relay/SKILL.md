@@ -149,7 +149,7 @@ Per-agent optional fields:
 
 Codex note: `codex exec` fails outside a git repo without `--skip-git-repo-check`, and it
 runs read-only unless `-s workspace-write` is added. Both flags are shown above (checked
-against codex-cli 0.155.1).
+against codex-cli 0.162.1).
 
 **Security:** command/stdio agents inherit only basic env vars (`PATH`, `HOME`, `USER`,
 `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, Windows equivalents). To pass a credential, list its
@@ -370,8 +370,10 @@ and `refs`, as a bare repository has) exists at or above the `cwd` and git canno
 metadata is (missing, slower than five seconds or the task's remaining time, non-zero exit,
 unusable output), the task ends `failed` with an error that starts `read_only_git_unknown:` and
 does not run. A `cwd` with no such sign above it runs without git. The lookup runs outside the
-sandbox, so the relay runs `/usr/bin/git` (or the owner's `AGENT_RELAY_GIT`, an absolute path set
-in the relay's environment) by absolute path, never through `PATH`, in a minimal environment
+sandbox, so the relay runs its trusted git by absolute path, never through `PATH`: `/usr/bin/git`
+or `/bin/git` on macOS and Linux, machine-wide `%ProgramFiles%\Git\cmd\git.exe` on Windows (a
+per-user or `PATH`-found git is refused, since a task could plant it), or the owner's
+`AGENT_RELAY_GIT`, an absolute path set in the relay's environment, in a minimal environment
 (`PATH=/usr/bin:/bin`, `HOME`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`). It does not
 read the global git config, which a read-only task could have written, so `safe.directory` there
 does not help: fix the directory's ownership, or submit without `readOnly`.
