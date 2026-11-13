@@ -206,9 +206,16 @@ Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
 `finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `needsPolicy`, `status`,
 `attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, `error`, and
 (for a failed step) `errorDetail`.
-Every step carries `startedAt` and `finishedAt`, null until the step starts and finishes;
-`attemptTimes` is one `{startedAt, finishedAt}` window per attempt, oldest first, so a
-`retries` or `repeat` step reports each try separately.
+Every step carries `startedAt` and `finishedAt`: `startedAt` is stamped when the relay
+begins the attempt (rendering and submitting its tasks), `finishedAt` when the step becomes
+terminal. A step that never started — `pending`, `skipped` with
+`dependency_not_completed`, or `cancelled` with the run before its attempt began — keeps
+both null. A step whose attempt failed before submitting any task (an unresolved template
+reference, or a submission the relay refuses, such as `read_only_unsupported: ...`) is
+`failed` with both stamped and `attempts` `0`. `attemptTimes` is one
+`{startedAt, finishedAt}` window per submitted attempt, oldest first, so a `retries` or
+`repeat` step reports each try separately; it is empty whenever no attempt submitted a
+task.
 
 `?view=summary` returns a small projection for an orchestrator that only needs to know
 which step finished: no `spec`, and each step carries its identity, `needs`, `status`,
@@ -453,8 +460,8 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].needsPolicy` | always | `"any"` or `"all"` as submitted; `null` when omitted (which behaves as `all`). |
 | `steps[].status` | always | Step status values. |
 | `steps[].attempts` | always | How many times the step has run, restored from the journal on resume. |
-| `steps[].startedAt` / `steps[].finishedAt` | always | ISO-8601, null until the step starts and finishes; a step that never ran keeps both null. Restored from the journal on resume. |
-| `steps[].attemptTimes` | always | One `{startedAt, finishedAt}` window per attempt, oldest first; `finishedAt` is null for an attempt still open. Restored from the journal on resume. |
+| `steps[].startedAt` / `steps[].finishedAt` | always | ISO-8601. `startedAt` is stamped when the relay begins the attempt — rendering and submitting its tasks — and `finishedAt` when the step reaches a terminal status, and only if it started. A step that never started (`pending`, `skipped` with `dependency_not_completed`, or `cancelled` with the run before its attempt began) keeps both null. A step whose attempt failed before submitting any task (an unresolved template reference, or a submission the relay refuses, such as `read_only_unsupported: ...`) is `failed` with both stamped and `attempts` `0`. Restored from the journal on resume. |
+| `steps[].attemptTimes` | single run only | One `{startedAt, finishedAt}` window per submitted attempt, oldest first; `finishedAt` is null for an attempt still open. Empty when no attempt submitted a task: a `pending`, `skipped` or pre-launch `cancelled` step, and a failure before the first submission. Absent from `GET /v1/workflows` list entries; present in the full, `view=summary` and `?step=` run views. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
 | `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
 | `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the task error and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` for diagnostic usage/rate-limit reports, quota exceeded/reached, "too many requests" or HTTP 429. Classification reads only the full task error before tail truncation and requires HTTP, status, error or code context for 429; ordinary quota prose and stdout-only limit text do not set the quota label. |

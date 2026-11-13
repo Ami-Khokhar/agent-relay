@@ -231,6 +231,42 @@ class InspectTest(_Case):
         self._refuses("include configuration", lambda r: _run_git(
             r, "config", "include.path", "/tmp/evil.config"))
 
+    def test_missing_origin_remote_is_named(self):
+        with _Fixture() as fixture:
+            _run_git(fixture.repo, "remote", "remove", "origin")
+            with self.assertRaises(update_staging.StagingError) as caught:
+                update_staging.inspect_checkout(fixture.repo, git=update_staging.default_git())
+            message = str(caught.exception)
+            self.assertIn("no origin remote", message)
+            self.assertIn(update_staging.SINGLE_ORIGIN, message)
+            self.assertNotIn("no error output", message)
+
+    def test_tracked_path_is_read_whole_from_the_index(self):
+        # `ls-files -s` is '<mode> <object> <stage>\t<path>': the path after the
+        # tab is the real one, even when it contains a tab itself.
+        with _Fixture() as fixture:
+            os.symlink("README.md", str(fixture.repo / "linked\tpath"))
+            _run_git(fixture.repo, "add", "--", "linked\tpath")
+            _run_git(fixture.repo, "commit", "-q", "-m", "tracked symlink")
+            with self.assertRaises(update_staging.StagingError) as caught:
+                update_staging.inspect_checkout(fixture.repo, git=update_staging.default_git())
+            message = str(caught.exception)
+            self.assertIn("at linked\tpath;", message)
+            self.assertIn("120000", message)
+            self.assertIn("symlink", message)
+
+    def test_traversal_guard_sees_the_whole_tracked_path(self):
+        # a leading '~' is not a plain repository path; the guard only fires
+        # when the parsed path is the real one, not '0\t<path'
+        with _Fixture() as fixture:
+            (fixture.repo / "~tilde").write_text("hi\n")
+            _run_git(fixture.repo, "add", "--", "~tilde")
+            _run_git(fixture.repo, "commit", "-q", "-m", "tilde file")
+            with self.assertRaises(update_staging.StagingError) as caught:
+                update_staging.inspect_checkout(fixture.repo, git=update_staging.default_git())
+            self.assertIn("tracked path ~tilde is not a plain repository path",
+                          str(caught.exception))
+
     def test_system_prefix_refusal(self):
         with _Fixture() as fixture:
             prefix = self.scratch / "user-tree"
@@ -371,6 +407,7 @@ class StagingTest(_Case):
         with self.assertRaises(update_staging.StagingError) as caught:
             update_staging.verify_stage(stage, fixture.identity())
         self.assertIn("real directory", str(caught.exception))
+        self.assertIn("staged linked-dir is not a real directory", str(caught.exception))
         os.remove(str(stage / "linked-dir"))
         (stage / "smuggled").mkdir()
         (stage / "smuggled" / "payload.txt").write_text("extra tree\n")

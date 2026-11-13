@@ -165,9 +165,12 @@ python3 src/mcp_server.py # MCP stdio server, in a second process
 The HTTP service is the core; MCP is a thin client over it. You do not have to start HTTP
 yourself: when the MCP process cannot reach a loopback relay it starts `server.py`
 detached (log: `~/.local/state/agent-relay/relay.log`). To keep it up across reboots, run
-`bash scripts/install-service.sh`; that installer also puts an `agent-relay` command on
-your `PATH`, and `agent-relay info` prints the relay URL, the artifact release page, the
-token path and the checkout in use. `SIGTERM` or `SIGINT` cancels running tasks and waits
+`bash scripts/install-service.sh`; that installer also writes an `agent-relay` command
+into `~/.local/bin` and prints the `export PATH="$HOME/.local/bin:$PATH"` line to add
+when that directory is not on your `PATH`. `agent-relay info` prints the relay URL the
+service was installed with, the artifact release page, the token path and the checkout in
+use; it does not start the MCP server, so MCP registration still names the absolute
+`src/mcp_server.py` path. `SIGTERM` or `SIGINT` cancels running tasks and waits
 briefly for adapters to stop.
 
 To update a source checkout, run `bash
@@ -459,9 +462,13 @@ runs through `pending` → `running` → one of `completed`, `failed`, `cancelle
 directly `pending` → `skipped` when its dependency policy cannot be satisfied (a
 non-completed need for `all`, or no completed need for `any`). Every step reports
 `needsPolicy` as submitted, or `null` when omitted, and carries `startedAt` and
-`finishedAt`, null until it starts and finishes. A run view adds `attemptTimes`, one
-`{startedAt, finishedAt}` window per attempt — so a report can give each step its own time
-window without reading task ids.
+`finishedAt`: `startedAt` when the relay begins the attempt (rendering and submitting its
+tasks), `finishedAt` when the step becomes terminal. A step that never started (`pending`,
+`skipped`, or `cancelled` before its attempt began) keeps both null; a step whose attempt
+failed before submitting a task is `failed` with both stamped and `attempts` 0. A run view
+adds `attemptTimes`, one `{startedAt, finishedAt}` window per submitted attempt and empty
+when nothing was submitted — so a report can give each step its own time window without
+reading task ids.
 
 ```
 {"name": "review-loop", "steps": [
