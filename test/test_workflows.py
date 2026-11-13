@@ -1022,6 +1022,32 @@ class WorkflowTests(unittest.TestCase):
         _, listing = relay.request("GET", "/v1/workflows")
         self.assertEqual(listing["workflows"], [])
 
+    def test_refuses_an_unencodable_step_field_with_400_and_creates_no_run(self):
+        relay = self.start(echo())
+        # The escape is sent verbatim: a lone surrogate is not UTF-8, so only the escape keeps
+        # this test's own body valid.
+        status, body = relay.request(
+            "POST", "/v1/workflows",
+            '{"steps": [{"id": "a", "agentId": "echo", "input": "\\ud800"}]}')
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "invalid_input")
+        self.assertIn("steps[0].input", body["message"])
+        for cwd in ('"/tmp/a\\u0000b"', '"/tmp/\\ud800"'):
+            status, body = relay.request(
+                "POST", "/v1/workflows",
+                '{"steps": [{"id": "a", "agentId": "echo", "input": "x", "cwd": %s}]}' % cwd)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["error"], "invalid_cwd")
+            self.assertIn("steps[0].cwd", body["message"])
+        _, listing = relay.request("GET", "/v1/workflows")
+        self.assertEqual(listing["workflows"], [])
+
+        # The same document with encodable text still starts a run.
+        status, submitted = relay.request(
+            "POST", "/v1/workflows",
+            {"steps": [{"id": "a", "agentId": "echo", "input": "ok"}]})
+        self.assertEqual(status, 202, submitted)
+
     def test_reports_an_unknown_workflow_and_lists_runs(self):
         relay = self.start(echo())
         status, body = relay.request("GET", "/v1/workflows/wf-deadbeef000000000000000000000000")
