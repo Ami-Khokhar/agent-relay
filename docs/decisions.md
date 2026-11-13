@@ -17,7 +17,7 @@ something no validation accepted.
 
 ## A failed foreach step keeps its JSON array output
 
-`_reap` stored the first failing task's scalar output in a failed `foreach` step, while a successful one stored `json.dumps(outputs)`, so the documented array shape broke exactly on the run a caller was inspecting. A failed fan-out now serializes every item's output in submission order — the failed item as its own output, empty when it produced none — and which item failed stays reachable through `taskIds` (same order as `foreach`) and `errorDetail`. Non-foreach steps keep their scalar output. Consequence: the output shape no longer depends on the step's outcome, and no field is added to the payload.
+`_reap` stored the first failing task's scalar output in a failed `foreach` step, while a successful one stored `json.dumps(outputs)`, so the documented array shape broke exactly on the run a caller was inspecting. A `foreach` step whose tasks ran now serializes every item's output in that attempt's order whatever the outcome — the failed item as its own output, empty when it produced none; a step that fails before its tasks run (unresolved template, rejected submission, evicted task) still has no output. Non-foreach steps keep their scalar output, and `taskIds` lists each attempt's tasks in foreach order, oldest first, so a position maps to an item only within one attempt. Consequence: the shape no longer depends on the outcome of the tasks that did run, and no field is added to the payload.
 
 ## prepare-activation proves the checkout against the stage receipt's source commit
 

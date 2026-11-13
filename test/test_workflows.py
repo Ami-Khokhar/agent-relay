@@ -236,7 +236,10 @@ class WorkflowTests(unittest.TestCase):
                          'collected=["item=one index=0", "item=two index=1"]')
 
     def test_a_failed_foreach_step_keeps_the_array_shape_and_names_the_failing_task(self):
-        relay = self.start({"id": "gate", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]})
+        relay = self.start([
+            {"id": "gate", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]},
+            {"id": "silent", "command": PYTHON, "args": ["-c", "import sys; sys.exit(1)"]},
+        ])
         workflow = run(relay, {"steps": [
             {"id": "fan", "agentId": "gate", "foreach": ["ok", "FAIL item"],
              "input": "{{item}}"},
@@ -253,6 +256,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([task["id"] for task in failed], [fan["taskIds"][1]])
         self.assertEqual(fan["errorDetail"], failed[0]["error"])
         self.assertIn(fan["errorDetail"], fan["error"])
+
+        # A failing item that wrote no stdout still holds its position in the array.
+        silent = run(relay, {"steps": [
+            {"id": "fan", "agentId": "silent", "foreach": ["one", "two"],
+             "input": "{{item}}"},
+        ]})
+        quiet = steps_of(silent)["fan"]
+        self.assertEqual(quiet["status"], "failed")
+        self.assertEqual(json.loads(quiet["output"]), ["", ""])
+        self.assertEqual(len(json.loads(quiet["output"])), 2)
 
     # --------------------------------------------------------- failure and retry
 
