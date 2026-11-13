@@ -277,7 +277,10 @@ An already terminal run is returned unchanged.
 Reads `<state dir>/workflows/<id>.jsonl`, restores the steps that completed with their
 outputs, attempt counts, and time windows, and schedules the rest. Returns `202` with the
 restarted run. `409 workflow_active` when the run is still going, `404 unknown_workflow`
-when nothing is journaled under that id. The request takes no body and needs no
+when nothing is journaled under that id, and `503 workflow_capacity_reached` when the store
+is already at `maxWorkflows` with no finished run to evict and the id is not itself stored:
+a finished run that is still stored is resumed in place, while a journal-only id takes a
+slot by the same eviction rule as a submission. The request takes no body and needs no
 `content-type`.
 
 ### `GET /v1/pressure`
@@ -363,7 +366,7 @@ Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow ste
 | 415 | `unsupported_media_type` | `POST /v1/tasks` or `POST /v1/workflows` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
-| 503 | `task_capacity_reached`, `workflow_capacity_reached`, `device_pressure` | Store full of non-terminal tasks or of runs with none finished; or a workflow submission while the host verdict is at or above the relay's admitBelow line, with the reading attached. |
+| 503 | `task_capacity_reached`, `workflow_capacity_reached`, `device_pressure` | Store full of non-terminal tasks or of runs with none finished (submissions and resumes alike); or a workflow submission while the host verdict is at or above the relay's admitBelow line, with the reading attached. |
 
 ### Task errors
 
