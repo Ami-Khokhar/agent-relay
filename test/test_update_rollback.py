@@ -12,7 +12,8 @@ keeps the ``recovery_required`` record, its barrier and an actionable remedy,
 and never declares the rollback complete. Boundaries are faked at the service
 manager, the HTTP endpoints and the participating git objects, as in the
 activation tests; no user service, no publication and no host state is
-touched.
+touched. The success and failure inventories also prove external state retention
+across a successful activation and one left recovery_required.
 """
 from __future__ import annotations
 
@@ -22,7 +23,6 @@ import os
 import stat
 import sys
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -33,7 +33,7 @@ import update_drain
 import update_service
 import update_staging
 import update_transaction
-from test_update_activation import _Fixture, _Case, _run_git, CAPABILITY, TXN
+from test_update_activation import _Fixture, _Case, _run_git, _external_inventory, CAPABILITY, TXN
 
 
 class _RollbackCase(_Case):
@@ -225,7 +225,10 @@ class RecoveryCommandTest(_RollbackCase):
     def test_crash_after_the_swap_is_recovered_to_the_exact_prior_revision(self):
         self._crash(swapped=True)
         self.assertEqual(self._head(), self.fixture.target)
-
+        self.serving = self.fixture.target
+        self.run_recover()
+        self.assertEqual(self._head(), self.fixture.old)
+        self.assertConverged(restarts=1)
 
     def test_crash_before_the_swap_needs_no_restart_at_all(self):
         self._crash(swapped=False)
@@ -420,16 +423,111 @@ class RecoveryBoundaryTest(_RollbackCase):
         self.home_patch.start()
 
 
+class ActivationPrivateStateTest(unittest.TestCase):
+    """Real activation and rollback logic; only HTTP and service execution are fake."""
+
+    def setUp(self):
+        self.fixture = _Fixture(state_name="agent-relay")
+        self.fixture.__enter__()
+        self.addCleanup(self.fixture.__exit__, None, None, None)
+        self.fixture.write_plist()[0].chmod(0o600)
+        self.serving, self.held, self.offline = self.fixture.old, True, False
+        self.restart_fails = False
+        env = patch.dict(os.environ, {"HOME": str(self.fixture.home),
+                         "XDG_STATE_HOME": str(self.fixture.state.parent),
+                         "XDG_CONFIG_HOME": "", "AGENT_RELAY_TOKEN": "t" * 32})
+        env.start()
+        self.addCleanup(env.stop)
+        http = patch.object(update_drain, "_request", self._request)
+        http.start()
+        self.addCleanup(http.stop)
+
+    def _request(self, method, _base, path, *, token=None, query=None, body=None, **kwargs):
+        if path == update_drain.HEALTH_PATH:
+            return 200, {"revision": {"commit": self.serving}}
+        self.assertEqual(token, "t" * 32)
+        if path == update_drain.DRAIN_PATH:
+            self.assertEqual(query if method == "GET" else body,
+                             {"transactionId": TXN, "revision": self.fixture.old,
+                              "capability": CAPABILITY})
+            if not self.held:
+                return 409, {"error": "drain_not_held"}
+            if method == "DELETE":
+                self.held = False
+            return 200, {"quiesced": True, "active": 0, "queued": 0, "workflows": 0}
+        if path == safe_update.AGENTS_PATH:
+            if self.offline:
+                raise update_drain.DrainError("drain_unreachable", "fixture service is down")
+            return 200, {"revision": {"commit": self.serving}}
+        self.assertEqual(path, safe_update.BARRIER_PATH)
+        record = update_transaction.read_journal(state_dir=self.fixture.state)
+        closed = record is not None and record["phase"] not in ("activated", "rolled_back")
+        return 200, {"admissionClosed": closed,
+                     "barrier": {"transactionId": TXN} if closed else None}
+
+    def _restart(self, _service):
+        if self.restart_fails:
+            self.offline = True
+            raise identity.UpdateError("fixture service manager refused the restart")
+        self.serving = _run_git("-C", str(self.fixture.repo), "rev-parse", "HEAD")
+        self.held = False
+
+    def _activate(self):
+        return safe_update.cmd_activate(TXN, str(self.fixture.repo),
+                                        base_url="http://127.0.0.1:43124",
+                                        restart=self._restart, deadline_s=0.4)
+
+    def test_successful_activation_retains_external_bytes_and_private_modes(self):
+        before = _external_inventory(self.fixture)
+        self.assertEqual(set(value.split(":")[-1] for key, value in before.items()
+                             if key not in ("stateDir", "updateDir")), {"600"})
+        self.assertEqual((before["stateDir"], before["updateDir"]), ("700", "700"))
+        self.assertEqual(self._activate(), 0)
+        self.assertEqual(self.serving, self.fixture.target)
+        self.assertIsNone(update_transaction.read_journal(state_dir=self.fixture.state))
+        self.assertEqual(_external_inventory(self.fixture), before)
+
+    def test_failed_activation_retains_external_bytes_modes_and_recovery_record(self):
+        before = _external_inventory(self.fixture)
+        self.restart_fails = True
+        with self.assertRaisesRegex(identity.UpdateError, "automatic rollback did not complete"):
+            self._activate()
+        record = update_transaction.read_journal(state_dir=self.fixture.state)
+        self.assertEqual(record["phase"], "recovery_required")
+        self.assertIsNotNone(update_transaction.read_barrier(state_dir=self.fixture.state))
+        self.assertEqual(_external_inventory(self.fixture), before)
+
+    def test_rollback_returns_the_exact_prior_revision_and_boolean_restore_restart_results(self):
+        request = self._request
+
+        def restarted_service_is_unreachable(method, base, path, **kwargs):
+            if self.serving == self.fixture.target:
+                raise update_drain.DrainError("drain_unreachable", "fixture service is down")
+            return request(method, base, path, **kwargs)
+
+        with patch.object(update_drain, "_request", restarted_service_is_unreachable):
+            with self.assertRaisesRegex(identity.UpdateError, "automatic rollback did not complete"):
+                self._activate()
+        service = update_service.inspect_service(self.fixture.repo)
+        result = safe_update.rollback_transaction(
+            TXN, state_dir=self.fixture.state, service=service,
+            base_url="http://127.0.0.1:43124", token="t" * 32,
+            restart=self._restart, deadline_s=0.4)
+        self.assertEqual(result, {"previous": self.fixture.old,
+                                  "restored": True, "serviceRestarted": True})
+        self.assertIs(type(result["restored"]), bool)
+        self.assertIs(type(result["serviceRestarted"]), bool)
+
+
 class PrivateStateTest(_RollbackCase):
     """Private config and service definitions are retained unchanged (#159)."""
 
+    def setUp(self):
+        super().setUp()
+        self.fixture.write_plist()
+
     def _inventory(self):
-        got = {}
-        for name, rel in (("consent", "consent.json"), ("device", "device-id")):
-            path = self.state / rel
-            data = path.read_bytes()
-            got[name] = "%s:%o" % (hashlib.sha256(data).hexdigest(),
-                                   stat.S_IMODE(path.stat().st_mode))
+        got = _external_inventory(self.fixture)
         for name, rel in (("barrier", "update/admission-barrier.json"),
                           ("journal", "update/transaction.json")):
             path = self.state / rel
@@ -438,14 +536,6 @@ class PrivateStateTest(_RollbackCase):
             data = path.read_bytes()
             got[name] = "%s:%o" % (hashlib.sha256(data).hexdigest(),
                                    stat.S_IMODE(path.stat().st_mode))
-        receipt = Path(self.fixture.stage) / "stage-receipt.json"
-        got["receipt"] = "%s:%o" % (hashlib.sha256(receipt.read_bytes()).hexdigest(),
-                                    stat.S_IMODE(receipt.stat().st_mode))
-        self.fixture.write_plist()
-        plist = self.fixture.home / "Library" / "LaunchAgents" / "com.agent-relay.plist"
-        got["service"] = "%s:%o" % (hashlib.sha256(plist.read_bytes()).hexdigest(),
-                                    stat.S_IMODE(plist.stat().st_mode))
-        got["updateDir"] = "%o" % stat.S_IMODE((self.state / "update").stat().st_mode)
         return got
 
     def test_state_stays_private_and_unchanged_through_recovery(self):
