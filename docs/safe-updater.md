@@ -125,14 +125,17 @@ this transaction's admission barrier. Only then is the record finalized to
 
 ## Refusals and recovery
 
-- **A failed activation** (any step after the drain is held) writes a durable
+- **A failed activation** (any step after the drain is held, up to the journal's
+  durable `activated` finalize) writes a durable
   `recovery_required` end and then rolls back automatically to the exact prior
   revision the journal names — the checkout is restored only while it still
   inspects clean (an intervening user edit is refused, never overwritten), the
   service is restarted only when the running relay does not already report the
   restored revision, and the barrier holds until the authenticated endpoint
   reports that exact prior revision. `status` prints the record; `recover`
-  finishes or retries it, idempotently, without repeating a service action.
+  finishes or retries it, idempotently, without repeating a service action. A
+  barrier refresh that fails after that finalize is not rolled back: the
+  activation stands and `recover` retries the refresh and expunges the record.
 - **A prepared transaction you change your mind about** is ended by
   `recover-abort`, which re-proves the unchanged external state, the exact
   starting revision, the owned drain and quiescence before releasing and

@@ -710,6 +710,66 @@ class PrepareAbortCliTest(_Case):
         self.assertEqual(relay.releases, [], "a still-running relay keeps its hold")
 
 
+class TerminalRecordGuidanceTest(_Case):
+    """A retained terminal record names a command that actually finishes it (#187)."""
+
+    def _terminal(self):
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        update_transaction.transition(TXN, "prepared", "rolled_back", state_dir=self.state,
+                                      reason="operator recover-abort")
+        return update_transaction.recover_transaction(state_dir=self.state)
+
+    def test_the_retained_record_names_recover_not_recover_abort(self):
+        self._terminal()
+        with self.assertRaises(identity.UpdateError) as caught:
+            update_transaction.begin_transaction(
+                self.fixture.begin_receipt(transaction_id="txn-next"), state_dir=self.state)
+        message = str(caught.exception)
+        self.assertIn("still recorded", message)
+        self.assertIn("`safe_update recover %s`" % TXN, message,
+                      "the retained-record remedy names the command that clears it")
+        self.assertNotIn("recover-abort", message,
+                         "recover-abort refuses every terminal phase, so naming it "
+                         "would send the operator into a refusal")
+
+    def test_the_named_recover_command_clears_the_terminal_record(self):
+        """Guard: the remedy text is runnable — that exact command succeeds."""
+        self._terminal()
+        calls = []
+
+        def request(method, base, path, **kwargs):
+            calls.append((method, path))
+            if path == update_drain.DRAIN_PATH:
+                raise update_drain.DrainError("drain_not_held",
+                                              "a restarted relay owes no hold")
+            self.assertEqual(path, safe_update.BARRIER_PATH,
+                             "the last effect of recovery is the barrier refresh")
+            return 200, {"admissionClosed": False}
+
+        with _join([patch.object(safe_update, "_state_dir", lambda: self.state),
+                    patch.object(update_drain, "relay_token", lambda: "t" * 32),
+                    patch.object(update_drain, "_request", request)]):
+            rc = safe_update.main(["recover", TXN, "--base-url", "http://127.0.0.1:9"])
+        self.assertEqual(rc, 0, "the command named by the refusal succeeds")
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state),
+                          "the terminal record is expunged")
+        self.assertEqual([path for _method, path in calls],
+                         [update_drain.DRAIN_PATH, update_drain.DRAIN_PATH,
+                          safe_update.BARRIER_PATH],
+                         "recovery releases and proves the drain, then refreshes admission")
+
+    def test_recover_abort_refuses_a_terminal_record_and_names_recover(self):
+        self._terminal()
+        with patch.object(safe_update, "_state_dir", lambda: self.state):
+            with self.assertRaises(identity.UpdateError) as caught:
+                safe_update.cmd_recover_abort(TXN, base_url="http://127.0.0.1:9")
+        message = str(caught.exception)
+        self.assertIn("terminal phase 'rolled_back'", message)
+        self.assertIn("`safe_update recover %s`" % TXN, message,
+                      "the refusal points at the command that finishes the record")
+        self.assertIsNotNone(update_transaction.recover_transaction(state_dir=self.state))
+
+
 class StatusCliTest(_Case):
     def test_status_names_the_record_or_the_absence(self):
         update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)

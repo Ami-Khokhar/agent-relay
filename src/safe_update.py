@@ -893,7 +893,12 @@ def cmd_recover_abort(transaction_id, *, base_url=None):
         raise UpdateError("the recorded transaction is %s, not %s; refusing to replay another "
                           "transaction's abort" % (record["transactionId"], transaction_id))
     if record["phase"] not in ("prepared", "draining"):
-        raise UpdateError("the transaction is in phase %r: manual recovery required"
+        if record["phase"] in update_transaction.TERMINAL_PHASES:
+            raise UpdateError("the transaction is in the terminal phase %r; run "
+                              "`safe_update recover %s` to finish it"
+                              % (record["phase"], transaction_id))
+        raise UpdateError("the transaction is in phase %r: manual recovery required; "
+                          "recover-abort aborts only a prepared or draining transaction"
                           % record["phase"])
     base_url, token = _authorize_drain(base_url)
     # Prove before any effect: unchanged external state, the exact starting
