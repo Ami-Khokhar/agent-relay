@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import ntpath
 import os
 import shutil
 import socket
@@ -1192,6 +1193,43 @@ class TrustedGitTests(unittest.TestCase):
         self.assertTrue(server.TRUSTED_GIT_PATHS)
         self.assertTrue(all(os.path.isabs(path) for path in server.TRUSTED_GIT_PATHS))
         self.assertEqual(server.TRUSTED_GIT_PATHS[0], "/usr/bin/git")
+
+    def test_the_allowlist_names_the_real_git_installations_of_each_platform(self):
+        self.assertEqual(server._trusted_git_paths("posix"), ("/usr/bin/git", "/bin/git"))
+        self.assertEqual(server._trusted_git_paths("java"), ("/usr/bin/git", "/bin/git"))
+        self.assertEqual(server.TRUSTED_GIT_PATHS, server._trusted_git_paths())
+        machine = ntpath.join(r"C:\Program Files", "Git", "cmd", "git.exe")
+        per_user = ntpath.join(r"C:\Users\me\AppData\Local", "Programs", "Git", "cmd", "git.exe")
+        with mock.patch.dict(os.environ, {"ProgramFiles": r"C:\Program Files",
+                                          "LOCALAPPDATA": r"C:\Users\me\AppData\Local"}):
+            self.assertEqual(server._trusted_git_paths("nt"), (machine, per_user))
+        with mock.patch.dict(os.environ, {"ProgramFiles": r"C:\Program Files"}):
+            os.environ.pop("LOCALAPPDATA", None)
+            self.assertEqual(server._trusted_git_paths("nt"), (machine,))
+
+    def test_selects_a_windows_candidate_from_the_allowlist_and_refuses_a_git_beside_it(self):
+        planted = ntpath.join(self.dir, "placed", "git.exe")
+        present = {planted}
+
+        def isfile(path):
+            return path in present
+
+        def access(path, mode):
+            return path in present
+
+        with mock.patch.dict(os.environ, {"PATH": os.path.join(self.dir, "placed") + os.pathsep
+                                          + os.environ["PATH"], "LOCALAPPDATA": self.dir}):
+            windows = server._trusted_git_paths("nt")
+            candidate = windows[1]
+            present.add(candidate)
+            os.environ.pop("AGENT_RELAY_GIT", None)
+            with mock.patch.object(server, "TRUSTED_GIT_PATHS", windows), \
+                    mock.patch.object(server.os.path, "isfile", isfile), \
+                    mock.patch.object(server.os, "access", access):
+                self.assertNotIn(planted, windows)
+                self.assertEqual(server._trusted_git(), candidate)
+                present.discard(candidate)
+                self.assertIsNone(server._trusted_git(), "a git outside the allowlist ran")
 
     def test_rejects_an_override_that_is_not_an_absolute_path_to_an_executable_file(self):
         plain = os.path.join(self.dir, "plain")

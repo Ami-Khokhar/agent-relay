@@ -12,6 +12,7 @@ import hmac
 import http.client
 import ipaddress
 import json
+import ntpath
 import os
 import re
 import secrets
@@ -64,9 +65,28 @@ COLLECT_GRACE_S = 2.0
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # Seconds to wait for each git call that locates the git metadata of a sandboxed task's cwd.
 GIT_TIMEOUT_S = 5
+
+
+def _trusted_git_paths(platform=None):
+    """The absolute paths of the real git installations the relay may run, for this platform.
+
+    It never searches PATH. On POSIX these are the system directories, which a task running as the
+    relay's user cannot replace. On Windows they are the ``cmd`` directory of the Git for Windows
+    installer, per machine and per user; the per-user one is skipped when LOCALAPPDATA is unset.
+    Windows paths are built with ntpath so the list names them the same on any host.
+    """
+    if (os.name if platform is None else platform) != "nt":
+        return ("/usr/bin/git", "/bin/git")
+    programs = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    paths = [ntpath.join(programs, "Git", "cmd", "git.exe")]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        paths.append(ntpath.join(local, "Programs", "Git", "cmd", "git.exe"))
+    return tuple(paths)
+
+
 # Where the relay looks for git when the owner names none (AGENT_RELAY_GIT). It never searches PATH.
-# These directories belong to the system, so a task running as the relay's user cannot replace the file.
-TRUSTED_GIT_PATHS = ("/usr/bin/git", "/bin/git")
+TRUSTED_GIT_PATHS = _trusted_git_paths()
 
 
 def _log(message, err=False):
