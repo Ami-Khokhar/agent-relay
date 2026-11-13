@@ -1,5 +1,20 @@
 # Decisions
 
+## `?tag=` is a repeatable all-match filter, and `model`/`tags` stay listing-only metadata
+
+Callers need to pick a worker by data instead of matching `name` prose, so `GET /v1/agents`
+reports `model` and `tags` when the registry declares them and keeps only the agents carrying
+every `?tag=` the query names. All-match is the contract: with `tag=reviewer&tag=factory` an
+agent tagged only `reviewer` is absent, while an unknown or blank tag is a tag no agent
+carries, so the filter yields an empty list rather than a 400 — a stale label is a fact about
+the registry, not a malformed request, and callers treat an empty list as "none available".
+Neither field is read by any execution path; they are discovery metadata only, each validated
+as a non-blank string and stored trimmed, so the listed value is the value that was validated.
+Consequence: a change to any-match, to rejecting an unknown tag, or to letting an execution
+path read `model` or `tags` contradicts a public contract and must supersede this decision
+rather than edit it, and the trimming is pinned because a stored untrimmed value would list
+something no validation accepted.
+
 ## prepare-activation proves the checkout against the stage receipt's source commit
 
 `prepare-activation` compared the active checkout's HEAD with the approved
