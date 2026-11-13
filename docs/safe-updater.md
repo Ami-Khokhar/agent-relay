@@ -110,10 +110,14 @@ checkout to be unchanged since staging (still clean, canonical, at the exact
 commit the stage recorded), then acquires the drain and writes
 `<state dir>/update/transaction.json` plus `admission-barrier.json`: the old
 exact relay commit, the target identity, the stage, hashed references to the
-external state, and the drain capability. The drain stays held after the
-command returns; while it is held the relay refuses every new external
-admission (tasks, workflow submissions, resumes) and already accepted work
-finishes normally.
+external state, and the drain capability. The acquired drain's revision must be
+that same recorded commit; a checkout already fast-forwarded past the running
+relay (the state `scripts/update.sh` leaves while its restart is deferred) is
+refused by name, with the hold released and nothing journaled, because
+`activate` can only return to the revision the drain started from. The drain
+stays held after the command returns; while it is held the relay refuses every
+new external admission (tasks, workflow submissions, resumes) and already
+accepted work finishes normally.
 
 `activate` walks the journal through `draining` → `quiescent` → `activating` →
 `restarted`, swaps the checkout with trusted, hook- and filter-disabled git by
