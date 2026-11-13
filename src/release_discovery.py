@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 import threading
@@ -198,14 +199,16 @@ def _acquire_cache_lock():
     if not _IS_POSIX or fcntl is None:
         return None
     path = _private_cache().with_suffix(".lock")
+    # O_NOFOLLOW refuses a symlinked lock name outright; the descriptor that is actually
+    # locked is then validated, so a swap of the name between open and validation cannot
+    # leave the lock held on a file the checks never saw.
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     fd = None
     try:
         fd = os.open(path, flags, 0o600)
-        info = path.lstat()
+        info = os.fstat(fd)
         owner = getattr(os, "geteuid", lambda: None)()
-        if (path.is_symlink() or not path.is_file()
-                or (owner is not None and info.st_uid != owner)):
+        if not stat.S_ISREG(info.st_mode) or (owner is not None and info.st_uid != owner):
             raise DiscoveryError("notice cache lock is not a private regular file; check cache directory permissions")
         os.fchmod(fd, 0o600)
         deadline = time.monotonic() + LOCK_TIMEOUT
