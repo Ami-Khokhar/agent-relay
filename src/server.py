@@ -593,15 +593,22 @@ def load_registry(path):
         if delegate_to is not None and (not isinstance(delegate_to, list) or not all(
                 isinstance(item, str) for item in delegate_to)):
             raise ValueError(f"Invalid delegateTo: {agent_id}")
-        # Discovery metadata: the listing returns it, no execution path reads it.
+        # Discovery metadata: the listing returns it, no execution path reads it. Both fields
+        # are stored trimmed, so the listed value is exactly the value that was validated.
+        metadata = {}
         model = raw.get("model")
-        if model is not None and (not isinstance(model, str) or not model.strip()):
-            raise ValueError(f"Invalid model: agent {agent_id}: model must be a non-empty string")
+        if model is not None:
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(
+                    f"Invalid model: agent {agent_id}: model must be a non-empty string")
+            metadata["model"] = model.strip()
         tags = raw.get("tags")
-        if tags is not None and (not isinstance(tags, list) or not all(
-                isinstance(item, str) and item for item in tags)):
-            raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
-                             "non-empty strings")
+        if tags is not None:
+            if not isinstance(tags, list) or not all(
+                    isinstance(item, str) and item.strip() for item in tags):
+                raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
+                                 "non-empty strings")
+            metadata["tags"] = [item.strip() for item in tags]
         role = raw.get("role")
         if role is not None:
             if not isinstance(role, str):
@@ -626,7 +633,7 @@ def load_registry(path):
         merged = {"newTasks": True, "nativeSessions": False, "streaming": False}
         if isinstance(caps, dict):
             merged.update(caps)
-        agents[agent_id] = {**raw, "type": agent_type, "args": raw.get("args", []),
+        agents[agent_id] = {**raw, **metadata, "type": agent_type, "args": raw.get("args", []),
                             "capabilities": merged, "_role": roles.get(role) if role else None}
     return agents
 
