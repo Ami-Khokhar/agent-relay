@@ -168,7 +168,7 @@ Step fields:
 | --- | --- | --- |
 | `id` | yes | Unique in the document; `[A-Za-z0-9_.~-]`, ≤128 chars. |
 | `agentId` | yes | Must match a registry id. |
-| `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. |
+| `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. A JSON escape such as `"\ud800"` decodes to a lone surrogate, which is not UTF-8 text and returns `400 invalid_input` naming the step's index and field. |
 | `needs` | no | Step ids that must complete first. Acyclic; forward references allowed. |
 | `needsPolicy` | no | `"all"` (default) or `"any"`. `any` requires at least one `needs` entry, otherwise `400 invalid_needs_policy`. With `all`, every need must complete. With `any`, every need must be terminal and at least one completed; without a completed need the step is skipped with `dependency_not_completed`. In an `any` prompt, `{{id.output}}` of a failed (including timed-out), skipped or cancelled ancestor becomes a marker like `[id did not complete: status=failed error=…]`. Unfinished ancestors stay empty under either policy; `all` also keeps non-completed terminal ancestors empty. A tolerated failed/skipped branch still makes the run `failed`; run cancellation remains `cancelled`. |
 | `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
@@ -176,7 +176,7 @@ Step fields:
 | `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
 | `failIfOutputMatches` | no | Python regular expression. A match on the output of a completed task fails the step with `output_matched_fail_pattern` and skips its dependents. The pattern is tested against each task's own output, so on a `foreach` step every item is matched separately and never the JSON array the step aggregates: one item reading `^BLOCKED` fails the whole step, while `^\[` does not fire on the serialization alone. |
 | `timeoutMs` | no | Positive integer, same cap as a task. |
-| `cwd` | no | Same `allowedRoots` check as a task. |
+| `cwd` | no | Same `allowedRoots` check as a task. A path carrying a NUL or a lone surrogate returns `400 invalid_cwd` naming the step's index and field. |
 | `options` | no | `{"<name>": "<value>"}`, exactly as for a task submission. The agent decides which names and values it allows. |
 | `readOnly` | no | Boolean, exactly as for a task submission. |
 
@@ -193,7 +193,7 @@ Validation failures use `400` with: `invalid_steps`, `invalid_step_id`, `duplica
 `unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_needs_policy`, `invalid_foreach`, `invalid_retries`,
 `invalid_repeat`, `invalid_fail_if`, `invalid_template`, `unknown_reference`, `invalid_options`,
 `invalid_read_only`, `command_input_too_large`, and the shared `unknown_field`,
-`unknown_agent`, `input_required`, `invalid_name`, `invalid_session_id`,
+`unknown_agent`, `input_required`, `invalid_input`, `invalid_name`, `invalid_session_id`,
 `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`.
 
 A step whose `options` or `readOnly` the agent cannot honour fails when the relay launches
