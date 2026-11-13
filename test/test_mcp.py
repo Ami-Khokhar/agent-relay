@@ -348,6 +348,12 @@ class McpHandlerTests(unittest.TestCase):
         finally:
             upstream.close()
 
+    def test_the_get_workflow_description_names_every_step_field_the_run_view_carries(self):
+        tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "get_workflow")
+        for field in ("status", "attempts", "startedAt", "finishedAt", "attemptTimes",
+                      "output", "error"):
+            self.assertIn(field, tool["description"])
+
     def test_the_step_schema_matches_the_engine(self):
         # The schema tells a client what the engine will accept; these are the engine's own limits,
         # so a constant that changes without the schema fails here instead of at a client's submit.

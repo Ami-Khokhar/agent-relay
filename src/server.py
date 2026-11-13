@@ -593,15 +593,22 @@ def load_registry(path):
         if delegate_to is not None and (not isinstance(delegate_to, list) or not all(
                 isinstance(item, str) for item in delegate_to)):
             raise ValueError(f"Invalid delegateTo: {agent_id}")
-        # Discovery metadata: the listing returns it, no execution path reads it.
+        # Discovery metadata: the listing returns it, no execution path reads it. Both fields
+        # are stored trimmed, so the listed value is exactly the value that was validated.
+        metadata = {}
         model = raw.get("model")
-        if model is not None and (not isinstance(model, str) or not model.strip()):
-            raise ValueError(f"Invalid model: agent {agent_id}: model must be a non-empty string")
+        if model is not None:
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(
+                    f"Invalid model: agent {agent_id}: model must be a non-empty string")
+            metadata["model"] = model.strip()
         tags = raw.get("tags")
-        if tags is not None and (not isinstance(tags, list) or not all(
-                isinstance(item, str) and item for item in tags)):
-            raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
-                             "non-empty strings")
+        if tags is not None:
+            if not isinstance(tags, list) or not all(
+                    isinstance(item, str) and item.strip() for item in tags):
+                raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
+                                 "non-empty strings")
+            metadata["tags"] = [item.strip() for item in tags]
         role = raw.get("role")
         if role is not None:
             if not isinstance(role, str):
@@ -626,7 +633,7 @@ def load_registry(path):
         merged = {"newTasks": True, "nativeSessions": False, "streaming": False}
         if isinstance(caps, dict):
             merged.update(caps)
-        agents[agent_id] = {**raw, "type": agent_type, "args": raw.get("args", []),
+        agents[agent_id] = {**raw, **metadata, "type": agent_type, "args": raw.get("args", []),
                             "capabilities": merged, "_role": roles.get(role) if role else None}
     return agents
 
@@ -1406,13 +1413,20 @@ def _pressure_guard():
 
 
 def _make_room():
+    """Evict the task that finished longest ago, so a long run's result survives its own arrival.
+
+    Every terminal task records ``_finished`` when it leaves queued/running, and that monotonic
+    stamp — not insertion order, which is creation order — decides the victim. A terminal record
+    without the stamp is not produced by any path here; such a record is not evictable rather
+    than ranked by a guessed time.
+    """
     if len(TASKS) < MAX_TASKS:
         return True
-    terminal = next((task for task in TASKS.values()
-                     if task["status"] not in ("queued", "running")), None)
-    if terminal is None:
+    finished = [task for task in TASKS.values()
+                if task["status"] not in ("queued", "running") and "_finished" in task]
+    if not finished:
         return False
-    _forget(terminal)
+    _forget(min(finished, key=lambda task: task["_finished"]))
     return True
 
 
@@ -1428,6 +1442,20 @@ def _cancellation_mode(agent_type):
 
 def _valid(value, limit=128):
     return isinstance(value, str) and 0 < len(value) <= limit
+
+
+def _encodable(text):
+    """True when ``text`` survives a UTF-8 encode.
+
+    ``json.loads`` accepts an escape such as ``"\\ud800"`` and hands back a lone surrogate, and a
+    path built the same way reaches ``os.path``. Encoding those raises ``UnicodeEncodeError``,
+    which would surface as a 500, so callers refuse them as malformed input first.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _is_positive_int(value):
@@ -1446,6 +1474,10 @@ def _resolve_task_cwd(agent, requested):
     if requested is None:
         return None, None
     if not isinstance(requested, str) or not requested:
+        return None, "invalid_cwd"
+    # os.path.realpath rejects a NUL and cannot encode a lone surrogate, so refuse both here: a
+    # ValueError out of realpath would reach the handler's blanket except and answer 500.
+    if "\0" in requested or not _encodable(requested):
         return None, "invalid_cwd"
     candidate = os.path.realpath(requested)
     roots = list(agent.get("allowedRoots") or [])
@@ -1921,6 +1953,11 @@ def _create_task(request, _internal=False):
     input_text = request.get("input")
     if not _valid(input_text, MAX_BODY):
         return 400, {"error": "input_required"}
+    if not _encodable(input_text):
+        # A JSON escape can decode to a lone surrogate, which the later size check would fail to
+        # encode; refuse the text itself, naming the field, instead of answering 500.
+        return 400, {"error": "invalid_input",
+                     "message": "input must be UTF-8 text; it contains an unpaired surrogate"}
     session_id = request.get("sessionId")
     if session_id is not None and not _valid(session_id):
         return 400, {"error": "invalid_session_id"}
@@ -2287,11 +2324,11 @@ class Handler(BaseHTTPRequestHandler):
             supplied.strip().encode("utf-8"), TOKEN.encode("utf-8"))
 
     def _submit(self):
-        error, request = self._read_json_body()
+        error, payload = self._read_json_body()
         if error:
-            return self._json(error, request)
-        status, body = _create_task(request)
-        wait_ms = request.get("waitMs")
+            return self._json(error, payload)
+        status, body = _create_task(payload)
+        wait_ms = payload.get("waitMs")
         if status == 202 and wait_ms:
             # _create_task validated the wait before it created the task, so a submission that
             # reaches here carries a valid one: block on it the way GET /v1/tasks/:id?waitMs=

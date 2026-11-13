@@ -16,7 +16,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from relay_helpers import ROOT, PYTHON, Relay, SERVER, start_http_server, stop_http_server
+from relay_helpers import (PRINT_ARGV, ROOT, PYTHON, Relay, SERVER, start_http_server,
+                           stop_http_server)
 
 sys.path.insert(0, os.path.join(ROOT, "src"))
 from server import _WARNED_FALLBACK, default_config_path
@@ -111,6 +112,30 @@ class RelayTests(unittest.TestCase):
             self.assertTrue(bounded["outputTruncated"])
         finally:
             quick.close()
+
+    def test_evicts_the_task_that_finished_first_not_the_one_created_first(self):
+        # The eviction victim is the task that finished longest ago, not the one created first:
+        # a long run's result stays stored when the next submission needs room.
+        relay = Relay([{"id": "slow", "command": PYTHON,
+                        "args": ["-c", "import sys,time; time.sleep(0.4); print(sys.argv[1])"]},
+                       {"id": "quick", "command": PYTHON,
+                        "args": ["-c", "import sys; print(sys.argv[1])"]}],
+                      env={"A2A_RELAY_MAX_TASKS": "2"})
+        try:
+            _, first = relay.submit(agentId="slow", input="one")
+            _, second = relay.submit(agentId="quick", input="two")
+            self.assertEqual(relay.wait_task(second["id"])["status"], "completed")
+            self.assertEqual(relay.wait_task(first["id"])["status"], "completed")
+            _, third = relay.submit(agentId="slow", input="three")
+            self.assertTrue(third["id"])
+            # The first submission finished last, so it is kept; the earlier finisher is gone.
+            status, kept = relay.request("GET", f"/v1/tasks/{first['id']}")
+            self.assertEqual(status, 200)
+            self.assertEqual(kept["output"], "one")
+            status, _ = relay.request("GET", f"/v1/tasks/{second['id']}")
+            self.assertEqual(status, 404)
+        finally:
+            relay.close()
 
     def test_queues_at_the_concurrency_limit_and_evicts_the_oldest_terminal_task(self):
         relay = Relay({"id": "work", "command": PYTHON,
@@ -215,6 +240,28 @@ class RelayTests(unittest.TestCase):
             self.assertEqual(payload["error"], "command_input_too_large")
         finally:
             argument_limited.close()
+
+    def test_refuses_unencodable_input_and_cwd_with_400_and_creates_nothing(self):
+        relay = Relay({"id": "echo", "command": PYTHON, "args": PRINT_ARGV})
+        try:
+            # The escape is sent verbatim: a lone surrogate is not UTF-8, so only the escape keeps
+            # this test's own body valid.
+            status, payload = relay.request(
+                "POST", "/v1/tasks", '{"agentId": "echo", "input": "\\ud800"}')
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_input")
+            status, payload = relay.request(
+                "POST", "/v1/tasks", '{"agentId": "echo", "input": "hello", "cwd": "/tmp/a\\u0000b"}')
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_cwd")
+            status, payload = relay.request(
+                "POST", "/v1/tasks", '{"agentId": "echo", "input": "hello", "cwd": "/tmp/\\ud800"}')
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"], "invalid_cwd")
+            _, listing = relay.request("GET", "/v1/tasks")
+            self.assertEqual(listing["tasks"], [])
+        finally:
+            relay.close()
 
     def test_deduplicates_task_submission_by_request_id_and_rejects_conflicting_reuse(self):
         relay = Relay({"id": "echo", "command": PYTHON, "args": ["-c", "import sys; print(sys.argv[1])"]})
