@@ -680,8 +680,10 @@ exit 0
             result = self._install(env, "--uninstall")
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = self._take_log(tmp)
-            self.assertIn("launchctl bootout gui/", "\n".join(calls))
-            self.assertIn("/com.agent-relay.update", "\n".join(calls))
+            self.assertIn(f"launchctl bootout gui/{os.getuid()}/com.agent-relay.update",
+                          calls)
+            self.assertIn("removed the release-check timer (com.agent-relay.update)",
+                          result.stdout)
 
     def test_no_update_timer_removes_the_systemd_update_units_but_keeps_the_service(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -935,6 +937,10 @@ exit 0
 
             result = self._install(env, "--uninstall")
             self.assertEqual(result.returncode, 0, result.stderr)
+            # Nothing was installed: say so for both artifacts instead of going quiet.
+            self.assertIn("relay service not installed (", result.stdout)
+            self.assertIn("no release-check timer installed (", result.stdout)
+            self.assertNotIn("removed the release-check timer", result.stdout)
 
     def test_timer_uses_metadata_only_checker_on_linux(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -52,14 +52,27 @@ if [ "$UNINSTALL" = "1" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
     launchctl unload "$PLIST" 2>/dev/null || true
-    rm -f "$PLIST"
-    echo "removed $PLIST"
+    if [ -f "$PLIST" ]; then
+      rm -f "$PLIST"
+      echo "removed $PLIST"
+    else
+      echo "relay service not installed ($PLIST was already absent)"
+    fi
     UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
-    launchctl bootout "gui/$(id -u)/$UPDATE_LABEL" 2>/dev/null \
-      || launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
+    REMOVED_UPDATE_TIMER=0
+    if launchctl bootout "gui/$(id -u)/$UPDATE_LABEL" 2>/dev/null; then
+      REMOVED_UPDATE_TIMER=1
+    elif launchctl unload "$UPDATE_PLIST" 2>/dev/null; then
+      REMOVED_UPDATE_TIMER=1
+    fi
     if [ -f "$UPDATE_PLIST" ]; then
       rm -f "$UPDATE_PLIST"
-      echo "removed $UPDATE_PLIST"
+      REMOVED_UPDATE_TIMER=1
+    fi
+    if [ "$REMOVED_UPDATE_TIMER" = "1" ]; then
+      echo "removed the release-check timer ($UPDATE_LABEL)"
+    else
+      echo "no release-check timer installed ($UPDATE_PLIST was already absent)"
     fi
   else
     UNIT="$HOME/.config/systemd/user/agent-relay.service"
