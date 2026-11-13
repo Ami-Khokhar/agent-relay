@@ -600,14 +600,14 @@ def load_registry(path):
         if model is not None:
             if not isinstance(model, str) or not model.strip():
                 raise ValueError(
-                    f"Invalid model: agent {agent_id}: model must be a non-empty string")
+                    f"Invalid model: agent {agent_id}: model must be a non-blank string")
             metadata["model"] = model.strip()
         tags = raw.get("tags")
         if tags is not None:
             if not isinstance(tags, list) or not all(
                     isinstance(item, str) and item.strip() for item in tags):
                 raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
-                                 "non-empty strings")
+                                 "non-blank strings")
             metadata["tags"] = [item.strip() for item in tags]
         role = raw.get("role")
         if role is not None:
