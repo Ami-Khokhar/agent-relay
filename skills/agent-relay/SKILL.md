@@ -165,9 +165,12 @@ python3 src/mcp_server.py # MCP stdio server, in a second process
 The HTTP service is the core; MCP is a thin client over it. You do not have to start HTTP
 yourself: when the MCP process cannot reach a loopback relay it starts `server.py`
 detached (log: `~/.local/state/agent-relay/relay.log`). To keep it up across reboots, run
-`bash scripts/install-service.sh`; that installer also puts an `agent-relay` command on
-your `PATH`, and `agent-relay info` prints the relay URL, the artifact release page, the
-token path and the checkout in use. `SIGTERM` or `SIGINT` cancels running tasks and waits
+`bash scripts/install-service.sh`; that installer also writes an `agent-relay` command
+into `~/.local/bin` and prints the `export PATH="$HOME/.local/bin:$PATH"` line to add
+when that directory is not on your `PATH`. `agent-relay info` prints the relay URL the
+service was installed with, the artifact release page, the token path and the checkout in
+use; it does not start the MCP server, so MCP registration still names the absolute
+`src/mcp_server.py` path. `SIGTERM` or `SIGINT` cancels running tasks and waits
 briefly for adapters to stop.
 
 To update a source checkout, run `bash

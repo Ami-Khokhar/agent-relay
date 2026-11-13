@@ -10,7 +10,7 @@ Python 3.9 or newer is required. There are no package dependencies.
 python3 src/server.py
 ```
 
-If the service is installed, the `agent-relay` command on `PATH` reports what a person needs to know without touching the source tree: run `agent-relay info` for the relay URL, the artifact release page, the token path and the checkout in use.
+If the service is installed and the installer's bin directory (`~/.local/bin`) is on your `PATH`, `agent-relay info` reports what a person needs to know without touching the source tree: the relay URL, the artifact release page, the token path and the checkout in use.
 
 The HTTP API listens on `http://127.0.0.1:43124` by default. Every `/v1/` request needs the API token (see [Local security model](#local-security-model)); the relay creates it on first start at `~/.config/agent-relay/token`, and the MCP interface and `scripts/smoke.sh` read it from there. Start the MCP interface in a second process when the orchestrating client supports MCP:
 
@@ -52,7 +52,7 @@ bash scripts/install-service.sh --no-update-timer   # the service only, no sched
 bash scripts/install-service.sh --uninstall
 ```
 
-The installer also installs an `agent-relay` command in your per-user bin directory, so it is on your `PATH` and the commands in these docs need no absolute source path. In one call, `agent-relay info` prints the relay URL, the artifact release page, the token path and the checkout the relay runs from; `--uninstall` removes the command again.
+The installer writes an `agent-relay` command into `~/.local/bin`. If that directory is not on your `PATH` (the macOS default), it prints the `export PATH="$HOME/.local/bin:$PATH"` line to add. In one call, `agent-relay info` prints the relay URL the service was installed with, the artifact release page, the token path and the checkout the relay runs from. `--uninstall` removes the wrapper it installed and leaves a file it did not write. The command does not start the MCP server, so the registration blocks above keep their absolute `src/mcp_server.py` paths.
 
 The default install schedules a release check that runs the checkout's
 `src/release_discovery.py`, so a checkout missing that file is rejected before
