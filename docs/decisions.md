@@ -32,7 +32,13 @@ what "changed since staging" means, while release drift stays covered by the
 identity-digest comparison. Consequence: an update flows approve → stage →
 prepare → activate with the checkout at the old revision throughout, and a
 checkout mutated between staging and preparation is still refused before any
-drain effect. The integrated acceptance suite
+drain effect. The acquired drain's revision is then compared with that same
+`sourceCommit`, so the claim above is enforced rather than assumed: when
+`scripts/update.sh` has fast-forwarded the checkout while its restart is
+deferred, the running relay is still at the old commit, and preparation now
+refuses by name — releasing the hold it just acquired and journaling nothing —
+instead of closing admission for a transaction `activate` can only refuse. The
+integrated acceptance suite
 (`test/test_safe_update_acceptance.py`) fails without this fix.
 
 ## Temperature configuration errors stay visible and tests isolate owner probes

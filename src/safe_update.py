@@ -319,6 +319,17 @@ def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=No
         acquired = update_drain.acquire_drain(base_url, transaction_id, token=token)
     except update_drain.DrainError as exc:
         raise UpdateError("the drain could not be acquired: %s" % exc)
+    drained = acquired.get("revision")
+    if drained != receipt["sourceCommit"]:
+        # activate returns the checkout to this exact starting revision; a
+        # running relay on any other commit leaves a journaled transaction that
+        # can only be refused later, holding admission for nothing.
+        note = _release_drain_after_failure(base_url, transaction_id, token, acquired)
+        raise UpdateError(
+            "the running relay is at %s, not the staged checkout %s; the drain was "
+            "acquired on a revision activation cannot return to. Restart the relay from "
+            "%s, or re-stage the checkout, then prepare again; %s"
+            % (drained, receipt["sourceCommit"], receipt["sourceCommit"], note))
     try:
         record = update_transaction.begin_transaction(
             {**receipt, "transactionId": transaction_id, "drain": acquired},
