@@ -307,11 +307,12 @@ def visible(task, include_input=False):
     """The task as clients see it. The prompt is left out unless asked for: callers already
     hold it, and echoing it on every poll fills their context. inputChars is always there.
 
-    Rendered under LOCK: the worker thread adds startedAt to this same dict as it starts a task
-    and finishedAt/output as it finishes one (see _drain and _finish), so a render that walked
-    the dict after releasing the lock could raise "dictionary changed size during iteration" and
-    turn an ordinary poll into a 500. LOCK is reentrant, so a caller already holding it is fine,
-    and the body therefore always describes one snapshot no worker can have half-updated.
+    Rendered while LOCK is held, because every write to a live task dict holds it: the worker
+    side stamps _deadline/startedAt as a task starts and finishedAt/output as it finishes, and a
+    render that walked the dict outside the lock could raise "dictionary changed size during
+    iteration" and turn an ordinary poll into a 500. LOCK is reentrant, so a caller that already
+    holds it stays correct, and the body then describes one snapshot no writer can half-update.
+    See "Every write to a live task dict holds LOCK" in docs/decisions.md.
     """
     with LOCK:
         snapshot = {key: value for key, value in task.items()
@@ -1294,9 +1295,8 @@ def _run_http(agent, task):
 
 
 def _worker(agent, task):
-    # One deadline covers process startup, request delivery, execution, and reading an HTTP
-    # adapter's response; a spawned adapter's output is collected under a short post-exit grace.
-    task["_deadline"] = time.monotonic() + task["timeoutMs"] / 1000.0
+    # _drain stamped the deadline while it held LOCK and before this thread existed: every write
+    # to a live task dict happens under LOCK, because a poll may be rendering it (see visible).
     try:
         kind = agent["type"]
         if kind == "command":
@@ -1365,6 +1365,11 @@ def _drain():
             task["_adapter"] = agent["type"]
             task["status"] = "running"
             task["startedAt"] = now_iso()
+            # One deadline covers process startup, request delivery, execution, and reading an HTTP
+            # adapter's response; a spawned adapter's output is collected under a short post-exit
+            # grace. Stamped here, under LOCK, and before the thread exists: a worker that added it
+            # after starting would be writing a dict that a poll may be rendering (see visible).
+            task["_deadline"] = time.monotonic() + task["timeoutMs"] / 1000.0
             threading.Thread(target=_worker, args=(agent, task), daemon=True).start()
 
 
@@ -1706,9 +1711,9 @@ def _delegation_error(parent, agent):
 
 
 def _list_tasks(session_id=None, status=None, limit=100):
-    # One lock hold covers the filter, the order and every render: a snapshot of the listing then
-    # describes the tasks as they were at one instant, and no render walks a dict that a starting
-    # or finishing worker is still writing (see visible).
+    # One lock hold covers the filter, the order and every render: the listing then describes the
+    # tasks as they were at one instant, and no render walks a dict a writer is still updating
+    # (every write to a live task dict holds LOCK — see visible and docs/decisions.md).
     with LOCK:
         tasks = [task for task in TASKS.values()
                  if (session_id is None or task.get("sessionId") == session_id)

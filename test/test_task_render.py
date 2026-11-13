@@ -1,10 +1,11 @@
-"""A task's response body is rendered from a snapshot no worker thread can mutate.
+"""A task's response body is rendered from a snapshot no writer can mutate.
 
-The real window — the worker thread inserting startedAt while a poll renders the same dict, or
-_finish inserting finishedAt/output — cannot be hit on demand, so these tests stand in for it with
-a task dict whose iteration mutates it, exactly as the worker would. What the mapping needs to
-decide that is the relay's own rule: a worker inserts only while LOCK is free, so a render that
-holds LOCK sees a still task and a render that released it walks a dict that changes underneath.
+The relay's rule is that a write to a live task dict holds LOCK: the worker side stamps the
+start and finish fields, and every reader renders under the lock. The two directions are tested
+separately. ``RacingTask`` stands in for the worker's insert landing while a poll renders the same
+dict (the real window cannot be hit on demand), and ``LockGuardTask`` is the referee for the
+writer's side: the dict records any write made without the lock while ``_drain`` and the worker
+thread it starts run exactly as in production.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import json
 import os
 import sys
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from unittest import mock
@@ -50,17 +52,62 @@ class RacingTask(dict):
         return walk()
 
 
-def _task(task_id="racing-task", status="queued"):
-    task = RacingTask(
-        id=task_id,
-        sessionId="session-1",
-        agentId="echo",
-        input="prompt",
-        status=status,
-        createdAt="2026-01-01T00:00:00.000Z",
-        timeoutMs=1000,
-    )
-    return task
+def _task(task_id="racing-task", status="queued", kind=RacingTask, **fields):
+    task = {
+        "id": task_id,
+        "sessionId": "session-1",
+        "agentId": "echo",
+        "input": "prompt",
+        "status": status,
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "timeoutMs": 1000,
+    }
+    task.update(fields)
+    return kind(**task)
+
+
+class LockGuardTask(dict):
+    """A task dict that records every write made without holding LOCK.
+
+    Construction happens before ``armed``, so seeding the task is not a write the relay makes.
+    After that, ``_drain`` and the worker thread it starts touch this dict exactly as they touch a
+    real task's, and any mutation that did not take the lock is recorded instead of being hidden.
+    """
+
+    def __init__(self, **fields):
+        super().__init__(**fields)
+        self.violations = []
+        self.armed = False
+
+    def _check(self, action):
+        if self.armed and not server.LOCK._is_owned():
+            self.violations.append(action)
+
+    def __setitem__(self, key, value):
+        self._check("set " + str(key))
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._check("del " + str(key))
+        super().__delitem__(key)
+
+    def update(self, *args, **kwargs):
+        self._check("update")
+        super().update(*args, **kwargs)
+
+    def pop(self, *args):
+        self._check("pop " + str(args[0] if args else ""))
+        return super().pop(*args)
+
+    def setdefault(self, key, default=None):
+        self._check("setdefault " + str(key))
+        return super().setdefault(key, default)
+
+
+def _dequeue(task):
+    with server.LOCK:
+        if task in server.QUEUE:
+            server.QUEUE.remove(task)
 
 
 class TaskRenderTests(unittest.TestCase):
@@ -133,6 +180,35 @@ class TaskRenderTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(body["status"], "cancelled")
         self.assertNotIn("_finished", body)
+
+    def test_a_worker_start_writes_the_task_dict_only_under_the_lock(self):
+        task = _task(kind=LockGuardTask, timeoutMs=5000)
+        self.add_task(task)
+        agent = {"id": "echo", "type": "command",
+                 "command": sys.executable, "args": ["-c", "print('ok')"]}
+        task.armed = True
+        with mock.patch.dict(server.AGENTS, {"echo": agent}), \
+                mock.patch.object(server, "ACTIVE", 0):
+            with server.LOCK:
+                server.QUEUE.append(task)
+            self.addCleanup(_dequeue, task)
+            server._drain()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                with server.TASK_CONDITION:
+                    if task["status"] not in ("queued", "running"):
+                        break
+                    server.TASK_CONDITION.wait(0.05)
+        self.assertEqual(task["status"], "completed", task)
+        self.assertEqual(task["output"], "ok")
+        # The drain and finish fields (_deadline, _extra_args, _sandbox, startedAt, _proc,
+        # finishedAt, output) were all written with LOCK held, including from the worker thread.
+        self.assertEqual(task.violations, [])
+        status, listing = self.get("/v1/tasks")
+        self.assertEqual(status, 200, listing)
+        status, body = self.get("/v1/tasks/" + task["id"])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["status"], "completed")
 
 
 if __name__ == "__main__":
