@@ -87,9 +87,7 @@ Because a run can load a machine for a long time, the relay also reads host pres
 
 These are adapter entry points, not a claim that each agent has been invoked end to end. The automated tests use fake commands and fake HTTP responses.
 
-## Next increments
-
-### Feedback draft (issue #116, part of #114)
+## Feedback reports (issue #116, part of #114)
 
 The first reporting flow is local draft preparation plus a prefilled fixed GitHub issue page.
 `prepare_feedback` performs no HTTP request and has no submit or consent flag; the user reviews
@@ -97,13 +95,21 @@ the public draft and submits in their own GitHub session. Inputs are bounded and
 allowlisted category, operation, OS family, version, concrete blocked action, and workaround
 actually used. Version accepts bounded SemVer, a 7-40 character hexadecimal revision, or `unknown`;
 all free text rejects credential-shaped values and control/bidirectional characters. Missing either
-evidence field yields no draft.
+evidence field yields no draft. Each narrative field is capped at 1000 characters and the version
+at 80, and `urlencode` writes each UTF-8 byte as `%XX`, so one code point costs at most 12 URL
+characters: the largest accepted draft — every field at its limit, every code point astral — yields
+a prefilled link under 26 kB, which browsers and GitHub carry. Those field caps are the only length
+bound, so no draft that satisfies them can be refused as too long. The drafting module has no
+command-line entry point: README, this document and the skill name the MCP `prepare_feedback` tool
+as the interface, and the CLI that briefly existed was retired rather than documented twice.
 Prompts, outputs, paths, environment values, and task IDs are not accepted as fields. Known
 credential patterns are rejected as an extra guard, not treated as proof that prose is private.
 No report archive or telemetry is retained. The skill stays quiet until a concrete relay blocker
 has been worked around and the task has resumed; only the user-facing orchestrator may offer a
 report at a natural checkpoint, at most once per work session. Workers hand facts to the parent.
 Normal errors, warnings, retries, and worker/configuration/provider failures alone are not triggers.
+
+## Next increments
 
 1. Add SQLite task storage before depending on task IDs across relay restarts.
 2. Add native adapters only where needed for session continuation, event streams, and agent-specific cancellation. Keep capability flags truthful.

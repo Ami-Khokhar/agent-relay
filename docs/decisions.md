@@ -1,5 +1,19 @@
 # Decisions
 
+## Feedback drafts have one length bound: the published field caps
+
+The draft carried two assembly bounds that contradicted each other: the prefilled-URL check fired
+at about 1850 characters of body, so the advertised 1000-character narrative fields could not be
+filled together, and the later 4096-character body check could never run. A fixed URL cap is
+content-dependent, because percent-encoding expands each code point differently. Both assembly
+bounds are gone and the field caps are the only limit: 1000 characters for the blocked action and
+the workaround, 80 for the version. `urlencode` writes each UTF-8 byte as `%XX`, so one code point
+costs at most 12 URL characters and the largest accepted draft encodes to under 26 kB, which
+browsers and GitHub carry. The `feedback` module also loses its `main()`/argparse entry point:
+README, DESIGN.md and the skill describe the MCP `prepare_feedback` tool as the interface, and
+nothing else called the CLI. Consequence: no input that satisfies the published limits is refused
+as too long, and a future field-limit change only moves the link within that derivation.
+
 ## `?tag=` is a repeatable all-match filter, and `model`/`tags` stay listing-only metadata
 
 Callers need to pick a worker by data instead of matching `name` prose, so `GET /v1/agents`
