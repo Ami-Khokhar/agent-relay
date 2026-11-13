@@ -7,6 +7,7 @@ service control but its three admin verbs and healthz.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -20,10 +21,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import safe_update
 import update_drain
+import update_staging
 import update_transaction
 from pathlib import Path
 from relay_helpers import TOKEN, Relay, send_json, start_http_server, stop_http_server
 import release_identity as identity
+# The real staging fixture: one real checkout, real git, real receipts. Reused
+# here so the CLI consumer's verification runs against a genuine stage instead
+# of a fake only this file could believe in.
+import test_update_staging as staging_fixture
 
 # Sleeps for the seconds the task's input names, then prints "drained".
 SLEEPER = "import sys, time; time.sleep(float(sys.argv[-1])); print('drained')"
@@ -109,10 +115,15 @@ class DrainTests(unittest.TestCase):
         self.assertTrue(acquired["capability"])
         for thread in threads:
             thread.join()
-        self.assertEqual({(status, body.get("error")) for status, body in results},
-                         {(202, None), (503, "drain_active")},
-                         "each racing submission either fully lands before the "
-                         "close or refuses as one clean drain refusal")
+        outcomes = [(status, body.get("error")) for status, body in results]
+        self.assertLessEqual(set(outcomes), {(202, None), (503, "drain_active")},
+                             "each racing submission either fully lands before the "
+                             "close or refuses as one clean drain refusal")
+        # Whether a given submission lands is a scheduling race; that admission
+        # closed is not. The round runs for many multiples of the 20ms head
+        # start, so at least one submission meets the held drain.
+        self.assertIn((503, "drain_active"), outcomes,
+                      "submissions racing a held drain are refused, not all admitted")
         self.assertFalse(acquired["quiesced"],
                          "an acquire is the hold, not a healthz guess")
         # A replay is not an admission: it keeps its identity and its 200,
@@ -205,6 +216,46 @@ class DrainTests(unittest.TestCase):
             "POST", "/v1/admin/update/drain",
             {"transactionId": "a?", "revision": revision})[0], 400)
 
+    def test_a_redirect_answer_is_never_followed_with_the_token(self):
+        """The relay's answer is final: no 3xx is followed, so the bearer token
+        (and the drain capability) can never be forwarded to another origin."""
+        stolen = []
+
+        def canary(request):
+            stolen.append((request.path, request.headers.get("authorization")))
+            send_json(request, 200, {"quiesced": True})
+
+        canary_server, canary_port = start_http_server(canary)
+        target = "http://127.0.0.1:%d/v1/admin/update/drain" % canary_port
+
+        def redirect(request):
+            request.send_response(302)
+            request.send_header("location", target)
+            request.send_header("content-length", "0")
+            request.end_headers()
+
+        redirect_server, redirect_port = start_http_server(redirect)
+        base = "http://127.0.0.1:%d" % redirect_port
+        try:
+            for verb, call in (
+                ("acquire", lambda: update_drain.acquire_drain(
+                    base, "txn-r", token=TOKEN, wait_s=0.0)),
+                ("status", lambda: update_drain.drain_status(
+                    base, "txn-r", token=TOKEN, revision="a" * 40,
+                    capability="0" * 64)),
+                ("release", lambda: update_drain.release_drain(
+                    base, "txn-r", token=TOKEN, revision="a" * 40,
+                    capability="0" * 64))):
+                with self.subTest(verb=verb):
+                    with self.assertRaises(update_drain.DrainError) as refused:
+                        call()
+                    self.assertEqual(refused.exception.code, "drain_unreachable")
+        finally:
+            stop_http_server(redirect_server)
+            stop_http_server(canary_server)
+        self.assertEqual(stolen, [], "no request, token-bearing or not, reached the "
+                                    "redirect target")
+
     # ---------------------------------------------------- workflows during a drain
 
     def test_accepted_workflows_continue_their_children_during_a_drain(self):
@@ -217,6 +268,9 @@ class DrainTests(unittest.TestCase):
             {"id": "second", "agentId": "echo", "input": "hello", "needs": ["first"]},
         ]})
         self.assertEqual(status, 202)
+        # A finished task to name as a parent below: `parentTaskId` is the one
+        # caller-settable field that looks like the engine's internal path.
+        parent_task = relay.run_task(agentId="slow", input="0.01")
         # Hold the drain while the flaky attempt is in flight. That attempt
         # then fails, and its retry — a task created after the drain started —
         # submits through the trusted internal path and completes.
@@ -228,15 +282,21 @@ class DrainTests(unittest.TestCase):
         self.assertEqual(steps["first"]["attempts"], 2, "the retry ran at all")
         self.assertEqual(steps["second"]["output"], "hello")
         # The children were not external admissions: the body had no chance
-        # to opt out. A caller cannot send a flag to buy the same path.
-        self.assertEqual(relay.request("POST", "/v1/workflows", {"steps": [
-            {"id": "only", "agentId": "echo", "input": "bang"},
-            {"parentTaskId": "opaque-bypass", "id": "else", "agentId": "echo",
-             "input": "bang"}]})[0], 400, "a request field never bypasses the drain")
+        # to opt out. A valid task naming a parent — the request field that
+        # most resembles the engine's own child creation — is refused by the
+        # same drain gate as every other new admission, and the very same body
+        # is admitted once the hold ends, so the refusal is the drain's.
+        delegated = {"agentId": "echo", "input": "bang",
+                     "parentTaskId": parent_task["id"]}
+        status, refusal = relay.submit(**delegated)
+        self.assertEqual((status, refusal.get("error")), (503, "drain_active"),
+                         "a request field never bypasses the drain")
         self.assertEqual(relay.submit(agentId="echo", input="external")[0], 503)
         update_drain.release_drain(relay.base, "txn-wf", token=TOKEN,
                                    revision=acquired["revision"],
                                    capability=acquired["capability"])
+        self.assertEqual(relay.submit(**delegated)[0], 202,
+                         "the same body is admitted as soon as the drain is released")
 
     def test_new_workflow_submit_and_resume_refuse_while_the_drain_is_held(self):
         relay = self.start([self.sleeper(), self.echo()])
@@ -390,14 +450,15 @@ class DrainTests(unittest.TestCase):
             self.assertEqual(status, 202)
             self.assertTrue(started.wait(5))
             with patch.object(safe_update, "_stage_receipt",
-                              self._fake_stage_failure), \
+                              self._fake_stage_success), \
                     patch.object(safe_update, "_consumed_consent", self._fake_consent), \
                     patch.dict(os.environ, {"AGENT_RELAY_TOKEN": TOKEN}):
                 self.assertEqual(
                     safe_update.cmd_drain("0.4.0", os.getcwd(), base_url=relay.base,
                                           transaction_id="cli-slow", quiesce_wait_s=0.5), 1)
             release_adapter.set()
-            # Even a failed rehearsal releases: the hold never spills out of it.
+            # Even a rehearsal that never quiesces releases: the hold never
+            # spills out of it.
             self.assertEqual(relay.submit(agentId="hosted", input="0")[0], 202)
         finally:
             stop_http_server(server)
@@ -442,11 +503,115 @@ class DrainTests(unittest.TestCase):
         finally:
             stop_http_server(server)
 
+    # ---------------------------------------------------- real stage and consent
+
+    def _real_stage(self, fixture, state, now):
+        """Stage the fixture's release for real: real git, real receipt, and
+        the consent record the stage burns on its way through."""
+        fixture.approve(state)
+        home = Path(fixture.tmp.name)
+        git = update_staging.Git(str(staging_fixture._fake_git_script(
+            home, home / "fake-git.log", str(fixture.origin))))
+        return update_staging.stage_release(
+            fixture.identity(), root=fixture.repo, state_dir=state, git=git,
+            manifest=fixture.manifest, manifest_bytes=fixture.manifest_bytes, now=now)
+
+    def test_drain_cli_verifies_a_real_stage_receipt_and_consumed_consent(self):
+        """The CLI's own precondition, unpatched: the receipt on disk and the
+        consumed consent decide it, and a tampered one is refused before any
+        hold is taken."""
+        with staging_fixture._Fixture() as fixture:
+            home = Path(fixture.tmp.name)
+            state = home / "agent-relay"
+            self._real_stage(fixture, state, staging_fixture.NOW + 10)
+            relay = self.start([self.sleeper()])
+            environ = {"AGENT_RELAY_TOKEN": TOKEN, "XDG_STATE_HOME": str(home)}
+            with patch.dict(os.environ, environ):
+                self.assertEqual(
+                    safe_update.cmd_drain(staging_fixture.TAG, str(fixture.repo),
+                                          base_url=relay.base, transaction_id="real-txn",
+                                          quiesce_wait_s=10), 0)
+                self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202)
+                # The real receipt is what makes a drain legal: a different
+                # install dir has no stage staged from it.
+                with self.assertRaises(safe_update.UpdateError) as foreign:
+                    safe_update._stage_receipt(staging_fixture.TAG,
+                                               str(home / "other-checkout"), state)
+                self.assertIn("no verified stage", str(foreign.exception))
+                # And the real consent record must show staging consumed it.
+                consent_path = state / "consent.json"
+                consent = json.loads(consent_path.read_text())
+                self.assertIs(consent["consumed"], True)
+                consent["consumed"] = False
+                consent_path.write_text(json.dumps(consent, indent=1))
+                with self.assertRaises(safe_update.UpdateError) as unconsumed:
+                    safe_update._consumed_consent(fixture.identity(), state)
+                self.assertIn("never consumed", str(unconsumed.exception))
+                # An unconsumed consent refuses the whole command before the
+                # relay is touched, so admission never closes.
+                with self.assertRaises(safe_update.UpdateError):
+                    safe_update.cmd_drain(staging_fixture.TAG, str(fixture.repo),
+                                          base_url=relay.base, transaction_id="nope",
+                                          quiesce_wait_s=1)
+            self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202,
+                             "a refused precondition takes no hold")
+
+    def test_newest_stage_is_chosen_by_receipt_time_not_directory_name(self):
+        """Two real stages of one tag: the receipts' createdAt decides, even
+        when the directory names sort the other way."""
+        with staging_fixture._Fixture() as fixture:
+            home = Path(fixture.tmp.name)
+            state = home / "agent-relay"
+            older = self._real_stage(fixture, state, staging_fixture.NOW + 10)
+            newer = self._real_stage(fixture, state, staging_fixture.NOW + 20)
+            self.assertLess(older["createdAt"], newer["createdAt"])
+            # stage-<tag>-<random> names carry no age; make the older one sort
+            # last so name order and receipt time disagree.
+            moved = Path(older["stage"]).with_name(Path(newer["stage"]).name + "-zz")
+            os.rename(older["stage"], moved)
+            receipt_path = moved / update_staging.STAGE_RECEIPT_NAME
+            body = json.loads(receipt_path.read_text())
+            body["stage"] = str(moved)
+            receipt_path.write_text(json.dumps(body, indent=1))
+            chosen, stored = safe_update._stage_receipt(
+                staging_fixture.TAG, str(fixture.repo), state)
+            self.assertEqual(chosen["createdAt"], newer["createdAt"],
+                             "the newest succeeded stage wins, not the last name")
+            self.assertEqual(chosen["stage"], newer["stage"])
+            self.assertEqual(stored, fixture.identity())
+
+    def test_drain_cli_refuses_a_failed_stage_before_acquiring(self):
+        """The stage check failing is not a rehearsal: no hold is taken, so
+        nothing needs releasing and admission is never closed."""
+        relay = self.start([self.sleeper()])
+        called = []
+        real_request = update_drain._request
+
+        def recording(method, base_url, path, **kwargs):
+            called.append(path)
+            return real_request(method, base_url, path, **kwargs)
+
+        with patch.object(safe_update, "_stage_receipt", self._stage_failure), \
+                patch.object(safe_update, "_consumed_consent", self._fake_consent), \
+                patch.object(update_drain, "_request", recording), \
+                patch.dict(os.environ, {"AGENT_RELAY_TOKEN": TOKEN}):
+            with self.assertRaises(safe_update.UpdateError) as refused:
+                safe_update.cmd_drain("0.4.0", os.getcwd(), base_url=relay.base,
+                                      transaction_id="cli-bad", quiesce_wait_s=1)
+        self.assertIn("no verified stage of 0.4.0", str(refused.exception))
+        self.assertEqual(called, [], "the stage is proven before any admin verb")
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202,
+                         "a failed stage never closed admission")
+
+    # The fake seams above exist only to reach the timeout and mid-rehearsal
+    # paths; the real receipt and consent verification has its own test
+    # (test_drain_cli_verifies_a_real_stage_receipt_and_consumed_consent).
     def _fake_stage_success(self, tag, install_dir, state_dir):
         return {}, {"tag": tag}
 
-    def _fake_stage_failure(self, tag, install_dir, state_dir):
-        return {}, {"tag": tag}
+    def _stage_failure(self, tag, install_dir, state_dir):
+        raise safe_update.UpdateError("no verified stage of %s staged from %s"
+                                      % (tag, install_dir))
 
     def _fake_consent(self, identity, state_dir):
         return {}

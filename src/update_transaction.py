@@ -373,8 +373,9 @@ def begin_transaction(receipt, *, state_dir):
                     "transaction %s is already live in %r; one install holds one update "
                     "transaction at a time" % (record["transactionId"], record["phase"]))
             raise UpdateError(
-                "transaction %s is still recorded (%s); recover-abort it before preparing "
-                "another" % (record["transactionId"], record["phase"]))
+                "transaction %s is still recorded (%s); run `safe_update recover %s` "
+                "to finish it before preparing another"
+                % (record["transactionId"], record["phase"], record["transactionId"]))
         drain = receipt.get("drain")
         revision = drain.get("revision") if isinstance(drain, dict) else None
         transaction = receipt.get("transactionId")

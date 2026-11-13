@@ -74,6 +74,21 @@ def _text(value, limit):
     return isinstance(value, str) and 0 < len(value) <= limit
 
 
+def _encodable(text):
+    """True when ``text`` survives a UTF-8 encode.
+
+    ``json.loads`` accepts an escape such as ``"\\ud800"`` and hands back a lone surrogate. The
+    engine encodes a step input to measure it, and the cwd resolver hands the path to ``os.path``,
+    so either raises ``UnicodeEncodeError`` outside the validation it should have failed, and the
+    blanket handler answers 500. Both are refused here, before a run exists.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _tail_lines(text, keep):
     """The last ``keep`` non-empty lines of a stream, whitespace-trimmed."""
     return [line.strip() for line in (text or "").splitlines() if line.strip()][-keep:]
@@ -210,6 +225,10 @@ def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_in
         if not _text(text, max_body):
             return bad("input_required",
                        f"Step {step_id} needs a non-empty input of at most {max_body} characters")
+        if not _encodable(text):
+            return bad("invalid_input",
+                       f"steps[{position}].input must be UTF-8 text; it contains an unpaired "
+                       f"surrogate")
         if agent["type"] == "command" and len(text.encode("utf-8")) > max_command_input:
             return bad("command_input_too_large",
                        f"Step {step_id} input exceeds A2A_RELAY_MAX_COMMAND_INPUT_BYTES for a "
@@ -254,8 +273,15 @@ def validate_spec(spec, agents, max_steps, max_foreach, max_body, max_command_in
                            f"Step {step_id}.timeoutMs must be a positive integer{suffix}")
 
         cwd = raw.get("cwd")
-        if cwd is not None and (not isinstance(cwd, str) or not cwd):
-            return bad("invalid_cwd", f"Step {step_id}.cwd must be a non-empty string")
+        if cwd is not None:
+            if not isinstance(cwd, str) or not cwd:
+                return bad("invalid_cwd", f"Step {step_id}.cwd must be a non-empty string")
+            # os.path.realpath rejects a NUL and cannot encode a lone surrogate, so refuse both
+            # before the run exists instead of letting the resolver raise.
+            if "\0" in cwd or not _encodable(cwd):
+                return bad("invalid_cwd",
+                           f"steps[{position}].cwd must be a path that is UTF-8 text without a "
+                           f"NUL")
 
         # The relay is the authority on whether this agent can honour these; the shape is checked
         # here so an obvious mistake is a 400 rather than a step that fails when it is launched.
@@ -587,6 +613,13 @@ class WorkflowEngine:
             refused = self._drain_refusal() if self._drain_refusal else None
             if refused:
                 return refused
+            # Journals outlive eviction, so a journal-only id adds a stored run and takes the
+            # same room rule as a submission: without it each resumed id would grow the store
+            # and its executor thread past the bound. An id still stored finished is resumed
+            # in place, which adds no entry, so asking for room there would evict an unrelated
+            # finished run and release its requestId for nothing.
+            if prior is None and not self._make_room():
+                return 503, {"error": "workflow_capacity_reached"}
             workflow = self._new_workflow(saved["spec"], None, workflow_id=workflow_id)
             for step in workflow["steps"]:
                 done = saved["outputs"].get(step["id"])
@@ -908,7 +941,14 @@ class WorkflowEngine:
             # The full task error stays available on request (a single-run view), never in
             # the step error a summary or an event carries.
             step["errorDetail"] = task_error or None
-            step["output"] = failed.get("output") or None
+            if spec["foreach"] is not None:
+                # Keep the documented array shape on failure too: a caller parsing a
+                # foreach output must not break on the run it is inspecting. The failed
+                # item is serialized like any completed one (its own output, empty when it
+                # produced none); taskIds and errorDetail still name it.
+                step["output"] = json.dumps([task.get("output") or "" for task in tasks])
+            else:
+                step["output"] = failed.get("output") or None
             self._settle(step)
             return True
 

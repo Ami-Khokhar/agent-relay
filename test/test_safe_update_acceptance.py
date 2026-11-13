@@ -53,7 +53,6 @@ ORIGIN = "https://github.com/Ami-Khokhar/agent-relay.git"
 TAG = "0.5.0"
 MARKER = "# release marker: the 0.5.0 tree differs from the installed one"
 STAMP = "2026-11-11T00:00:00Z"
-NOW = 1_770_000_000.0
 TXN = "acceptance-txn"
 SLEEPER = "import sys, time; time.sleep(float(sys.argv[-1])); print('drained')"
 ECHO = "import sys; sys.stdout.write(sys.argv[1])"
@@ -200,9 +199,6 @@ class _World:
             return self.manifest_bytes
         raise identity.UpdateError(
             "no published stable release matches this tag; check the tag name")
-
-    def resolved_identity(self):
-        return identity.resolve_release(TAG, fetch_json=self.fetch_json)[0]
 
     @contextlib.contextmanager
     def boundaries(self, terminal=None, now=None):
@@ -730,6 +726,34 @@ class RefusalTest(_Acceptance):
                                    str(world.install), "--base-url", relay.base,
                                    "--transaction-id", TXN), 0)
         self.assertEqual(self.journal()["phase"], "prepared")
+
+    def test_a_checkout_fast_forwarded_past_the_drained_revision_refuses_preparation(self):
+        """Guard: the state ``scripts/update.sh`` leaves behind when its restart
+        is deferred — the checkout moved to the release while the relay still
+        runs the old commit — must refuse preparation by name, journal nothing
+        and give the acquired drain back, instead of closing admission for a
+        transaction activation can only refuse."""
+        world, relay = self.world, self.relay
+        self.assertEqual(world.approve(), 0)
+        _fixture_git(world.install, "fetch", "-q", str(world.base / "origin.git"), "main")
+        _fixture_git(world.install, "merge", "-q", "--ff-only", "FETCH_HEAD")
+        self.assertEqual(world.head(), world.new_commit,
+                         "the checkout moved to the release, the relay did not")
+        self.assertEqual(relay.revision(), world.old_commit,
+                         "the running relay still serves the old revision")
+        self.assertEqual(world.cli("stage", TAG, "--install-dir", str(world.install)), 0)
+        code, err = world.cli_text("prepare-activation", TAG, "--install-dir",
+                                   str(world.install), "--base-url", relay.base,
+                                   "--transaction-id", TXN)
+        self.assertEqual(code, 1)
+        self.assertIn(world.old_commit, err, "the refusal names the running revision")
+        self.assertIn(world.new_commit, err, "the refusal names the staged checkout")
+        self.assertIn("Restart the relay", err, "the refusal names the remedy")
+        self.assertIn("released again", err, "the acquired hold was given back")
+        self.assertIsNone(self.journal(), "no transaction was journaled")
+        self.assertEqual(world.head(), world.new_commit, "the checkout was never moved")
+        self.assertEqual(relay.submit(agentId="echo", input="open")[0], 202,
+                         "the released drain reopened admission")
 
 
 class AbortAndRejectionTest(_Acceptance):

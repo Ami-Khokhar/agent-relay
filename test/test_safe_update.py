@@ -1,4 +1,5 @@
 """Device-local approval and its public CLI boundaries (#119)."""
+import io
 import json
 import os
 import stat
@@ -6,8 +7,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
+from urllib.request import BaseHandler, Request, build_opener as _build_opener
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
@@ -45,10 +48,25 @@ class _Boundaries:
 
 
 class _FakeResponse:
-    """Minimal stand-in for one HTTP response from a stubbed opener."""
+    """Minimal stand-in for one HTTP response urllib's redirect machinery reads."""
 
-    def __init__(self, url, body):
-        self.url, self.body = url, body
+    def __init__(self, url, body, code=200, headers=None):
+        self.url, self.body, self.code = url, body, code
+        self.msg = "OK" if code == 200 else "Found"
+        self.headers = headers or {}
+        self.closed = False
+
+    def geturl(self):
+        return self.url
+
+    def info(self):
+        return self.headers
+
+    def read(self, size=-1):
+        return self.body
+
+    def close(self):
+        self.closed = True
 
     def __enter__(self):
         return self
@@ -56,35 +74,52 @@ class _FakeResponse:
     def __exit__(self, *args):
         return False
 
-    def geturl(self):
-        return self.url
 
-    def read(self, size=-1):
-        return self.body
+class _Redirect:
+    """A scripted 302 answer the production redirect handler must inspect."""
+
+    def __init__(self, location):
+        self.location = location
 
 
-class _RoutingOpener:
-    """Stub opener that answers each scripted request URL and records headers."""
+class _RoutingTransport(BaseHandler):
+    """Scripted HTTPS transport installed beside the real redirect handler.
+
+    urllib's own opener drives this transport, so a scripted 302 reaches the
+    production ``_CaptureRedirect``/``_NoRedirect`` handlers exactly as a real
+    redirect would; the test never raises the redirect itself.
+    """
+
+    handler_order = 100
 
     def __init__(self, routes):
         self.routes, self.requests = routes, []
 
-    def open(self, request, timeout=5):
+    def https_open(self, request):
         self.requests.append((request.full_url, request.headers.get("Accept")))
         response = self.routes.get(request.full_url)
         if response is None:
             raise AssertionError("unscripted request %s" % request.full_url)
         if isinstance(response, Exception):
             raise response
+        if isinstance(response, _Redirect):
+            return _FakeResponse(request.full_url, b"", 302,
+                                 {"location": response.location})
         return _FakeResponse(request.full_url, response)
+
+
+def scripted_opener(handler, transport):
+    """A real urllib opener with the production handler and one fake transport."""
+    return _build_opener(handler, transport)
 
 
 class FakeTerminal:
     def __init__(self, answers=(), tty=True):
         self.answers, self.tty = list(answers), tty
-        self.prompts, self.echoed = [], []
+        self.prompts, self.echoed, self.tty_checks = [], [], 0
 
     def is_tty(self):
+        self.tty_checks += 1
         return self.tty
 
     def prompt(self, message):
@@ -93,6 +128,16 @@ class FakeTerminal:
 
     def echo(self, message):
         self.echoed.append(message)
+
+
+class _Stream:
+    """A stand-in standard stream whose isatty answer the test controls."""
+
+    def __init__(self, tty):
+        self.tty = tty
+
+    def isatty(self):
+        return self.tty
 
 
 def release(tag=TAG):
@@ -249,6 +294,34 @@ class ApprovalTest(unittest.TestCase):
         with self.assertRaises(identity.UpdateError):
             identity.consume_consent(resolved_identity(), state_dir=link, now=NOW + 10)
 
+    def test_loose_state_directory_is_tightened_before_consent(self):
+        self.state.mkdir()
+        os.chmod(self.state, 0o777)
+        identity.approve(resolved_identity(), state_dir=self.state, now=NOW,
+                         terminal=FakeTerminal([TAG, COMMIT, "approve"]))
+        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode) & 0o077, 0,
+                         "a pre-existing shared state directory must be tightened")
+        self.assertTrue((self.state / "consent.json").is_file())
+
+    def test_state_directory_that_cannot_be_tightened_is_refused(self):
+        self.state.mkdir()
+        os.chmod(self.state, 0o777)
+        with patch("os.chmod"):  # a no-op chmod leaves the directory open
+            with self.assertRaises(identity.UpdateError) as caught:
+                identity.private_state_dir(self.state, "consent state")
+        self.assertIn("readable or writable by others", str(caught.exception))
+
+    def test_std_terminal_reports_a_real_console_on_every_platform(self):
+        # isatty() answers on Windows consoles, so no POSIX gate may hide a
+        # real interactive terminal from the approval contract.
+        with patch.object(identity, "IS_POSIX", False), \
+                patch.object(identity.sys, "stdin", _Stream(True)), \
+                patch.object(identity.sys, "stdout", _Stream(True)):
+            self.assertTrue(identity._StdTerminal().is_tty())
+        with patch.object(identity.sys, "stdin", _Stream(True)), \
+                patch.object(identity.sys, "stdout", _Stream(False)):
+            self.assertFalse(identity._StdTerminal().is_tty())
+
     def test_nonexistent_consent_is_refused(self):
         self.state.mkdir()
         with self.assertRaises(identity.UpdateError):
@@ -289,44 +362,52 @@ class CliTest(unittest.TestCase):
             mock.start()
             self.addCleanup(mock.stop)
 
-    def _terminal(self, answers):
-        terminal = FakeTerminal(answers)
+    def _terminal(self, answers=(), tty=True):
+        terminal = FakeTerminal(answers, tty=tty)
         mock = patch.object(identity, "_StdTerminal", lambda: terminal)
         mock.start()
         self.addCleanup(mock.stop)
         return terminal
 
     def test_inspect_is_metadata_only(self):
-        # Drives the real _fetch through a stubbed opener so the per-URL Accept
-        # header and the one-redirect asset policy of the documented contract
-        # are asserted against the actual HTTP boundary code.
+        # Drives the real _fetch through a real urllib opener whose HTTPS
+        # transport is scripted, so the per-URL Accept header and the
+        # one-redirect asset policy are asserted against the actual HTTP
+        # boundary code, production redirect handler included.
         asset = identity.ASSET_URL + "42"
         host = sorted(safe_update.ASSET_REDIRECT_HOSTS)[0]
         download = "https://%s/agent-relay-manifest.json" % host
         routes = {
             identity.RELEASE_BY_TAG_URL + TAG: json.dumps(release()).encode("utf-8"),
             identity.TAG_REF_URL + TAG: json.dumps({"object": {"sha": COMMIT, "type": "commit"}}).encode("utf-8"),
-            asset: safe_update._Redirected(download),
+            asset: _Redirect(download),
             download: json.dumps(manifest_body()).encode("utf-8"),
         }
-        opener = _RoutingOpener(routes)
-        with patch.object(safe_update, "build_opener", lambda handler: opener):
+        transport = _RoutingTransport(routes)
+        with patch.object(safe_update, "build_opener",
+                          lambda handler: scripted_opener(handler, transport)):
             with _Boundaries() as boundaries:
                 code = safe_update.main(["inspect", TAG])
         self.assertEqual(code, 0)
         self.assertEqual(boundaries.calls, [], "the CLI must never run git or install commands")
-        accepts = dict(opener.requests)
+        accepts = dict(transport.requests)
         self.assertEqual(accepts[identity.RELEASE_BY_TAG_URL + TAG], safe_update.JSON_ACCEPT)
         self.assertEqual(accepts[identity.TAG_REF_URL + TAG], safe_update.JSON_ACCEPT)
         self.assertEqual(accepts[asset], safe_update.ASSET_ACCEPT)
         self.assertEqual(accepts[download], safe_update.ASSET_ACCEPT)
 
     def test_missing_tty_considered_from_cli(self):
-        terminal = FakeTerminal(tty=False)
+        terminal = self._terminal(tty=False)
+        stderr = io.StringIO()
         with _Boundaries() as boundaries:
-            with patch.object(safe_update, "_fetch", self.fetch):
+            with patch.object(safe_update, "_fetch", self.fetch), redirect_stderr(stderr):
                 code = safe_update.main(["approve", TAG])
         self.assertEqual(code, 1)
+        self.assertEqual(stderr.getvalue(),
+                         "error: approval needs an interactive terminal; "
+                         "refusing a non-interactive path\n")
+        self.assertEqual(terminal.tty_checks, 1, "the CLI must consult its terminal")
+        self.assertEqual(terminal.prompts, [], "a non-TTY must never be prompted")
         self.assertFalse((self.state / "consent.json").exists())
         self.assertEqual(boundaries.calls, [])
 
@@ -355,10 +436,19 @@ class FetchContractTest(unittest.TestCase):
     """_fetch itself: per-URL Accept headers and the exact redirect policy."""
 
     def _run(self, script, url):
-        opener = _RoutingOpener(script)
-        with patch.object(safe_update, "build_opener", lambda handler: opener):
+        transport = _RoutingTransport(script)
+        with patch.object(safe_update, "build_opener",
+                          lambda handler: scripted_opener(handler, transport)):
             result = safe_update._fetch(url)
-        return result, opener
+        return result, transport
+
+    def test_capture_redirect_raises_with_the_unfollowed_target(self):
+        target = "https://objects.githubusercontent.com/signed"
+        with self.assertRaises(safe_update._Redirected) as caught:
+            safe_update._CaptureRedirect().redirect_request(
+                Request("https://api.github.com/asset"), None, 302, "Found", {},
+                target)
+        self.assertEqual(caught.exception.location, target)
 
     def test_metadata_endpoints_use_the_github_json_accept_header(self):
         url = identity.RELEASE_BY_TAG_URL + TAG
@@ -371,7 +461,7 @@ class FetchContractTest(unittest.TestCase):
         asset = identity.ASSET_URL + "42"
         download = "https://" + sorted(safe_update.ASSET_REDIRECT_HOSTS)[0] + "/signed"
         body = json.dumps(manifest_body()).encode("utf-8")
-        result, opener = self._run({asset: safe_update._Redirected(download),
+        result, opener = self._run({asset: _Redirect(download),
                                     download: body}, asset)
         self.assertEqual(result, body)
         self.assertEqual(opener.requests, [(asset, safe_update.ASSET_ACCEPT),
@@ -380,22 +470,30 @@ class FetchContractTest(unittest.TestCase):
     def test_manifest_asset_redirect_to_a_foreign_host_is_refused(self):
         with self.assertRaises(identity.UpdateError) as caught:
             self._run({identity.ASSET_URL + "42":
-                       safe_update._Redirected("https://evil.example.net/manifest")},
+                       _Redirect("https://evil.example.net/manifest")},
                       identity.ASSET_URL + "42")
+        self.assertIn("non-canonical host", str(caught.exception))
+
+    def test_manifest_asset_redirect_to_the_page_host_is_refused(self):
+        # github.com is the release page host, not a signed download host.
+        asset = identity.ASSET_URL + "42"
+        page = "https://github.com/Ami-Khokhar/agent-relay/releases/download/%s/x" % TAG
+        with self.assertRaises(identity.UpdateError) as caught:
+            self._run({asset: _Redirect(page)}, asset)
         self.assertIn("non-canonical host", str(caught.exception))
 
     def test_manifest_asset_second_redirect_is_refused(self):
         asset = identity.ASSET_URL + "42"
         hop = "https://" + sorted(safe_update.ASSET_REDIRECT_HOSTS)[0] + "/a"
         with self.assertRaises(identity.UpdateError) as caught:
-            self._run({asset: safe_update._Redirected(hop),
-                       hop: safe_update._Redirected(hop + "?again=1")}, asset)
+            self._run({asset: _Redirect(hop),
+                       hop: _Redirect(hop + "?again=1")}, asset)
         self.assertIn("refusing non-canonical identity", str(caught.exception))
 
     def test_metadata_endpoints_refuse_every_redirect(self):
         url = identity.RELEASE_BY_TAG_URL + TAG
         with self.assertRaises(identity.UpdateError) as caught:
-            self._run({url: safe_update._Redirected("https://github.com/elsewhere")}, url)
+            self._run({url: _Redirect("https://github.com/elsewhere")}, url)
         self.assertIn("refusing non-canonical identity", str(caught.exception))
 
 

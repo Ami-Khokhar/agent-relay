@@ -305,12 +305,21 @@ def now_iso():
 
 def visible(task, include_input=False):
     """The task as clients see it. The prompt is left out unless asked for: callers already
-    hold it, and echoing it on every poll fills their context. inputChars is always there."""
-    snapshot = {key: value for key, value in task.items()
-                if not key.startswith("_") and key != "input"}
-    snapshot["inputChars"] = len(task["input"])
-    if include_input:
-        snapshot["input"] = task["input"]
+    hold it, and echoing it on every poll fills their context. inputChars is always there.
+
+    Rendered while LOCK is held, because every write to a live task dict holds it: the worker
+    side stamps _deadline/startedAt as a task starts and finishedAt/output as it finishes, and a
+    render that walked the dict outside the lock could raise "dictionary changed size during
+    iteration" and turn an ordinary poll into a 500. LOCK is reentrant, so a caller that already
+    holds it stays correct, and the body then describes one snapshot no writer can half-update.
+    See "Every write to a live task dict holds LOCK" in docs/decisions.md.
+    """
+    with LOCK:
+        snapshot = {key: value for key, value in task.items()
+                    if not key.startswith("_") and key != "input"}
+        snapshot["inputChars"] = len(task["input"])
+        if include_input:
+            snapshot["input"] = task["input"]
     return snapshot
 
 
@@ -600,14 +609,14 @@ def load_registry(path):
         if model is not None:
             if not isinstance(model, str) or not model.strip():
                 raise ValueError(
-                    f"Invalid model: agent {agent_id}: model must be a non-empty string")
+                    f"Invalid model: agent {agent_id}: model must be a non-blank string")
             metadata["model"] = model.strip()
         tags = raw.get("tags")
         if tags is not None:
             if not isinstance(tags, list) or not all(
                     isinstance(item, str) and item.strip() for item in tags):
                 raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
-                                 "non-empty strings")
+                                 "non-blank strings")
             metadata["tags"] = [item.strip() for item in tags]
         role = raw.get("role")
         if role is not None:
@@ -1211,10 +1220,107 @@ def _read_body(stream, task):
     return b"".join(chunks)
 
 
+class _DeadlineFile:
+    """The response's byte stream, ending every read at the task's deadline.
+
+    ``opener.open``'s socket timeout bounds one recv, so an adapter that drips a header byte
+    per interval resets it and the head is never complete. Re-arming the socket with what is
+    left of the budget before each read -- as ``_read_body`` does for the body -- makes the
+    head end at the deadline too. Bytes read while parsing the head stay buffered here so the
+    body still starts where the socket left it.
+    """
+
+    def __init__(self, fp, sock, task):
+        self._fp = fp
+        self._sock = sock
+        self._task = task
+        self._buffer = b""
+
+    def __getattr__(self, name):  # close, closed, fileno, ... stay the real stream's
+        return getattr(self._fp, name)
+
+    def _arm(self):
+        remaining = _remaining(self._task)
+        if remaining <= 0:
+            raise TimeoutError(f"Agent exceeded {self._task['timeoutMs']} ms")
+        self._sock.settimeout(remaining)
+
+    def _take(self, size):
+        take = len(self._buffer) if size < 0 else min(size, len(self._buffer))
+        data, self._buffer = self._buffer[:take], self._buffer[take:]
+        return data
+
+    def readline(self, limit=-1):
+        while True:
+            end = self._buffer.find(b"\n") + 1
+            if end:
+                break
+            if 0 < limit <= len(self._buffer):
+                end = limit
+                break
+            self._arm()
+            chunk = self._fp.read1(65536 if limit <= 0 else min(65536, limit - len(self._buffer)))
+            if not chunk:  # EOF ends the line
+                end = len(self._buffer)
+                break
+            self._buffer += chunk
+        line, self._buffer = self._buffer[:end], self._buffer[end:]
+        return line
+
+    def read(self, size=-1):
+        head = self._take(size)
+        if size >= 0 and len(head) == size:
+            return head
+        self._arm()
+        return head + (self._fp.read() if size < 0 else self._fp.read(size - len(head)))
+
+    def read1(self, size=-1):
+        if self._buffer:
+            return self._take(size)
+        self._arm()
+        return self._fp.read1(size)
+
+
+class _DeadlineResponse(http.client.HTTPResponse):
+    """An HTTP response whose head and body reads give up at the task's deadline."""
+
+    task = None  # bound per request by ``_deadline_connection``
+
+    def __init__(self, sock, *args, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self.fp = _DeadlineFile(self.fp, sock, self.task)
+
+
+def _deadline_connection(base, task):
+    """The urllib connection class whose responses read under ``task``'s deadline."""
+    response = type("_DeadlineResponse", (_DeadlineResponse,), {"task": task})
+    return type(f"_Deadline{base.__name__}", (base,), {"response_class": response})
+
+
+class _DeadlineHTTPHandler(urlrequest.HTTPHandler):
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+
+    def http_open(self, req):
+        return self.do_open(_deadline_connection(http.client.HTTPConnection, self.task), req)
+
+
+class _DeadlineHTTPSHandler(urlrequest.HTTPSHandler):
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+
+    def https_open(self, req):
+        return self.do_open(_deadline_connection(http.client.HTTPSConnection, self.task), req,
+                            context=self._context)
+
+
 def _run_http(agent, task):
     from urllib import error as urlerror
 
-    opener = urlrequest.build_opener(_NoRedirect)
+    opener = urlrequest.build_opener(_NoRedirect, _DeadlineHTTPHandler(task),
+                                     _DeadlineHTTPSHandler(task))
     payload = json.dumps(adapter_request(task, agent)).encode("utf-8")
     request = urlrequest.Request(agent["url"], data=payload, method="POST",
                                  headers={"content-type": "application/json"})
@@ -1286,9 +1392,8 @@ def _run_http(agent, task):
 
 
 def _worker(agent, task):
-    # One deadline covers process startup, request delivery, execution, and reading an HTTP
-    # adapter's response; a spawned adapter's output is collected under a short post-exit grace.
-    task["_deadline"] = time.monotonic() + task["timeoutMs"] / 1000.0
+    # _drain stamped the deadline while it held LOCK and before this thread existed: every write
+    # to a live task dict happens under LOCK, because a poll may be rendering it (see visible).
     try:
         kind = agent["type"]
         if kind == "command":
@@ -1357,6 +1462,11 @@ def _drain():
             task["_adapter"] = agent["type"]
             task["status"] = "running"
             task["startedAt"] = now_iso()
+            # One deadline covers process startup, request delivery, execution, and reading an HTTP
+            # adapter's response; a spawned adapter's output is collected under a short post-exit
+            # grace. Stamped here, under LOCK, and before the thread exists: a worker that added it
+            # after starting would be writing a dict that a poll may be rendering (see visible).
+            task["_deadline"] = time.monotonic() + task["timeoutMs"] / 1000.0
             threading.Thread(target=_worker, args=(agent, task), daemon=True).start()
 
 
@@ -1413,13 +1523,20 @@ def _pressure_guard():
 
 
 def _make_room():
+    """Evict the task that finished longest ago, so a long run's result survives its own arrival.
+
+    Every terminal task records ``_finished`` when it leaves queued/running, and that monotonic
+    stamp — not insertion order, which is creation order — decides the victim. A terminal record
+    without the stamp is not produced by any path here; such a record is not evictable rather
+    than ranked by a guessed time.
+    """
     if len(TASKS) < MAX_TASKS:
         return True
-    terminal = next((task for task in TASKS.values()
-                     if task["status"] not in ("queued", "running")), None)
-    if terminal is None:
+    finished = [task for task in TASKS.values()
+                if task["status"] not in ("queued", "running") and "_finished" in task]
+    if not finished:
         return False
-    _forget(terminal)
+    _forget(min(finished, key=lambda task: task["_finished"]))
     return True
 
 
@@ -1691,14 +1808,15 @@ def _delegation_error(parent, agent):
 
 
 def _list_tasks(session_id=None, status=None, limit=100):
+    # One lock hold covers the filter, the order and every render: the listing then describes the
+    # tasks as they were at one instant, and no render walks a dict a writer is still updating
+    # (every write to a live task dict holds LOCK — see visible and docs/decisions.md).
     with LOCK:
-        tasks = list(TASKS.values())
-    if session_id is not None:
-        tasks = [task for task in tasks if task.get("sessionId") == session_id]
-    if status is not None:
-        tasks = [task for task in tasks if task["status"] == status]
-    tasks.sort(key=lambda task: task.get("createdAt") or "", reverse=True)
-    return [visible(task) for task in tasks[:limit]]
+        tasks = [task for task in TASKS.values()
+                 if (session_id is None or task.get("sessionId") == session_id)
+                 and (status is None or task["status"] == status)]
+        tasks.sort(key=lambda task: task.get("createdAt") or "", reverse=True)
+        return [visible(task) for task in tasks[:limit]]
 
 
 def _is_valid_wait(value):
@@ -2327,7 +2445,13 @@ class Handler(BaseHTTPRequestHandler):
             # reaches here carries a valid one: block on it the way GET /v1/tasks/:id?waitMs=
             # does, instead of answering queued and leaving the caller to poll.
             _drain()
-            result = visible(_wait_for_terminal(body["id"], wait_ms))
+            task = _wait_for_terminal(body["id"], wait_ms)
+            if task is None:
+                # The store drops terminal tasks once retention expires or a submission needs the
+                # room, so a wait can outlive the record it waited on. Answer as GET /v1/tasks/:id
+                # does instead of building a copy of a task that is gone.
+                return self._json(404, {"error": "unknown_task"})
+            result = visible(task)
             if result["status"] in ("queued", "running"):
                 # Judge the copy, not the live task: it may finish between the wait and this
                 # check, exactly as the long poll on GET does.
@@ -2340,11 +2464,13 @@ class Handler(BaseHTTPRequestHandler):
             _drain()
 
     def _read_json_body(self, document=True):
-        """Read the request body as a JSON object.
+        """Read and parse the request body, consuming it so the connection stays in sync.
 
         Returns ``(error_status, error_body)`` on failure and ``(None, body)`` on success, so
-        every caller sends exactly one response. Pass ``document=False`` for a route that
-        takes no document: the body is still read, so a keep-alive connection stays in sync.
+        every caller that asks for a document sends exactly one response. Pass
+        ``document=False`` for a route that takes no document (``_kill_workflows`` and
+        ``_resume_workflow``): the body is read and dropped, so only its framing matters and
+        any valid JSON is accepted, with ``None`` returned in place of the payload.
         """
         if document:
             content_type = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
@@ -2362,6 +2488,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
             return 400, {"error": "invalid_json"}
+        if not document:
+            return None, None
         if not isinstance(body, dict):
             return 400, {"error": "invalid_request"}
         return None, body

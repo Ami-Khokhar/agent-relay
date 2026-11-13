@@ -235,6 +235,38 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["collect"]["output"],
                          'collected=["item=one index=0", "item=two index=1"]')
 
+    def test_a_failed_foreach_step_keeps_the_array_shape_and_names_the_failing_task(self):
+        relay = self.start([
+            {"id": "gate", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]},
+            {"id": "silent", "command": PYTHON, "args": ["-c", "import sys; sys.exit(1)"]},
+        ])
+        workflow = run(relay, {"steps": [
+            {"id": "fan", "agentId": "gate", "foreach": ["ok", "FAIL item"],
+             "input": "{{item}}"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        fan = steps_of(workflow)["fan"]
+        self.assertEqual(fan["status"], "failed")
+        # A caller parses foreach output as JSON, including on the failing run.
+        self.assertEqual(json.loads(fan["output"]), ["ok", "FAIL item"])
+        self.assertEqual(len(fan["taskIds"]), 2)
+        tasks = [relay.request("GET", f"/v1/tasks/{task_id}")[1] for task_id in fan["taskIds"]]
+        failed = [task for task in tasks if task["status"] == "failed"]
+        # Which item failed stays reachable: its id is in taskIds, its error in errorDetail.
+        self.assertEqual([task["id"] for task in failed], [fan["taskIds"][1]])
+        self.assertEqual(fan["errorDetail"], failed[0]["error"])
+        self.assertIn(fan["errorDetail"], fan["error"])
+
+        # A failing item that wrote no stdout still holds its position in the array.
+        silent = run(relay, {"steps": [
+            {"id": "fan", "agentId": "silent", "foreach": ["one", "two"],
+             "input": "{{item}}"},
+        ]})
+        quiet = steps_of(silent)["fan"]
+        self.assertEqual(quiet["status"], "failed")
+        self.assertEqual(json.loads(quiet["output"]), ["", ""])
+        self.assertEqual(len(json.loads(quiet["output"])), 2)
+
     # --------------------------------------------------------- failure and retry
 
     def test_skips_downstream_steps_when_a_dependency_fails(self):
@@ -966,6 +998,124 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body["error"], "unknown_workflow")
 
+    def test_a_document_less_route_drops_the_body_shape_and_still_acts(self):
+        # Resume and the kill button take no document: their body is read only to keep the
+        # connection in sync, so any valid JSON is accepted and the route still does its work.
+        mark = self.path("document-less-mark")
+        relay = self.start([
+            echo(),
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+             "env": {"WF_MARK": mark}},
+            {"id": "slow", "command": PYTHON, "args": ["-c", SLOW]},
+        ])
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "flaky", "input": "retry me"}]})
+        self.assertEqual(wait(relay, submitted["id"])["status"], "failed")
+        status, _ = relay.request("POST", f"/v1/workflows/{submitted['id']}/resume", "[]")
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, submitted["id"])["status"], "completed")
+
+        _, running = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "slow", "input": "long job"}]})
+        deadline = time.time() + 10
+        view = {}
+        while time.time() < deadline:
+            _, view = relay.request("GET", f"/v1/workflows/{running['id']}")
+            if view["steps"][0]["status"] == "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(view["steps"][0]["status"], "running")
+        status, killed = relay.request("POST", "/v1/pressure/kill", '"x"')
+        self.assertEqual(status, 200)
+        self.assertIn(running["id"], killed["killed"])
+
+        # A route that does read the document still refuses a body that is not an object.
+        for body in ("[]", '"x"'):
+            status, refused = relay.request("POST", "/v1/workflows", body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(refused["error"], "invalid_request")
+
+    def test_resume_takes_the_same_room_rule_as_a_submission(self):
+        # A journal outlives the run it belongs to, so resuming an evicted id is the one path
+        # that could re-add runs forever: the store's bound must hold here too.
+        first_release = self.path("release-first")
+        second_release = self.path("release-second")
+        hold = ("import os, pathlib, time\n"
+                "while not pathlib.Path(os.environ['WF_RELEASE']).exists(): time.sleep(0.01)\n"
+                "print('released')\n")
+        relay = self.start(
+            [echo(),
+             {"id": "hold-a", "command": PYTHON, "args": ["-c", hold],
+              "env": {"WF_RELEASE": first_release}},
+             {"id": "hold-b", "command": PYTHON, "args": ["-c", hold],
+              "env": {"WF_RELEASE": second_release}}],
+            env={"AGENT_RELAY_MAX_WORKFLOWS": "2"})
+        self.assertEqual(relay.request("GET", "/healthz")[1]["limits"]["maxWorkflows"], 2)
+
+        status, held = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "hold-a", "input": "hold the first slot"}]})
+        self.assertEqual(status, 202, held)
+        # Fills the second slot, then gets evicted by the next submission: only its journal
+        # survives, which is exactly what a resume reads.
+        gone = run(relay, {"steps": [{"id": "only", "agentId": "echo", "input": "evictable"}]})
+        run(relay, {"steps": [{"id": "only", "agentId": "echo", "input": "replaces it"}]})
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{gone['id']}")[0], 404)
+        status, held_again = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "hold-b", "input": "hold the other slot"}]})
+        self.assertEqual(status, 202, held_again)
+        # Both stored runs are unfinished now, so nothing is evictable.
+        _, full = relay.request("GET", "/v1/workflows?limit=10")
+        self.assertEqual({wf["id"] for wf in full["workflows"]},
+                         {held["id"], held_again["id"]})
+
+        status, refused = relay.request("POST", f"/v1/workflows/{gone['id']}/resume")
+        self.assertEqual((status, refused["error"]), (503, "workflow_capacity_reached"))
+        # The refusal starts no run: the id stays out of the store and the bound holds.
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{gone['id']}")[0], 404)
+        _, still_full = relay.request("GET", "/v1/workflows?limit=10")
+        self.assertEqual({wf["id"] for wf in still_full["workflows"]},
+                         {held["id"], held_again["id"]})
+
+        # With one finished run in the store, a resume evicts it by the submission rule.
+        with open(first_release, "w", encoding="utf-8") as handle:
+            handle.write("go")
+        self.assertEqual(wait(relay, held["id"])["status"], "completed")
+        status, resumed = relay.request("POST", f"/v1/workflows/{gone['id']}/resume")
+        self.assertEqual(status, 202, resumed)
+        self.assertEqual(wait(relay, gone["id"])["status"], "completed")
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{held['id']}")[0], 404)
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{held_again['id']}")[0], 200)
+        _, bounded = relay.request("GET", "/v1/workflows?limit=10")
+        self.assertEqual({wf["id"] for wf in bounded["workflows"]},
+                         {gone["id"], held_again["id"]})
+        with open(second_release, "w", encoding="utf-8") as handle:
+            handle.write("go")
+
+    def test_resume_of_a_stored_finished_run_evicts_nothing(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_WORKFLOWS": "2"})
+        first = run(relay, {"requestId": "keep-a",
+                            "steps": [{"id": "only", "agentId": "echo", "input": "A"}]})
+        second = run(relay, {"requestId": "keep-b",
+                             "steps": [{"id": "only", "agentId": "echo", "input": "B"}]})
+        # Both are stored and finished, so the store is at the bound and the resumed id is
+        # already there: the resume replaces its own entry instead of needing a new one.
+        self.assertEqual(relay.request("GET", "/v1/workflows?limit=10")[1]["workflows"][0]["id"],
+                         second["id"])
+        status, resumed = relay.request("POST", f"/v1/workflows/{second['id']}/resume")
+        self.assertEqual(status, 202, resumed)
+        self.assertEqual(wait(relay, second["id"])["status"], "completed")
+        # Nothing was evicted: A stays stored with its requestId, so a replay returns it
+        # rather than starting a second run.
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{first['id']}")[0], 200)
+        status, replay = relay.request("POST", "/v1/workflows", {
+            "requestId": "keep-a",
+            "steps": [{"id": "only", "agentId": "echo", "input": "A"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(replay["id"], first["id"])
+        _, listing = relay.request("GET", "/v1/workflows?limit=10")
+        self.assertEqual({wf["id"] for wf in listing["workflows"]},
+                         {first["id"], second["id"]})
+
     # ------------------------------------------------------------------ idempotency
 
     def test_returns_the_same_run_for_a_reused_request_id(self):
@@ -1049,6 +1199,32 @@ class WorkflowTests(unittest.TestCase):
 
         _, listing = relay.request("GET", "/v1/workflows")
         self.assertEqual(listing["workflows"], [])
+
+    def test_refuses_an_unencodable_step_field_with_400_and_creates_no_run(self):
+        relay = self.start(echo())
+        # The escape is sent verbatim: a lone surrogate is not UTF-8, so only the escape keeps
+        # this test's own body valid.
+        status, body = relay.request(
+            "POST", "/v1/workflows",
+            '{"steps": [{"id": "a", "agentId": "echo", "input": "\\ud800"}]}')
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "invalid_input")
+        self.assertIn("steps[0].input", body["message"])
+        for cwd in ('"/tmp/a\\u0000b"', '"/tmp/\\ud800"'):
+            status, body = relay.request(
+                "POST", "/v1/workflows",
+                '{"steps": [{"id": "a", "agentId": "echo", "input": "x", "cwd": %s}]}' % cwd)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["error"], "invalid_cwd")
+            self.assertIn("steps[0].cwd", body["message"])
+        _, listing = relay.request("GET", "/v1/workflows")
+        self.assertEqual(listing["workflows"], [])
+
+        # The same document with encodable text still starts a run.
+        status, submitted = relay.request(
+            "POST", "/v1/workflows",
+            {"steps": [{"id": "a", "agentId": "echo", "input": "ok"}]})
+        self.assertEqual(status, 202, submitted)
 
     def test_reports_an_unknown_workflow_and_lists_runs(self):
         relay = self.start(echo())

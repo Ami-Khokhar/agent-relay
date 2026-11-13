@@ -766,7 +766,8 @@ class ActivationFlowTest(_Case):
             self._run()
         with self.assertRaises(identity.UpdateError) as caught:
             safe_update.cmd_recover_abort(TXN)
-        self.assertIn("manual recovery", str(caught.exception))
+        self.assertIn("`safe_update recover %s`" % TXN, str(caught.exception),
+                      "the refusal names the command that finishes the failed activation")
         record = update_transaction.recover_transaction(state_dir=self.state)
         self.assertEqual(record["phase"], "recovery_required")
 

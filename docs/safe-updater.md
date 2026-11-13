@@ -110,10 +110,14 @@ checkout to be unchanged since staging (still clean, canonical, at the exact
 commit the stage recorded), then acquires the drain and writes
 `<state dir>/update/transaction.json` plus `admission-barrier.json`: the old
 exact relay commit, the target identity, the stage, hashed references to the
-external state, and the drain capability. The drain stays held after the
-command returns; while it is held the relay refuses every new external
-admission (tasks, workflow submissions, resumes) and already accepted work
-finishes normally.
+external state, and the drain capability. The acquired drain's revision must be
+that same recorded commit; a checkout already fast-forwarded past the running
+relay (the state `scripts/update.sh` leaves while its restart is deferred) is
+refused by name, with the hold released and nothing journaled, because
+`activate` can only return to the revision the drain started from. The drain
+stays held after the command returns; while it is held the relay refuses every
+new external admission (tasks, workflow submissions, resumes) and already
+accepted work finishes normally.
 
 `activate` walks the journal through `draining` → `quiescent` → `activating` →
 `restarted`, swaps the checkout with trusted, hook- and filter-disabled git by
@@ -125,14 +129,17 @@ this transaction's admission barrier. Only then is the record finalized to
 
 ## Refusals and recovery
 
-- **A failed activation** (any step after the drain is held) writes a durable
+- **A failed activation** (any step after the drain is held, up to the journal's
+  durable `activated` finalize) writes a durable
   `recovery_required` end and then rolls back automatically to the exact prior
   revision the journal names — the checkout is restored only while it still
   inspects clean (an intervening user edit is refused, never overwritten), the
   service is restarted only when the running relay does not already report the
   restored revision, and the barrier holds until the authenticated endpoint
   reports that exact prior revision. `status` prints the record; `recover`
-  finishes or retries it, idempotently, without repeating a service action.
+  finishes or retries it, idempotently, without repeating a service action. A
+  barrier refresh that fails after that finalize is not rolled back: the
+  activation stands and `recover` retries the refresh and expunges the record.
 - **A prepared transaction you change your mind about** is ended by
   `recover-abort`, which re-proves the unchanged external state, the exact
   starting revision, the owned drain and quiescence before releasing and

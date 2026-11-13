@@ -133,6 +133,22 @@ class AgentMetadataTests(unittest.TestCase):
                     server.load_registry(path)
                 self.assertIn(field, str(raised.exception))
 
+    def test_a_whitespace_only_value_is_refused_as_blank_not_empty(self):
+        directory = tempfile.mkdtemp(prefix="a2a-blank-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "agents.json")
+        for field, value, message in (
+                ("model", "   ", "model must be a non-blank string"),
+                ("tags", [" ", "\t"], "tags must be an array of non-blank strings")):
+            with self.subTest(field=field):
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump({"agents": [{"id": "x", "command": PYTHON, "args": [],
+                                           field: value}]}, handle)
+                with self.assertRaises(ValueError) as raised:
+                    server.load_registry(path)
+                self.assertIn(message, str(raised.exception))
+                self.assertNotIn("non-empty", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

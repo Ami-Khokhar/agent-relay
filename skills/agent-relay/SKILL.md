@@ -514,9 +514,12 @@ workflow with `503 device_pressure`, and while a run is active the relay re-read
 stayed `critical` for `AGENT_RELAY_PRESSURE_HOLD_MS` milliseconds (default 30000, read at least
 twice), so a single spike between normal readings does not end a run;
 `AGENT_RELAY_PRESSURE_HOLD_MS=0` stops on the first critical reading. `POST /v1/pressure/kill` is
-the same stop on demand. A stopped run is `cancelled` with `error` starting `device_pressure:`,
-naming how long pressure held and the readings that decided it, and keeps its journal, so
-`POST /v1/workflows/:id/resume` continues it without repeating the steps that finished.
+the same stop on demand. A stopped run is `cancelled` with `error` starting `device_pressure:`
+and keeps its journal, so `POST /v1/workflows/:id/resume` continues it without repeating the
+steps that finished. What the message carries depends on who stopped it: the guard's says how
+long pressure held and which readings decided it (`critical for 30.2s across 3 readings; decided
+by …`), while the kill button's says only what it saw (`stopped on request while the verdict was
+warn (…)`), since no hold elapsed.
 `AGENT_RELAY_PRESSURE_GUARD=0` turns the automatic stop off and leaves the endpoints in place.
 
 Runs journal to `<state dir>/workflows/<id>.jsonl` (`AGENT_RELAY_STATE_DIR`, default

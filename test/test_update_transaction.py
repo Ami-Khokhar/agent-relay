@@ -508,7 +508,7 @@ class PrepareAbortCliTest(_Case):
 
     def test_a_failed_prepare_after_the_acquire_releases_the_hold(self):
         """Guard: a begin_transaction failure must not strand the acquired drain hold."""
-        relay = _FakeRelay()
+        relay = self._relay()
         with _join(self._patches(relay) +
                    [patch.object(safe_update, "_state_dir", lambda: self.state),
                     patch.object(update_transaction, "begin_transaction",
@@ -527,7 +527,7 @@ class PrepareAbortCliTest(_Case):
         self.assertIsNone(self.blocker())
 
     def test_a_failed_prepare_release_reports_an_unreleasable_hold(self):
-        relay = _FakeRelay()
+        relay = self._relay()
 
         def refusing_release(_base, transaction_id, *, token=None, revision=None,
                              capability=None, timeout=None):
@@ -543,6 +543,10 @@ class PrepareAbortCliTest(_Case):
                                                    transaction_id=TXN)
         self.assertIn("could NOT be released", str(caught.exception),
                       "the error says the hold stands until an explicit release")
+
+    def _relay(self, revision=None):
+        """A recording drain server at this fixture's staged checkout revision."""
+        return _FakeRelay(revision=self.fixture.commit if revision is None else revision)
 
     def _patches(self, relay, release=None):
         """Fakes only the network hop, so the real ``_resolve`` shape is exercised."""
@@ -582,7 +586,7 @@ class PrepareAbortCliTest(_Case):
                 safe_update.cmd_recover_abort(transaction, base_url="http://127.0.0.1:9")
 
     def test_prepare_holds_the_drain_writes_the_record_and_touches_nothing(self):
-        relay = _FakeRelay()
+        relay = self._relay()
         before_repo = _tree_inventory(self.repo)
         before_state = _tree_inventory(self.state)
         self.assertEqual(self._prepared(relay), 0)
@@ -606,7 +610,7 @@ class PrepareAbortCliTest(_Case):
                          "consent.json and every other state file stay byte-identical")
 
     def test_publish_drift_between_staging_and_preparation_is_refused(self):
-        relay = _FakeRelay()
+        relay = self._relay()
         before = _tree_inventory(self.state)
 
         def drifted(tag, fetch_json=None):
@@ -624,7 +628,7 @@ class PrepareAbortCliTest(_Case):
         self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
 
     def test_mutated_stage_or_dirty_checkout_is_refused_before_the_effect(self):
-        relay = _FakeRelay()
+        relay = self._relay()
         self.fixture._write_stage_receipt(identityDigest="0" * 64)
         with _join(self._patches(relay) +
                    [patch.object(safe_update, "_state_dir", lambda: self.state)]):
@@ -650,7 +654,7 @@ class PrepareAbortCliTest(_Case):
         self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
 
     def test_abort_reopens_only_after_proving_revision_ownership_state_and_quiescence(self):
-        relay = _FakeRelay()
+        relay = self._relay()
         before_repo = _tree_inventory(self.repo)
         self.assertEqual(self._prepared(relay), 0)
         self.assertEqual(self._abort(relay), 0)
@@ -664,22 +668,22 @@ class PrepareAbortCliTest(_Case):
         self.assertIsNone(self.blocker())
         self.assertEqual(_tree_inventory(self.repo), before_repo,
                          "aborting never changes the active source")
-        relay2 = _FakeRelay()
+        relay2 = self._relay()
         self.assertEqual(self._prepared(relay2), 0,
                          "after a fully proven abort the install can prepare again")
 
     def test_abort_refuses_a_moved_revision_and_never_reopens(self):
-        self._prepared(_FakeRelay())
+        self._prepared(self._relay())
         before = _tree_inventory(self.state / "update")
-        relay = _FakeRelay(revision="e" * 40)
+        relay = self._relay(revision="e" * 40)
         self._abort(relay, assert_raises=identity.UpdateError)
         self.assertEqual(relay.calls, [("healthz",)], "nothing was proven, nothing released")
         self.assertEqual(_tree_inventory(self.state / "update"), before,
                          "a refused abort leaves the closed barrier intact")
 
     def test_abort_refuses_an_unknown_or_replayed_transaction_and_changed_state(self):
-        self._prepared(_FakeRelay())
-        relay = _FakeRelay()
+        self._prepared(self._relay())
+        relay = self._relay()
         self._abort(relay, transaction="wrong-id", assert_raises=identity.UpdateError)
         self.assertEqual(relay.calls, [], "an unknown transaction aborts nothing")
         self.assertIsNotNone(self.blocker())
@@ -691,15 +695,15 @@ class PrepareAbortCliTest(_Case):
         fd = os.open(str(consent), os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
             handle.write(json.dumps(body))
-        relay = _FakeRelay()
+        relay = self._relay()
         self._abort(relay, assert_raises=identity.UpdateError)
         self.assertEqual(relay.calls, [],
                          "changed state is proven before any hold is touched")
         self.assertIsNotNone(self.blocker(), "the barrier stays closed on a refused abort")
 
     def test_abort_refuses_a_relay_that_never_quiesced(self):
-        self._prepared(_FakeRelay())
-        relay = _FakeRelay()
+        self._prepared(self._relay())
+        relay = self._relay()
         with _join(self._patches(relay) +
                    [patch.object(safe_update, "_state_dir", lambda: self.state),
                     patch.object(update_drain, "drain_status", lambda *a, **k: {
@@ -708,6 +712,66 @@ class PrepareAbortCliTest(_Case):
                 safe_update.cmd_recover_abort(TXN, base_url="http://127.0.0.1:9")
         self.assertIn("manual recovery", str(caught.exception))
         self.assertEqual(relay.releases, [], "a still-running relay keeps its hold")
+
+
+class TerminalRecordGuidanceTest(_Case):
+    """A retained terminal record names a command that actually finishes it (#187)."""
+
+    def _terminal(self):
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        update_transaction.transition(TXN, "prepared", "rolled_back", state_dir=self.state,
+                                      reason="operator recover-abort")
+        return update_transaction.recover_transaction(state_dir=self.state)
+
+    def test_the_retained_record_names_recover_not_recover_abort(self):
+        self._terminal()
+        with self.assertRaises(identity.UpdateError) as caught:
+            update_transaction.begin_transaction(
+                self.fixture.begin_receipt(transaction_id="txn-next"), state_dir=self.state)
+        message = str(caught.exception)
+        self.assertIn("still recorded", message)
+        self.assertIn("`safe_update recover %s`" % TXN, message,
+                      "the retained-record remedy names the command that clears it")
+        self.assertNotIn("recover-abort", message,
+                         "recover-abort refuses every terminal phase, so naming it "
+                         "would send the operator into a refusal")
+
+    def test_the_named_recover_command_clears_the_terminal_record(self):
+        """Guard: the remedy text is runnable — that exact command succeeds."""
+        self._terminal()
+        calls = []
+
+        def request(method, base, path, **kwargs):
+            calls.append((method, path))
+            if path == update_drain.DRAIN_PATH:
+                raise update_drain.DrainError("drain_not_held",
+                                              "a restarted relay owes no hold")
+            self.assertEqual(path, safe_update.BARRIER_PATH,
+                             "the last effect of recovery is the barrier refresh")
+            return 200, {"admissionClosed": False}
+
+        with _join([patch.object(safe_update, "_state_dir", lambda: self.state),
+                    patch.object(update_drain, "relay_token", lambda: "t" * 32),
+                    patch.object(update_drain, "_request", request)]):
+            rc = safe_update.main(["recover", TXN, "--base-url", "http://127.0.0.1:9"])
+        self.assertEqual(rc, 0, "the command named by the refusal succeeds")
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state),
+                          "the terminal record is expunged")
+        self.assertEqual([path for _method, path in calls],
+                         [update_drain.DRAIN_PATH, update_drain.DRAIN_PATH,
+                          safe_update.BARRIER_PATH],
+                         "recovery releases and proves the drain, then refreshes admission")
+
+    def test_recover_abort_refuses_a_terminal_record_and_names_recover(self):
+        self._terminal()
+        with patch.object(safe_update, "_state_dir", lambda: self.state):
+            with self.assertRaises(identity.UpdateError) as caught:
+                safe_update.cmd_recover_abort(TXN, base_url="http://127.0.0.1:9")
+        message = str(caught.exception)
+        self.assertIn("terminal phase 'rolled_back'", message)
+        self.assertIn("`safe_update recover %s`" % TXN, message,
+                      "the refusal points at the command that finishes the record")
+        self.assertIsNotNone(update_transaction.recover_transaction(state_dir=self.state))
 
 
 class StatusCliTest(_Case):

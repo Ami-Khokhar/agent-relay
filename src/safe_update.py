@@ -45,7 +45,6 @@ import update_staging
 import update_transaction
 from release_identity import UpdateError
 
-STATE_LABEL = "release update consent"
 BARRIER_PATH = "/v1/admin/update/state"
 AGENTS_PATH = "/v1/agents"
 JSON_ACCEPT = "application/vnd.github+json"
@@ -53,8 +52,10 @@ JSON_ACCEPT = "application/vnd.github+json"
 # asset metadata, so it must be requested with the octet-stream Accept header.
 ASSET_ACCEPT = "application/octet-stream"
 # GitHub serves release assets by 302ing to one of these signed download hosts;
-# any other redirect target is an uncanonical identity and refused.
-ASSET_REDIRECT_HOSTS = frozenset(("github.com", "objects.githubusercontent.com",
+# any other redirect target is an uncanonical identity and refused. github.com
+# itself is the page host, not a download host: its /releases/download URLs are
+# another 302 to the CDN, which the one-redirect rule refuses anyway.
+ASSET_REDIRECT_HOSTS = frozenset(("objects.githubusercontent.com",
                                   "release-assets.githubusercontent.com"))
 
 
@@ -192,8 +193,16 @@ def _stage_receipt(tag, install_dir, state_dir):
     if not matches:
         raise UpdateError("no verified stage of %s staged from %s"
                           % (tag, Path(install_dir).resolve()))
-    # Newest succeeded stage wins; stages removed on failure never appear.
-    stored, receipt = matches[-1]
+    # Newest succeeded stage wins. The staging directories are named
+    # stage-<tag>-<random>, so directory name and iteration order say nothing
+    # about age; the receipt's own success timestamp is the only order here.
+    # Stages removed on failure never leave a receipt behind, and a receipt
+    # with a missing or non-numeric createdAt sorts oldest, never newest.
+    def _created_at(pair):
+        value = pair[1].get("createdAt")
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+    stored, receipt = max(matches, key=_created_at)
     try:
         update_staging.verify_stage(receipt["stage"], stored,
                                     git=update_staging.default_git())
@@ -310,6 +319,17 @@ def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=No
         acquired = update_drain.acquire_drain(base_url, transaction_id, token=token)
     except update_drain.DrainError as exc:
         raise UpdateError("the drain could not be acquired: %s" % exc)
+    drained = acquired.get("revision")
+    if drained != receipt["sourceCommit"]:
+        # activate returns the checkout to this exact starting revision; a
+        # running relay on any other commit leaves a journaled transaction that
+        # can only be refused later, holding admission for nothing.
+        note = _release_drain_after_failure(base_url, transaction_id, token, acquired)
+        raise UpdateError(
+            "the running relay is at %s, not the staged checkout %s; the drain was "
+            "acquired on a revision activation cannot return to. Restart the relay from "
+            "%s, or re-stage the checkout, then prepare again; %s"
+            % (drained, receipt["sourceCommit"], receipt["sourceCommit"], note))
     try:
         record = update_transaction.begin_transaction(
             {**receipt, "transactionId": transaction_id, "drain": acquired},
@@ -878,7 +898,12 @@ def cmd_recover_abort(transaction_id, *, base_url=None):
         raise UpdateError("the recorded transaction is %s, not %s; refusing to replay another "
                           "transaction's abort" % (record["transactionId"], transaction_id))
     if record["phase"] not in ("prepared", "draining"):
-        raise UpdateError("the transaction is in phase %r: manual recovery required"
+        if record["phase"] in update_transaction.TERMINAL_PHASES:
+            raise UpdateError("the transaction is in the terminal phase %r; run "
+                              "`safe_update recover %s` to finish it"
+                              % (record["phase"], transaction_id))
+        raise UpdateError("the transaction is in phase %r: manual recovery required; "
+                          "recover-abort aborts only a prepared or draining transaction"
                           % record["phase"])
     base_url, token = _authorize_drain(base_url)
     # Prove before any effect: unchanged external state, the exact starting

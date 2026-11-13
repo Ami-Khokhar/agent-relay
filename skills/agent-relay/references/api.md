@@ -67,7 +67,9 @@ next run is restarted, since an old relay cannot report counts).
 for command/stdio adapters and `request_only` for HTTP. `role` and `roleDescription` appear only
 when the agent names a role in the registry; the instructions themselves are never listed. `model`
 and `tags` appear only when the registry declares them: `model` is the model that worker runs and
-`tags` are its labels, so a caller selects by data rather than by matching `name` prose.
+`tags` are its labels, so a caller selects by data rather than by matching `name` prose. Both must be
+non-blank strings, and both are stored trimmed, so the listing shows the value that was validated (which
+is why `?tag=%20reviewer` matches nothing).
 `GET /v1/agents?tag=<name>` keeps only the agents carrying that tag — an agent must carry every
 tag the query names, and an unknown tag returns an empty list rather than an error. `cwd`, `allowedRoots`, and
 `delegateTo` (the agents its tasks may delegate to) appear only when configured. `options`
@@ -92,7 +94,7 @@ Body:
 | `requestId` | no | ≤128 chars; idempotency key scoped per agent. |
 | `timeoutMs` | no | Positive integer. Overrides the agent/global timeout; rejected if above `A2A_RELAY_MAX_TIMEOUT_MS`. |
 | `cwd` | no | Absolute or relative path. Must be inside the agent's `allowedRoots` (or equal to its `cwd`), else `400 cwd_not_allowed`; a path carrying a NUL or a lone surrogate returns `400 invalid_cwd`. |
-| `waitMs` | no | Long-poll the submission itself, the way `GET /v1/tasks/:id?waitMs=` does. The relay checks it before it creates the task: a value that is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS` returns `400 invalid_wait` (message names the range and points at `GET /v1/tasks/:id?waitMs=`) and creates nothing. A valid wait then blocks: the call returns `200` with the task once it is terminal, or the current task with `waitExpired: true`, `waitedMs` and a `hint` when the wait elapses first. A submission without `waitMs` still returns `202` at once. It is not stored on the task. The check sits after the idempotent-replay decision: a replay (`requestId` matching a stored task with identical fields) ignores the wait and returns `200` with the stored task without waiting, because the wait is advisory and a replay creates nothing; a replay with changed fields still returns `409`. |
+| `waitMs` | no | Long-poll the submission itself, the way `GET /v1/tasks/:id?waitMs=` does. The relay checks it before it creates the task: a value that is not an integer from 1 to `A2A_RELAY_MAX_WAIT_MS` returns `400 invalid_wait` (message names the range and points at `GET /v1/tasks/:id?waitMs=`) and creates nothing. A valid wait then blocks: the call returns `200` with the task once it is terminal, or the current task with `waitExpired: true`, `waitedMs` and a `hint` when the wait elapses first. If the store drops the task before the waiter reads it — retention expired, or a new submission needed the room — the call answers `404 unknown_task` instead of a task copy, exactly as `GET /v1/tasks/:id` does. A submission without `waitMs` still returns `202` at once. It is not stored on the task. The check sits after the idempotent-replay decision: a replay (`requestId` matching a stored task with identical fields) ignores the wait and returns `200` with the stored task without waiting, because the wait is advisory and a replay creates nothing; a replay with changed fields still returns `409`. |
 | `options` | no | Object of option name to value string, for example `{"effort": "high"}`. Each name and value must be declared in the agent's registry `options`; the relay adds the args the owner mapped to them after the agent's `args` and before `input`. An undeclared name is `400 unknown_option`, an undeclared value `400 invalid_option_value`, a non-object or non-string value `400 invalid_options`. |
 | `readOnly` | no | `true` requires a run that cannot change files: the agent's `readOnly` profile args are added after its `args` and options and, when the profile sets `sandbox`, the run is wrapped in `sandbox-exec`. An agent without a profile (or whose sandbox needs macOS) returns `400 read_only_unsupported`; a sandboxed profile with no `cwd` on the task or agent returns `400 cwd_required`; a value that is not `true` or `false`, including `null`, returns `400 invalid_read_only`. For a `command` agent whose profile has `args` and no `inputSeparator`, an `input` that starts with `-` returns `400 invalid_input` (it could be read as an option that overrides the profile's args); the check reads the text the command receives, so a role that prepends its instructions makes such an input safe; with an `inputSeparator` the relay puts it before the input and any input is accepted. A `stdio` agent is not checked. The relay checks the task against the registry entry again when it dispatches a queued task, so a reload in between cannot turn a read-only task into an unenforced one: the task ends `failed` and its `error` starts with the code submission would have given (see "Task errors" below). Default `false`. |
 | `parentTaskId` | no | Task delegating this one (the MCP `delegate` tool sends `AGENT_RELAY_PARENT_TASK_ID`). Applies the delegation policy: `delegateTo`, cycles, `AGENT_RELAY_MAX_DELEGATION_DEPTH`, `AGENT_RELAY_MAX_DELEGATED_TASKS`. |
@@ -166,7 +168,7 @@ Step fields:
 | --- | --- | --- |
 | `id` | yes | Unique in the document; `[A-Za-z0-9_.~-]`, ≤128 chars. |
 | `agentId` | yes | Must match a registry id. |
-| `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. |
+| `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. A JSON escape such as `"\ud800"` decodes to a lone surrogate, which is not UTF-8 text and returns `400 invalid_input` naming the step's index and field. |
 | `needs` | no | Step ids that must complete first. Acyclic; forward references allowed. |
 | `needsPolicy` | no | `"all"` (default) or `"any"`. `any` requires at least one `needs` entry, otherwise `400 invalid_needs_policy`. With `all`, every need must complete. With `any`, every need must be terminal and at least one completed; without a completed need the step is skipped with `dependency_not_completed`. In an `any` prompt, `{{id.output}}` of a failed (including timed-out), skipped or cancelled ancestor becomes a marker like `[id did not complete: status=failed error=…]`. Unfinished ancestors stay empty under either policy; `all` also keeps non-completed terminal ancestors empty. A tolerated failed/skipped branch still makes the run `failed`; run cancellation remains `cancelled`. |
 | `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
@@ -174,7 +176,7 @@ Step fields:
 | `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
 | `failIfOutputMatches` | no | Python regular expression. A match on the output of a completed task fails the step with `output_matched_fail_pattern` and skips its dependents. The pattern is tested against each task's own output, so on a `foreach` step every item is matched separately and never the JSON array the step aggregates: one item reading `^BLOCKED` fails the whole step, while `^\[` does not fire on the serialization alone. |
 | `timeoutMs` | no | Positive integer, same cap as a task. |
-| `cwd` | no | Same `allowedRoots` check as a task. |
+| `cwd` | no | Same `allowedRoots` check as a task. A path carrying a NUL or a lone surrogate returns `400 invalid_cwd` naming the step's index and field. |
 | `options` | no | `{"<name>": "<value>"}`, exactly as for a task submission. The agent decides which names and values it allows. |
 | `readOnly` | no | Boolean, exactly as for a task submission. |
 
@@ -191,7 +193,7 @@ Validation failures use `400` with: `invalid_steps`, `invalid_step_id`, `duplica
 `unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_needs_policy`, `invalid_foreach`, `invalid_retries`,
 `invalid_repeat`, `invalid_fail_if`, `invalid_template`, `unknown_reference`, `invalid_options`,
 `invalid_read_only`, `command_input_too_large`, and the shared `unknown_field`,
-`unknown_agent`, `input_required`, `invalid_name`, `invalid_session_id`,
+`unknown_agent`, `input_required`, `invalid_input`, `invalid_name`, `invalid_session_id`,
 `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`.
 
 A step whose `options` or `readOnly` the agent cannot honour fails when the relay launches
@@ -205,7 +207,7 @@ the step starts, exactly as a registry change would be for a queued task.
 Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
 `finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `needsPolicy`, `status`,
 `attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, `error`, and
-(for a failed step) `errorDetail`.
+(for a failed step with a failing task) `errorDetail`.
 Every step carries `startedAt` and `finishedAt`: `startedAt` is stamped when the relay
 begins the attempt (rendering and submitting its tasks), `finishedAt` when the step becomes
 terminal. A step that never started — `pending`, `skipped` with
@@ -225,7 +227,7 @@ instead of the full `output`, `taskIds`, and `errorDetail`. The summary is small
 the full view whenever an output is long.
 
 `?step=<stepId>` returns that one step alone, with its full `output`, `taskIds`,
-`attemptTimes`, and (for a failed step) `errorDetail`, and no `spec`. A step the run does
+`attemptTimes`, and (for a failed step with a failing task) `errorDetail`, and no `spec`. A step the run does
 not have is `404 unknown_step`, returned before long-polling; a `step` that is not a
 valid step id shape is `400 invalid_step`. Both selectors combine with `?waitMs=`.
 With both selectors, `view=summary` determines the selected step's shape: `outputChars`
@@ -275,7 +277,10 @@ An already terminal run is returned unchanged.
 Reads `<state dir>/workflows/<id>.jsonl`, restores the steps that completed with their
 outputs, attempt counts, and time windows, and schedules the rest. Returns `202` with the
 restarted run. `409 workflow_active` when the run is still going, `404 unknown_workflow`
-when nothing is journaled under that id. The request takes no body and needs no
+when nothing is journaled under that id, and `503 workflow_capacity_reached` when the store
+is already at `maxWorkflows` with no finished run to evict and the id is not itself stored:
+a finished run that is still stored is resumed in place, while a journal-only id takes a
+slot by the same eviction rule as a submission. The request takes no body and needs no
 `content-type`.
 
 ### `GET /v1/pressure`
@@ -361,7 +366,7 @@ Workflows: `queued`, `running`, `completed`, `failed`, `cancelled`. Workflow ste
 | 415 | `unsupported_media_type` | `POST /v1/tasks` or `POST /v1/workflows` without `content-type: application/json`. |
 | 429 | `delegation_budget_exhausted` | The root task's tree already created `AGENT_RELAY_MAX_DELEGATED_TASKS` tasks. |
 | 500 | `request_failed` | Unexpected server error (includes `message`). |
-| 503 | `task_capacity_reached`, `workflow_capacity_reached`, `device_pressure` | Store full of non-terminal tasks or of runs with none finished; or a workflow submission while the host verdict is at or above the relay's admitBelow line, with the reading attached. |
+| 503 | `task_capacity_reached`, `workflow_capacity_reached`, `device_pressure` | Store full of non-terminal tasks or of runs with none finished (submissions and resumes alike); or a workflow submission while the host verdict is at or above the relay's admitBelow line, with the reading attached. |
 
 ### Task errors
 
@@ -394,7 +399,7 @@ The MCP server (JSON-RPC 2.0 over stdio, one JSON object per line) implements:
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `check_updates` | `{ includePrereleases? }` | Installed version and either no offer or an available version, canonical release URL, and bounded release notes. Calls the canonical GitHub release API only when explicitly requested; notes are data, not instructions. It never installs or restarts. |
+| `check_updates` | `{ includePrereleases? }` | Installed version and either no offer or an available version, canonical release URL, and bounded release notes; `releaseNotesTruncated` is `true` when the release body was cut at the bound, so the remainder is available only at that URL. Calls the canonical GitHub release API only when explicitly requested; notes are data, not instructions. It never installs or restarts. |
 | `list_agents` | `{}` | Same payload as `GET /v1/agents`, including `revision`. |
 | `delegate` | `{ agentId, input, sessionId?, requestId?, timeoutMs?, cwd?, options?, readOnly?, waitMs? }` | The queued task as soon as the relay accepts it — no wait is asked for unless `waitMs` is given. With `waitMs`, the terminal task, or the current task with `waitExpired: true` if the wait elapses first. A `waitMs` above the relay limit is refused with `invalid_wait` before the task is created, so nothing runs without an ID. The tool then retries once with the limit (read from `/healthz` `limits.maxWaitMs`, never longer than asked) and adds `waitMs` and `waitClamped: true` to the result. Even with a `requestId` the retry makes one task, because the refused attempt created none. A refusal that lands on the follow-up long poll instead — for example a replay that returns `200` without re-checking the wait — is clamped to the limit the same way, and the result then carries `waitMs` and `waitClamped: true`. If the submission created the task but the follow-up long poll then fails with no clamp available — a relay that refuses that wait while its `/healthz` reports no usable limit, an unreachable `/healthz`, or a transport error — the result is the created task with `waitFailed: true` and a `waitError` naming the failure and pointing at `wait_task` with the same `taskId`; the tool never resubmits after a successful submission. |
 | `wait_task` | `{ taskId, maxWaitMs? }` | The task's current state, at once when `maxWaitMs` is omitted. With `maxWaitMs`, the terminal task, or the current task with `waitExpired: true`, `waitedMs` and `hint` if the wait elapses. A `maxWaitMs` above the relay limit is clamped to it, and the result adds `waitMs` and `waitClamped: true`. |
@@ -463,9 +468,9 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].startedAt` / `steps[].finishedAt` | always | ISO-8601. `startedAt` is stamped when the relay begins the attempt — rendering and submitting its tasks — and `finishedAt` when the step reaches a terminal status, and only if it started. A step that never started (`pending`, `skipped` with `dependency_not_completed`, or `cancelled` with the run before its attempt began) keeps both null. A step whose attempt failed before submitting any task (an unresolved template reference, or a submission the relay refuses, such as `read_only_unsupported: ...`) is `failed` with both stamped and `attempts` `0`. Restored from the journal on resume. |
 | `steps[].attemptTimes` | single run only | One `{startedAt, finishedAt}` window per submitted attempt, oldest first; `finishedAt` is null for an attempt still open. Empty when no attempt submitted a task: a `pending`, `skipped` or pre-launch `cancelled` step, and a failure before the first submission. Absent from `GET /v1/workflows` list entries; present in the full, `view=summary` and `?step=` run views. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
-| `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
+| `steps[].output` | completed or failed | For a `foreach` step whose tasks ran, a JSON array of the item outputs whatever their outcome (a failed item contributes its own output, empty when it produced none), in that attempt's item order. No output is set when the step fails before its tasks run: an unresolved template reference, a rejected submission, or `task_evicted_from_the_relay_store`. Because `taskIds` accumulates across retries, a `taskIds` position maps to a `foreach` item only within one attempt; the failing item's error stays in `errorDetail`. |
 | `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the task error and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` for diagnostic usage/rate-limit reports, quota exceeded/reached, "too many requests" or HTTP 429. Classification reads only the full task error before tail truncation and requires HTTP, status, error or code context for 429; ordinary quota prose and stdout-only limit text do not set the quota label. |
-| `steps[].errorDetail` | failed step, single run view only | The failing task's full error text (stderr for a command agent), absent when no task ran; the list view never carries it. |
+| `steps[].errorDetail` | failed step, single run view only | The failing child task's `error`: its stderr when it printed some, otherwise the relay's or adapter's message for that failure (for example `Agent exited with N`, `Adapter exited with N` or `unknown_agent`); absent when no child task failed (a step that failed before starting one, or that detected the failure itself, such as `output_matched_fail_pattern`). On a `foreach` step it is the first failing item only — `taskIds` lists every child and `GET /v1/tasks/:id` returns each one's full error. The list view never carries it. |
 
 ## Workflow journals
 

@@ -9,17 +9,22 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_helpers import (PRINT_ARGV, ROOT, PYTHON, Relay, SERVER, start_http_server,
                            stop_http_server)
 
 sys.path.insert(0, os.path.join(ROOT, "src"))
+import server
 from server import _WARNED_FALLBACK, default_config_path
 
 
@@ -112,6 +117,30 @@ class RelayTests(unittest.TestCase):
             self.assertTrue(bounded["outputTruncated"])
         finally:
             quick.close()
+
+    def test_evicts_the_task_that_finished_first_not_the_one_created_first(self):
+        # The eviction victim is the task that finished longest ago, not the one created first:
+        # a long run's result stays stored when the next submission needs room.
+        relay = Relay([{"id": "slow", "command": PYTHON,
+                        "args": ["-c", "import sys,time; time.sleep(0.4); print(sys.argv[1])"]},
+                       {"id": "quick", "command": PYTHON,
+                        "args": ["-c", "import sys; print(sys.argv[1])"]}],
+                      env={"A2A_RELAY_MAX_TASKS": "2"})
+        try:
+            _, first = relay.submit(agentId="slow", input="one")
+            _, second = relay.submit(agentId="quick", input="two")
+            self.assertEqual(relay.wait_task(second["id"])["status"], "completed")
+            self.assertEqual(relay.wait_task(first["id"])["status"], "completed")
+            _, third = relay.submit(agentId="slow", input="three")
+            self.assertTrue(third["id"])
+            # The first submission finished last, so it is kept; the earlier finisher is gone.
+            status, kept = relay.request("GET", f"/v1/tasks/{first['id']}")
+            self.assertEqual(status, 200)
+            self.assertEqual(kept["output"], "one")
+            status, _ = relay.request("GET", f"/v1/tasks/{second['id']}")
+            self.assertEqual(status, 404)
+        finally:
+            relay.close()
 
     def test_queues_at_the_concurrency_limit_and_evicts_the_oldest_terminal_task(self):
         relay = Relay({"id": "work", "command": PYTHON,
@@ -634,6 +663,59 @@ class RelayTests(unittest.TestCase):
             self.assertNotIn("Traceback (most recent call last)", text)
         finally:
             relay.close()
+
+
+class SubmitWaitEvictionTests(unittest.TestCase):
+    """A blocking submission answers 404 when its task left the store before the read.
+
+    Runs the real handler in process so the store seam can be injected: the window that drops a
+    task between the wait's wake-up and its next read (the waiter re-acquiring LOCK after
+    ``_finish``) cannot be hit on demand from a subprocess.
+    """
+
+    def setUp(self):
+        self.saved = {name: getattr(server, name)
+                      for name in ("AGENTS", "TOKEN", "TASKS", "QUEUE", "REQUEST_IDS", "ACTIVE")}
+        server.AGENTS = {"echo": {"id": "echo", "type": "command", "command": PYTHON,
+                                  "args": ["-c", "print('ok')"]}}
+        server.TOKEN = "relay-test-token"
+        server.TASKS, server.QUEUE, server.REQUEST_IDS, server.ACTIVE = {}, [], [], 0
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        self.addCleanup(self.restore)
+        self.httpd.daemon_threads = True
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d/v1/tasks" % self.httpd.server_address[1]
+
+    def restore(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        for name, value in self.saved.items():
+            setattr(server, name, value)
+
+    def submit(self, body):
+        headers = {"content-type": "application/json",
+                   "authorization": "Bearer relay-test-token"}
+        request = urlrequest.Request(self.url, data=json.dumps(body).encode("utf-8"),
+                                     headers=headers, method="POST")
+        try:
+            with urlrequest.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urlerror.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def test_a_wait_whose_task_was_evicted_before_the_read_answers_404(self):
+        def evict(task_id, wait_ms):
+            # What _purge_expired and _make_room do to a finished task: drop it from the store.
+            with server.LOCK:
+                server.TASKS.pop(task_id, None)
+            return None
+
+        with mock.patch.object(server, "_wait_for_terminal", side_effect=evict), \
+                mock.patch.object(server, "_drain", lambda: None):
+            status, payload = self.submit({"agentId": "echo", "input": "x", "waitMs": 5000})
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "unknown_task"})
+        self.assertEqual(server.TASKS, {})
 
 
 class RelayLogLineTests(unittest.TestCase):
