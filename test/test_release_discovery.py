@@ -560,8 +560,8 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 discovery._write_cache(offer)
             self.assertIsNone(discovery.cached_notice("0.3.0"))
 
-    def test_oversize_and_symlinked_cache_files_stay_untrusted(self):
-        """Guard: oversize and symlinked cache reads stay untrusted on every write policy."""
+    def test_oversize_cache_files_stay_untrusted(self):
+        """Guard: an oversize cache read stays untrusted on every write policy."""
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
             path = Path(temp) / "agent-relay" / "release-notices.json"
             path.parent.mkdir(mode=0o700)
@@ -572,13 +572,42 @@ class ReleaseDiscoveryTests(unittest.TestCase):
             path.write_bytes(b" " * (discovery.MAX_CACHE + 1 - len(payload)) + payload)
             path.chmod(0o600)
             self.assertIsNone(discovery.cached_notice("0.3.0"))
-            path.unlink()
+
+    @unittest.skipUnless(os.name == "posix", "creating a symlink needs POSIX")
+    def test_symlinked_cache_files_stay_untrusted(self):
+        """Guard: a symlinked cache read stays untrusted on every write policy."""
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            path = Path(temp) / "agent-relay" / "release-notices.json"
+            path.parent.mkdir(mode=0o700)
             decoy = path.parent / "decoy"
             decoy.write_text("untouched")
             decoy.chmod(0o600)
             path.symlink_to(decoy)
             self.assertIsNone(discovery.cached_notice("0.3.0"))
             self.assertEqual(decoy.read_text(), "untouched")
+
+    @unittest.skipUnless(os.name == "posix", "the notice cache lock is a POSIX flock")
+    def test_cache_lock_validates_the_opened_descriptor(self):
+        """Guard: a name swapped after open cannot leave the lock on an unvalidated descriptor."""
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            directory = Path(temp) / "agent-relay"
+            directory.mkdir(mode=0o700)
+            lock = directory / "release-notices.lock"
+            lock.write_bytes(b"")
+            lock.chmod(0o600)
+            decoy = Path(temp) / "swapped-in"
+            decoy.mkdir()
+            real_open = os.open
+
+            def open_after_swap(path, flags, mode=0o777):
+                # The cache lock name still satisfies every path predicate; only the
+                # descriptor that os.open() actually returned is a different file.
+                os.close(real_open(path, flags, mode))
+                return real_open(decoy, os.O_RDONLY)
+
+            with patch.object(discovery.os, "open", side_effect=open_after_swap):
+                with self.assertRaisesRegex(discovery.DiscoveryError, "regular file"):
+                    discovery._acquire_cache_lock()
 
     def test_cached_notice_reads_only_the_local_cache(self):
         """Guard: a cached notice never fetches release metadata over the network."""
