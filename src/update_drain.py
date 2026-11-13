@@ -35,8 +35,8 @@ DRAIN_PATH = "/v1/admin/update/drain"
 HEALTH_PATH = "/healthz"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 TRANSACTION_RE = re.compile(r"[A-Za-z0-9_.~-]{1,128}")
-# Capability: 64 hex the relay generated; no client ever chooses one.
-CAPABILITY_RE = re.compile(r"[0-9a-f]{64}")
+# A capability is 64 hex the relay generated; the client never validates or
+# chooses one, it only carries back what the acquire answered.
 # Bounded waits: acquiring never turns into an unbounded stall, and waiting
 # for quiescence always reports instead of hanging.
 DEFAULT_ACQUIRE_WAIT_S = 15.0
@@ -91,13 +91,30 @@ def _check_loopback(base_url):
                          "refusing base URL %r" % base_url)
 
 
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    """Never follow a redirect: the bearer token must reach only the relay.
+
+    urllib's default follows up to ten redirects and re-sends the request
+    headers to each target, which would hand the token that reopens admission
+    (and the drain capability) to wherever a hijacked answer points.
+    """
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# Built once: one opener policy for every verb this module sends.
+_OPENER = urlrequest.build_opener(_NoRedirect)
+
+
 def _request(method, base_url, path, *, token=None, body=None, query=None,
              timeout=HTTP_TIMEOUT_S):
     """One bounded JSON request; returns ``(status, body)`` for every answer.
 
     HTTP errors are data here, not exceptions in the protocol sense: the caller
     maps server error codes to its own decisions, so this re-raises nothing but
-    a transport failure.
+    a transport failure. A redirect is a transport failure: it is never
+    followed, so no credential is forwarded.
     """
     url = base_url + path
     if query:
@@ -111,9 +128,13 @@ def _request(method, base_url, path, *, token=None, body=None, query=None,
         headers["content-type"] = "application/json"
     request = urlrequest.Request(url, data=data, method=method, headers=headers)
     try:
-        with urlrequest.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urlerror.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise DrainError("drain_unreachable",
+                             "the relay answered a redirect (HTTP %d); refusing to follow "
+                             "it with the bearer token attached" % exc.code)
         try:
             return exc.code, json.loads(exc.read().decode("utf-8"))
         except ValueError:
@@ -248,19 +269,3 @@ def release_drain(base_url, transaction_id, *, token, revision, capability,
                          "release was refused: %s" % (body or {}).get("message", status),
                          status=status)
     return body
-
-
-def drain(base_url, transaction_id, *, token, acquire_wait_s=DEFAULT_ACQUIRE_WAIT_S,
-          quiesce_wait_s=DEFAULT_QUIESCE_WAIT_S):
-    """One bounded rehearsal: acquire, wait for quiescence, keep the hold.
-
-    Returns ``(revision, capability, status)``; the caller releases with the
-    same pair. Raising after the acquire never releases; a caller releases in
-    a finally block or the hold stands until its explicit release.
-    """
-    acquired = acquire_drain(base_url, transaction_id, token=token, wait_s=acquire_wait_s)
-    revision, capability = acquired["revision"], acquired["capability"]
-    status = wait_for_quiescence(base_url, transaction_id, token=token,
-                                 revision=revision, capability=capability,
-                                 wait_s=quiesce_wait_s)
-    return revision, capability, status
