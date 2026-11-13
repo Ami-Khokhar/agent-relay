@@ -193,8 +193,16 @@ def _stage_receipt(tag, install_dir, state_dir):
     if not matches:
         raise UpdateError("no verified stage of %s staged from %s"
                           % (tag, Path(install_dir).resolve()))
-    # Newest succeeded stage wins; stages removed on failure never appear.
-    stored, receipt = matches[-1]
+    # Newest succeeded stage wins. The staging directories are named
+    # stage-<tag>-<random>, so directory name and iteration order say nothing
+    # about age; the receipt's own success timestamp is the only order here.
+    # Stages removed on failure never leave a receipt behind, and a receipt
+    # with a missing or non-numeric createdAt sorts oldest, never newest.
+    def _created_at(pair):
+        value = pair[1].get("createdAt")
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+    stored, receipt = max(matches, key=_created_at)
     try:
         update_staging.verify_stage(receipt["stage"], stored,
                                     git=update_staging.default_git())
