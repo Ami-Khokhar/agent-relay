@@ -593,15 +593,22 @@ def load_registry(path):
         if delegate_to is not None and (not isinstance(delegate_to, list) or not all(
                 isinstance(item, str) for item in delegate_to)):
             raise ValueError(f"Invalid delegateTo: {agent_id}")
-        # Discovery metadata: the listing returns it, no execution path reads it.
+        # Discovery metadata: the listing returns it, no execution path reads it. Both fields
+        # are stored trimmed, so the listed value is exactly the value that was validated.
+        metadata = {}
         model = raw.get("model")
-        if model is not None and (not isinstance(model, str) or not model.strip()):
-            raise ValueError(f"Invalid model: agent {agent_id}: model must be a non-empty string")
+        if model is not None:
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(
+                    f"Invalid model: agent {agent_id}: model must be a non-blank string")
+            metadata["model"] = model.strip()
         tags = raw.get("tags")
-        if tags is not None and (not isinstance(tags, list) or not all(
-                isinstance(item, str) and item for item in tags)):
-            raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
-                             "non-empty strings")
+        if tags is not None:
+            if not isinstance(tags, list) or not all(
+                    isinstance(item, str) and item.strip() for item in tags):
+                raise ValueError(f"Invalid tags: agent {agent_id}: tags must be an array of "
+                                 "non-blank strings")
+            metadata["tags"] = [item.strip() for item in tags]
         role = raw.get("role")
         if role is not None:
             if not isinstance(role, str):
@@ -626,7 +633,7 @@ def load_registry(path):
         merged = {"newTasks": True, "nativeSessions": False, "streaming": False}
         if isinstance(caps, dict):
             merged.update(caps)
-        agents[agent_id] = {**raw, "type": agent_type, "args": raw.get("args", []),
+        agents[agent_id] = {**raw, **metadata, "type": agent_type, "args": raw.get("args", []),
                             "capabilities": merged, "_role": roles.get(role) if role else None}
     return agents
 
@@ -1204,10 +1211,107 @@ def _read_body(stream, task):
     return b"".join(chunks)
 
 
+class _DeadlineFile:
+    """The response's byte stream, ending every read at the task's deadline.
+
+    ``opener.open``'s socket timeout bounds one recv, so an adapter that drips a header byte
+    per interval resets it and the head is never complete. Re-arming the socket with what is
+    left of the budget before each read -- as ``_read_body`` does for the body -- makes the
+    head end at the deadline too. Bytes read while parsing the head stay buffered here so the
+    body still starts where the socket left it.
+    """
+
+    def __init__(self, fp, sock, task):
+        self._fp = fp
+        self._sock = sock
+        self._task = task
+        self._buffer = b""
+
+    def __getattr__(self, name):  # close, closed, fileno, ... stay the real stream's
+        return getattr(self._fp, name)
+
+    def _arm(self):
+        remaining = _remaining(self._task)
+        if remaining <= 0:
+            raise TimeoutError(f"Agent exceeded {self._task['timeoutMs']} ms")
+        self._sock.settimeout(remaining)
+
+    def _take(self, size):
+        take = len(self._buffer) if size < 0 else min(size, len(self._buffer))
+        data, self._buffer = self._buffer[:take], self._buffer[take:]
+        return data
+
+    def readline(self, limit=-1):
+        while True:
+            end = self._buffer.find(b"\n") + 1
+            if end:
+                break
+            if 0 < limit <= len(self._buffer):
+                end = limit
+                break
+            self._arm()
+            chunk = self._fp.read1(65536 if limit <= 0 else min(65536, limit - len(self._buffer)))
+            if not chunk:  # EOF ends the line
+                end = len(self._buffer)
+                break
+            self._buffer += chunk
+        line, self._buffer = self._buffer[:end], self._buffer[end:]
+        return line
+
+    def read(self, size=-1):
+        head = self._take(size)
+        if size >= 0 and len(head) == size:
+            return head
+        self._arm()
+        return head + (self._fp.read() if size < 0 else self._fp.read(size - len(head)))
+
+    def read1(self, size=-1):
+        if self._buffer:
+            return self._take(size)
+        self._arm()
+        return self._fp.read1(size)
+
+
+class _DeadlineResponse(http.client.HTTPResponse):
+    """An HTTP response whose head and body reads give up at the task's deadline."""
+
+    task = None  # bound per request by ``_deadline_connection``
+
+    def __init__(self, sock, *args, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self.fp = _DeadlineFile(self.fp, sock, self.task)
+
+
+def _deadline_connection(base, task):
+    """The urllib connection class whose responses read under ``task``'s deadline."""
+    response = type("_DeadlineResponse", (_DeadlineResponse,), {"task": task})
+    return type(f"_Deadline{base.__name__}", (base,), {"response_class": response})
+
+
+class _DeadlineHTTPHandler(urlrequest.HTTPHandler):
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+
+    def http_open(self, req):
+        return self.do_open(_deadline_connection(http.client.HTTPConnection, self.task), req)
+
+
+class _DeadlineHTTPSHandler(urlrequest.HTTPSHandler):
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+
+    def https_open(self, req):
+        return self.do_open(_deadline_connection(http.client.HTTPSConnection, self.task), req,
+                            context=self._context)
+
+
 def _run_http(agent, task):
     from urllib import error as urlerror
 
-    opener = urlrequest.build_opener(_NoRedirect)
+    opener = urlrequest.build_opener(_NoRedirect, _DeadlineHTTPHandler(task),
+                                     _DeadlineHTTPSHandler(task))
     payload = json.dumps(adapter_request(task, agent)).encode("utf-8")
     request = urlrequest.Request(agent["url"], data=payload, method="POST",
                                  headers={"content-type": "application/json"})
@@ -1406,13 +1510,20 @@ def _pressure_guard():
 
 
 def _make_room():
+    """Evict the task that finished longest ago, so a long run's result survives its own arrival.
+
+    Every terminal task records ``_finished`` when it leaves queued/running, and that monotonic
+    stamp — not insertion order, which is creation order — decides the victim. A terminal record
+    without the stamp is not produced by any path here; such a record is not evictable rather
+    than ranked by a guessed time.
+    """
     if len(TASKS) < MAX_TASKS:
         return True
-    terminal = next((task for task in TASKS.values()
-                     if task["status"] not in ("queued", "running")), None)
-    if terminal is None:
+    finished = [task for task in TASKS.values()
+                if task["status"] not in ("queued", "running") and "_finished" in task]
+    if not finished:
         return False
-    _forget(terminal)
+    _forget(min(finished, key=lambda task: task["_finished"]))
     return True
 
 
@@ -1428,6 +1539,20 @@ def _cancellation_mode(agent_type):
 
 def _valid(value, limit=128):
     return isinstance(value, str) and 0 < len(value) <= limit
+
+
+def _encodable(text):
+    """True when ``text`` survives a UTF-8 encode.
+
+    ``json.loads`` accepts an escape such as ``"\\ud800"`` and hands back a lone surrogate, and a
+    path built the same way reaches ``os.path``. Encoding those raises ``UnicodeEncodeError``,
+    which would surface as a 500, so callers refuse them as malformed input first.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _is_positive_int(value):
@@ -1446,6 +1571,10 @@ def _resolve_task_cwd(agent, requested):
     if requested is None:
         return None, None
     if not isinstance(requested, str) or not requested:
+        return None, "invalid_cwd"
+    # os.path.realpath rejects a NUL and cannot encode a lone surrogate, so refuse both here: a
+    # ValueError out of realpath would reach the handler's blanket except and answer 500.
+    if "\0" in requested or not _encodable(requested):
         return None, "invalid_cwd"
     candidate = os.path.realpath(requested)
     roots = list(agent.get("allowedRoots") or [])
@@ -1921,6 +2050,11 @@ def _create_task(request, _internal=False):
     input_text = request.get("input")
     if not _valid(input_text, MAX_BODY):
         return 400, {"error": "input_required"}
+    if not _encodable(input_text):
+        # A JSON escape can decode to a lone surrogate, which the later size check would fail to
+        # encode; refuse the text itself, naming the field, instead of answering 500.
+        return 400, {"error": "invalid_input",
+                     "message": "input must be UTF-8 text; it contains an unpaired surrogate"}
     session_id = request.get("sessionId")
     if session_id is not None and not _valid(session_id):
         return 400, {"error": "invalid_session_id"}
@@ -2287,11 +2421,11 @@ class Handler(BaseHTTPRequestHandler):
             supplied.strip().encode("utf-8"), TOKEN.encode("utf-8"))
 
     def _submit(self):
-        error, request = self._read_json_body()
+        error, payload = self._read_json_body()
         if error:
-            return self._json(error, request)
-        status, body = _create_task(request)
-        wait_ms = request.get("waitMs")
+            return self._json(error, payload)
+        status, body = _create_task(payload)
+        wait_ms = payload.get("waitMs")
         if status == 202 and wait_ms:
             # _create_task validated the wait before it created the task, so a submission that
             # reaches here carries a valid one: block on it the way GET /v1/tasks/:id?waitMs=
@@ -2310,11 +2444,13 @@ class Handler(BaseHTTPRequestHandler):
             _drain()
 
     def _read_json_body(self, document=True):
-        """Read the request body as a JSON object.
+        """Read and parse the request body, consuming it so the connection stays in sync.
 
         Returns ``(error_status, error_body)`` on failure and ``(None, body)`` on success, so
-        every caller sends exactly one response. Pass ``document=False`` for a route that
-        takes no document: the body is still read, so a keep-alive connection stays in sync.
+        every caller that asks for a document sends exactly one response. Pass
+        ``document=False`` for a route that takes no document (``_kill_workflows`` and
+        ``_resume_workflow``): the body is read and dropped, so only its framing matters and
+        any valid JSON is accepted, with ``None`` returned in place of the payload.
         """
         if document:
             content_type = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
@@ -2332,6 +2468,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
             return 400, {"error": "invalid_json"}
+        if not document:
+            return None, None
         if not isinstance(body, dict):
             return 400, {"error": "invalid_request"}
         return None, body

@@ -17,6 +17,8 @@ CHECKOUT = Path(__file__).resolve().parent.parent
 
 
 def _relay_url():
+    # The installer's wrapper sets AGENT_RELAY_PORT, so this names the port the
+    # service was installed with; an explicit relay URL still wins.
     explicit = server._env("AGENT_RELAY_URL", "A2A_RELAY_URL")
     if explicit:
         return explicit.rstrip("/")

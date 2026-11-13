@@ -81,7 +81,17 @@ class AgentMetadataTests(unittest.TestCase):
             self.assertEqual({agent["id"] for agent in listing["agents"]},
                              {"glm-factory", "pi-mimo"})
 
+            # Every named tag must be carried, so an any-match filter would list both agents.
+            status, listing = relay.request("GET", "/v1/agents?tag=reviewer&tag=factory")
+            self.assertEqual(status, 200)
+            self.assertEqual([agent["id"] for agent in listing["agents"]], ["pi-mimo"])
+
             status, listing = relay.request("GET", "/v1/agents?tag=nobody")
+            self.assertEqual(status, 200)
+            self.assertEqual(listing["agents"], [])
+
+            # A blank tag is a tag no agent carries, not an omitted filter.
+            status, listing = relay.request("GET", "/v1/agents?tag=")
             self.assertEqual(status, 200)
             self.assertEqual(listing["agents"], [])
 
@@ -91,12 +101,30 @@ class AgentMetadataTests(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_the_listed_metadata_is_the_trimmed_value_that_was_validated(self):
+        relay = Relay([
+            {"id": "glm-factory", "command": PYTHON, "args": ["-c", "print(1)"],
+             "model": " glm-5.3-flash ", "tags": [" reviewer ", "factory"]},
+        ])
+        try:
+            status, listing = relay.request("GET", "/v1/agents")
+            self.assertEqual(status, 200)
+            entry = listing["agents"][0]
+            self.assertEqual(entry["model"], "glm-5.3-flash")
+            self.assertEqual(entry["tags"], ["reviewer", "factory"])
+            # The trimmed value is also the one the filter matches.
+            status, listing = relay.request("GET", "/v1/agents?tag=reviewer")
+            self.assertEqual(status, 200)
+            self.assertEqual([agent["id"] for agent in listing["agents"]], ["glm-factory"])
+        finally:
+            relay.close()
+
     def test_a_registry_that_mistypes_model_or_tags_is_refused_at_load(self):
         directory = tempfile.mkdtemp(prefix="a2a-meta-")
         self.addCleanup(shutil.rmtree, directory, True)
         path = os.path.join(directory, "agents.json")
-        for field, value in (("model", ""), ("model", 7), ("tags", "reviewer"),
-                             ("tags", [""]), ("tags", [1])):
+        for field, value in (("model", ""), ("model", "   "), ("model", 7), ("tags", "reviewer"),
+                             ("tags", [""]), ("tags", [" "]), ("tags", [1])):
             with self.subTest(field=field, value=value):
                 with open(path, "w", encoding="utf-8") as handle:
                     json.dump({"agents": [{"id": "x", "command": PYTHON, "args": [],
@@ -104,6 +132,22 @@ class AgentMetadataTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as raised:
                     server.load_registry(path)
                 self.assertIn(field, str(raised.exception))
+
+    def test_a_whitespace_only_value_is_refused_as_blank_not_empty(self):
+        directory = tempfile.mkdtemp(prefix="a2a-blank-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "agents.json")
+        for field, value, message in (
+                ("model", "   ", "model must be a non-blank string"),
+                ("tags", [" ", "\t"], "tags must be an array of non-blank strings")):
+            with self.subTest(field=field):
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump({"agents": [{"id": "x", "command": PYTHON, "args": [],
+                                           field: value}]}, handle)
+                with self.assertRaises(ValueError) as raised:
+                    server.load_registry(path)
+                self.assertIn(message, str(raised.exception))
+                self.assertNotIn("non-empty", str(raised.exception))
 
 
 if __name__ == "__main__":

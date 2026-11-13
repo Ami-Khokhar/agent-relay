@@ -146,9 +146,11 @@ class Git:
         """Read the repository config BEFORE any command that could execute a
         checkout filter, and refuse the definitions that can redirect git to
         code: filters, custom hook paths, config includes, per-URL rewrites and
-        submodule definitions."""
+        submodule definitions. Returns the inspected ``key=value`` lines, so a
+        caller that needs one key reads it from this same, already-gated read."""
+        lines = self.run("config", "--local", "--list", cwd=cwd).splitlines()
         offending = set()
-        for line in self.run("config", "--local", "--list", cwd=cwd).splitlines():
+        for line in lines:
             key = line.split("=", 1)[0].lower()
             if key.split(".", 1)[0] in ("filter", "include", "includeif", "submodule", "url") \
                     or key == "core.hookspath":
@@ -156,6 +158,7 @@ class Git:
         if offending:
             raise StagingError("repository configuration defines %s; refusing git "
                                "that may execute code" % ", ".join(sorted(offending)))
+        return lines
 
 
 def _plain_private_dir(root, label):
@@ -185,6 +188,20 @@ def _plain_private_dir(root, label):
         raise StagingError("%s directory is group- or world-writable; refusing an unsafe "
                            "location" % label)
     return resolved
+
+
+def _tracked_entries(git, resolved):
+    """``(mode, path)`` for every tracked entry, from ``git ls-files -s -z``.
+
+    A record is ``<mode> <object> <stage>\\t<path>``. The only separator before
+    the path is the tab after the stage digit, so a path that itself contains a
+    space or a tab is reported whole, and a path starting with ``.`` is never
+    obscured by the stage digit.
+    """
+    for record in git.run("ls-files", "-s", "-z", cwd=resolved).split("\0"):
+        if record:
+            head, path = record.split("\t", 1)
+            yield head.split(" ", 1)[0], path
 
 
 def inspect_checkout(root, *, git):
@@ -224,16 +241,21 @@ def inspect_checkout(root, *, git):
     main = git.run("worktree", "list", "--porcelain", cwd=resolved).split("\n", 1)[0]
     if main.startswith("worktree ") and main.split(" ", 1)[1].rstrip("/\\") != resolved_str:
         raise StagingError("git reports a linked worktree, not the main checkout; refusing")
-    git.config_guard(cwd=resolved)
-    for origin in git.run("config", "--local", "--get-all", "remote.origin.url",
-                          cwd=resolved).splitlines():
+    config = git.config_guard(cwd=resolved)
+    origins = []
+    for line in config:
+        key, _, value = line.partition("=")
+        if key.lower() == "remote.origin.url":
+            origins.append(value)
+    if not origins:
+        raise StagingError("checkout has no origin remote; a source checkout must fetch "
+                           "from the canonical %s (add it with: git remote add origin %s); "
+                           "refusing" % (REPOSITORY, SINGLE_ORIGIN))
+    for origin in origins:
         if origin not in ALLOWED_ORIGINS:
             raise StagingError("origin %s is not the canonical %s remote; refusing a "
                                "non-canonical source checkout" % (origin, REPOSITORY))
-    for line in git.run("ls-files", "-s", "-z", cwd=resolved).split("\0"):
-        if not line:
-            continue
-        mode, _stage, path = line.split(" ", 2)
+    for mode, path in _tracked_entries(git, resolved):
         if mode not in TRACKED_MODES:
             label = {"120000": "symlink", "160000": "submodule/gitlink"}.get(mode, mode)
             raise StagingError("repository tracks %s at %s; refusing a checkout with %s "
@@ -263,11 +285,12 @@ def _walk_regular_files(resolved):
         if current == resolved and ".git" in dirnames:
             dirnames.remove(".git")  # .git is metadata, not manifest content
         for name in dirnames:
-            info = os.lstat(str(current / name))
+            candidate = current / name
+            relative = candidate.relative_to(resolved).as_posix()
+            info = os.lstat(str(candidate))
             if not S_ISDIR(info.st_mode):
                 raise StagingError("staged %s is not a real directory; refusing symlinks "
-                                   "and special files" % os.path.join(
-                                       current.relative_to(resolved).as_posix(), name))
+                                   "and special files" % relative)
         for name in filenames:
             if name == STAGE_RECEIPT_NAME and current == resolved:
                 continue  # the receipt is the stage's own identity record
@@ -521,10 +544,7 @@ def activate_transaction_source(record, *, git=None):
     if git.run("status", "--porcelain", "--untracked-files=all", cwd=resolved).strip():
         raise StagingError("the switched working tree is dirty; refusing an uncertain "
                            "activation")
-    for line in git.run("ls-files", "-s", "-z", cwd=resolved).split("\0"):
-        if not line:
-            continue
-        mode, _stage, path = line.split(" ", 2)
+    for mode, path in _tracked_entries(git, resolved):
         if mode not in TRACKED_MODES:
             raise StagingError("activated repository tracks unsafe mode %s at %s; "
                                "refusing" % (mode, path))
@@ -587,10 +607,7 @@ def rollback_transaction_source(record, *, git=None):
                            "refusing an uncertain rollback")
     if git.run("status", "--porcelain", "--untracked-files=all", cwd=resolved).strip():
         raise StagingError("the restored working tree is dirty; refusing an uncertain rollback")
-    for line in git.run("ls-files", "-s", "-z", cwd=resolved).split("\0"):
-        if not line:
-            continue
-        mode, _stage, path = line.split(" ", 2)
+    for mode, path in _tracked_entries(git, resolved):
         if mode not in TRACKED_MODES:
             raise StagingError("the restored repository tracks unsafe mode %s at %s; "
                                "refusing" % (mode, path))

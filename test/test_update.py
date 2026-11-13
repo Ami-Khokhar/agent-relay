@@ -664,9 +664,8 @@ exit 0
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(os.path.exists(os.path.join(agents, "com.agent-relay.plist")))
             self.assertFalse(os.path.exists(os.path.join(agents, "com.agent-relay.update.plist")))
-            calls = self._take_log(tmp)
-            self.assertIn("launchctl bootout gui/", "\n".join(calls))
-            self.assertIn("/com.agent-relay.update", "\n".join(calls))
+            self.assertIn(f"launchctl bootout gui/{os.getuid()}/com.agent-relay.update",
+                          self._take_log(tmp))
             self.assertIn("removed the existing release-check timer", result.stdout)
             self.assertNotIn("no release-check timer installed", result.stdout)
 
@@ -680,8 +679,10 @@ exit 0
             result = self._install(env, "--uninstall")
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = self._take_log(tmp)
-            self.assertIn("launchctl bootout gui/", "\n".join(calls))
-            self.assertIn("/com.agent-relay.update", "\n".join(calls))
+            self.assertIn(f"launchctl bootout gui/{os.getuid()}/com.agent-relay.update",
+                          calls)
+            self.assertIn("removed the release-check timer (com.agent-relay.update)",
+                          result.stdout)
 
     def test_no_update_timer_removes_the_systemd_update_units_but_keeps_the_service(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -927,7 +928,7 @@ exit 0
                         self.assertEqual(os.listdir(units),
                                          ["agent-relay.service"])
 
-    def test_uninstall_works_from_a_server_only_checkout(self):
+    def test_uninstall_from_a_server_only_checkout_reports_nothing_installed(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkout = os.path.join(tmp, "checkout")
             env = self._env(tmp, checkout)
@@ -935,6 +936,10 @@ exit 0
 
             result = self._install(env, "--uninstall")
             self.assertEqual(result.returncode, 0, result.stderr)
+            # Nothing was installed: say so for both artifacts instead of going quiet.
+            self.assertIn("relay service not installed (", result.stdout)
+            self.assertIn("no release-check timer installed (", result.stdout)
+            self.assertNotIn("removed the release-check timer", result.stdout)
 
     def test_timer_uses_metadata_only_checker_on_linux(self):
         with tempfile.TemporaryDirectory() as tmp:
