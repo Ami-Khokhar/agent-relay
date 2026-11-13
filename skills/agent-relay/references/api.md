@@ -284,9 +284,14 @@ slot by the same eviction rule as a submission. The request takes no body and ne
 `content-type`.
 
 A resume continues the change feed rather than replaying it: a step restored from the
-journal publishes no event, and on a feed that already reported the run's status, a run
-resumed to that same status publishes no run-level event. An `after` cursor taken before
-the resume therefore sees only what the resume itself ran.
+journal publishes no event, so an `after` cursor taken before the resume does not re-report
+its completion. A step the resume will run keeps the `pending` baseline, so its attempt
+publishes whatever it does — including failing before it ever reaches `running`.
+
+A run with nothing left to run (every step was restored) finishes at the status its feed
+already reported, so it publishes no run-level event while its previous run is still in
+relay memory; a run with work left, and one whose previous object was evicted by the
+workflow store bound, publishes its own `queued → running → terminal`.
 
 ### `GET /v1/pressure`
 

@@ -1007,6 +1007,40 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(completed), 1, after)
         self.assertGreater(completed[0]["seq"], cursor)
 
+    def test_a_resumed_step_refused_at_submission_still_reports_its_failure(self):
+        mark = self.path("resume-refused-mark")
+        agents = [
+            echo(),
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+             "env": {"WF_MARK": mark}},
+        ]
+        relay = self.start(agents)
+        _, submitted = relay.request("POST", "/v1/workflows", {"name": "resume-refused", "steps": [
+            {"id": "kept", "agentId": "echo", "input": "kept"},
+            {"id": "retry", "agentId": "flaky", "needs": ["kept"], "input": "retry me"},
+        ]})
+        workflow_id, session_id = submitted["id"], submitted["sessionId"]
+        self.assertEqual(wait(relay, workflow_id)["status"], "failed")
+        before = feed(relay, session_id)
+        cursor = before[-1]["seq"]
+
+        # Drop the retried step's agent, so the resumed attempt fails in _launch before it
+        # ever reaches running; resume does not re-validate the journal against the registry.
+        relay.write_registry(echo())
+        status, reloaded = relay.reload()
+        self.assertEqual(status, 200, reloaded)
+
+        status, _ = relay.request("POST", f"/v1/workflows/{workflow_id}/resume")
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, workflow_id)["status"], "failed")
+
+        # The resume did not replay the kept step, but the attempt it made must reach the
+        # feed: a seeded baseline would hide a failure that never passed through running.
+        after = feed(relay, session_id, cursor)
+        self.assertEqual(
+            [(event["stepId"], event["oldStatus"], event["newStatus"]) for event in after],
+            [(None, "queued", "failed"), ("retry", "pending", "failed")])
+
     def test_a_resume_after_a_restart_republishes_no_journaled_completion(self):
         mark = self.path("resume-restart-feed-mark")
         agents = [
