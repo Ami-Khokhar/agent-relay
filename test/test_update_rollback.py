@@ -253,9 +253,14 @@ class RecoveryCommandTest(_RollbackCase):
     """``safe_update recover`` rolls the durable failed activation back."""
 
     def test_crash_after_the_swap_is_recovered_to_the_exact_prior_revision(self):
-        """A durable failed activation whose source already moved recovers
-        through the real ``recover`` command to the exact journaled prior
-        revision, forgets the transaction and keeps every private file."""
+        """Guard: a durable failed activation whose source already moved
+        recovers through the real ``recover`` command to the exact journaled
+        prior revision, forgets the transaction and keeps every private file.
+
+        The source change on this branch removes an uncalled helper and
+        corrects a docstring, so no test can depend on it; this and the
+        other tests marked ``Guard:`` hold the shipped recovery contract,
+        not the deletion."""
         self._crash(swapped=True)
         self.assertEqual(self._head(), self.fixture.target)
         self.fixture.write_plist()
@@ -463,6 +468,8 @@ class PrivateStateTest(_RollbackCase):
     """Private config and service definitions are retained unchanged (#159)."""
 
     def test_state_stays_private_and_unchanged_through_recovery(self):
+        """Guard: recovery keeps consent, the device id, the stage receipt
+        and the service definition byte- and permission-identical."""
         self._crash(swapped=True)
         self.fixture.write_plist()
         before = self._inventory()
@@ -476,10 +483,10 @@ class PrivateStateTest(_RollbackCase):
                          "the finished record is expunged, not rewritten")
 
     def test_state_stays_private_and_unchanged_through_a_successful_activate(self):
-        """A proven activation keeps every private file it did not finish:
-        consent, device id, stage receipt and the service definition are
-        byte- and permission-unchanged, and only the barrier and the journal
-        are removed rather than rewritten."""
+        """Guard: a proven activation keeps every private file it did not
+        finish - consent, device id, stage receipt and the service definition
+        are byte- and permission-identical - and only the barrier and the
+        journal are removed, not rewritten."""
         self.fixture.write_plist()
         before = self._inventory()
         self.assertEqual(before["barrier"].split(":")[1], "600")
@@ -493,9 +500,9 @@ class PrivateStateTest(_RollbackCase):
         self.assertEqual((self.state / "update").stat().st_mode & 0o777, 0o700)
 
     def test_state_stays_private_through_a_recovery_required_end(self):
-        """An activation that fails both to restart and to roll back keeps
-        every private file: consent, device id, the stage receipt and the
-        service definition are byte- and permission-unchanged, and the
+        """Guard: an activation that fails both to restart and to roll back
+        keeps every private file - consent, device id, the stage receipt and
+        the service definition are byte- and permission-identical - and the
         retained barrier and journal stay owner-only."""
         self.fixture.write_plist()
         before = self._inventory()
