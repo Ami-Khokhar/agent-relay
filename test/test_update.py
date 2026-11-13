@@ -664,9 +664,8 @@ exit 0
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(os.path.exists(os.path.join(agents, "com.agent-relay.plist")))
             self.assertFalse(os.path.exists(os.path.join(agents, "com.agent-relay.update.plist")))
-            calls = self._take_log(tmp)
-            self.assertIn("launchctl bootout gui/", "\n".join(calls))
-            self.assertIn("/com.agent-relay.update", "\n".join(calls))
+            self.assertIn(f"launchctl bootout gui/{os.getuid()}/com.agent-relay.update",
+                          self._take_log(tmp))
             self.assertIn("removed the existing release-check timer", result.stdout)
             self.assertNotIn("no release-check timer installed", result.stdout)
 
@@ -929,7 +928,7 @@ exit 0
                         self.assertEqual(os.listdir(units),
                                          ["agent-relay.service"])
 
-    def test_uninstall_works_from_a_server_only_checkout(self):
+    def test_uninstall_from_a_server_only_checkout_reports_nothing_installed(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkout = os.path.join(tmp, "checkout")
             env = self._env(tmp, checkout)
