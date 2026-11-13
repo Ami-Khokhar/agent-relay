@@ -621,6 +621,7 @@ class WorkflowEngine:
             if prior is None and not self._make_room():
                 return 503, {"error": "workflow_capacity_reached"}
             workflow = self._new_workflow(saved["spec"], None, workflow_id=workflow_id)
+            published = {step["id"]: step for step in (prior or {}).get("steps", ())}
             for step in workflow["steps"]:
                 done = saved["outputs"].get(step["id"])
                 if done is not None:
@@ -630,6 +631,17 @@ class WorkflowEngine:
                     step["startedAt"] = done["startedAt"]
                     step["finishedAt"] = done["finishedAt"]
                     step["attemptTimes"] = done["attemptTimes"]
+                # The feed already published this step's last status (for a restored step,
+                # its completion), so the resumed run continues from it: journaled work must
+                # not replay pending → completed, while a step this resume runs still reports
+                # its own transitions. The journal is all there is after a restart, so a
+                # restored step has no earlier status to continue from.
+                step["_event_status"] = published.get(step["id"], {}).get(
+                    "_event_status", step["status"])
+            if prior is not None:
+                # The same for the run itself, so resuming a finished run publishes nothing.
+                workflow["_event_run_status"] = prior.get(
+                    "_event_run_status", workflow["status"])
             self._workflows[workflow_id] = workflow
             # The one field _new_workflow sets and _make_room releases; reading the old
             # name left every resumed run unregistered.

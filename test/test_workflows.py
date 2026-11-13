@@ -84,6 +84,17 @@ def steps_of(workflow):
     return {step["id"]: step for step in workflow["steps"]}
 
 
+def feed(relay, session_id, after=None):
+    """The session's change feed, oldest first, from ``after`` (or the beginning)."""
+    query = f"/v1/workflows/events?sessionId={session_id}"
+    if after is not None:
+        query += f"&after={after}"
+    status, body = relay.request("GET", query)
+    if status != 200:
+        raise AssertionError(f"the change feed returned {status}: {body}")
+    return body["events"]
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.state = tempfile.mkdtemp(prefix="a2a-relay-wf-state-")
@@ -938,6 +949,91 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["first"]["finishedAt"], kept["finishedAt"])
         self.assertEqual(finished["first"]["attemptTimes"], kept["attemptTimes"])
         self.assertEqual(finished["second"]["output"], "recovered")
+
+    def test_resume_publishes_nothing_the_journal_already_completed(self):
+        relay = self.start(echo())
+        status, submitted = relay.request("POST", "/v1/workflows", {"name": "replay", "steps": [
+            {"id": "first", "agentId": "echo", "input": "kept"},
+            {"id": "second", "agentId": "echo", "needs": ["first"], "input": "also kept"},
+        ]})
+        self.assertEqual(status, 202)
+        workflow_id, session_id = submitted["id"], submitted["sessionId"]
+        self.assertEqual(wait(relay, workflow_id)["status"], "completed")
+        before = feed(relay, session_id)
+        self.assertIn(("first", "completed"),
+                      [(event["stepId"], event["newStatus"]) for event in before])
+        cursor = before[-1]["seq"]
+
+        status, _ = relay.request("POST", f"/v1/workflows/{workflow_id}/resume")
+        self.assertEqual(status, 202)
+        done = wait(relay, workflow_id)
+        self.assertEqual(done["status"], "completed")
+        self.assertEqual(done["steps"][0]["output"], "kept")
+
+        # A resume repeats no work on a run that already finished, so the feed continues
+        # from the same seq with nothing new: the restored steps and the run status are
+        # stamped with what the feed already published.
+        self.assertEqual(feed(relay, session_id, cursor), [])
+
+    def test_a_resumed_run_still_publishes_the_step_it_runs_afterwards(self):
+        mark = self.path("resume-feed-mark")
+        agents = [
+            echo(),
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+             "env": {"WF_MARK": mark}},
+        ]
+        relay = self.start(agents)
+        _, submitted = relay.request("POST", "/v1/workflows", {"name": "resume-feed", "steps": [
+            {"id": "kept", "agentId": "echo", "input": "kept"},
+            {"id": "retry", "agentId": "flaky", "needs": ["kept"], "input": "retry me"},
+        ]})
+        workflow_id, session_id = submitted["id"], submitted["sessionId"]
+        self.assertEqual(wait(relay, workflow_id)["status"], "failed")
+        before = feed(relay, session_id)
+        self.assertIn(("kept", "completed"),
+                      [(event["stepId"], event["newStatus"]) for event in before])
+        cursor = before[-1]["seq"]
+
+        status, _ = relay.request("POST", f"/v1/workflows/{workflow_id}/resume")
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, workflow_id)["status"], "completed")
+
+        after = feed(relay, session_id, cursor)
+        # The step the journal already completed publishes nothing a second time...
+        self.assertNotIn("kept", [event["stepId"] for event in after])
+        # ...while the step the resume actually ran reports its completion past the cursor.
+        completed = [event for event in after
+                     if event["stepId"] == "retry" and event["newStatus"] == "completed"]
+        self.assertEqual(len(completed), 1, after)
+        self.assertGreater(completed[0]["seq"], cursor)
+
+    def test_a_resume_after_a_restart_republishes_no_journaled_completion(self):
+        mark = self.path("resume-restart-feed-mark")
+        agents = [
+            echo(),
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+             "env": {"WF_MARK": mark}},
+        ]
+        relay = self.start(agents)
+        _, submitted = relay.request("POST", "/v1/workflows", {"name": "resume-restart", "steps": [
+            {"id": "kept", "agentId": "echo", "input": "kept"},
+            {"id": "retry", "agentId": "flaky", "needs": ["kept"], "input": "retry me"},
+        ]})
+        workflow_id, session_id = submitted["id"], submitted["sessionId"]
+        self.assertEqual(wait(relay, workflow_id)["status"], "failed")
+        self.stop(relay)
+
+        # The feed lives in memory, so the journal is the only state the resume can read.
+        relay = self.start(agents)
+        self.assertEqual(feed(relay, session_id), [])
+        status, _ = relay.request("POST", f"/v1/workflows/{workflow_id}/resume")
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, workflow_id)["status"], "completed")
+
+        after = feed(relay, session_id)
+        self.assertNotIn("kept", [event["stepId"] for event in after])
+        self.assertIn(("retry", "completed"),
+                      [(event["stepId"], event["newStatus"]) for event in after])
 
     def test_resume_reads_a_journal_without_fail_patterns_or_needs_policy(self):
         mark = self.path("legacy-journal-mark")

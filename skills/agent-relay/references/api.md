@@ -283,6 +283,11 @@ a finished run that is still stored is resumed in place, while a journal-only id
 slot by the same eviction rule as a submission. The request takes no body and needs no
 `content-type`.
 
+A resume continues the change feed rather than replaying it: a step restored from the
+journal publishes no event, and on a feed that already reported the run's status, a run
+resumed to that same status publishes no run-level event. An `after` cursor taken before
+the resume therefore sees only what the resume itself ran.
+
 ### `GET /v1/pressure`
 
 The host reading, with a verdict a caller can act on:
