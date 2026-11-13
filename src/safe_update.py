@@ -336,7 +336,8 @@ def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=No
             state_dir=state_dir)
     except Exception as exc:  # the hold acquired above must never outlive a failed prepare
         note = _release_drain_after_failure(base_url, transaction_id, token, acquired)
-        raise UpdateError("the transaction could not be prepared: %s; %s" % (exc, note)) from exc
+        raise UpdateError("the transaction could not be prepared: %s; %s%s"
+                          % (exc, note, _surviving_record(state_dir, transaction_id))) from exc
     print("Prepared activation transaction %s:" % transaction_id)
     print("  target  %s (%s)" % (identity["tag"], identity["commit"]))
     print("  old     exact relay revision %s" % acquired["revision"])
@@ -358,6 +359,37 @@ def _release_drain_after_failure(base_url, transaction_id, token, acquired):
         return ("the acquired drain hold could NOT be released: %s; the hold stands "
                 "until an explicit release recovers it" % exc)
     return "the acquired drain hold was released again"
+
+
+def _surviving_record(state_dir, transaction_id):
+    """The record a failed prepare left behind, named so it is never hidden.
+
+    ``begin_transaction`` writes the journal before the barrier, so a failure
+    after the journal write leaves a live ``prepared`` record that keeps
+    admission closed. Reporting only the released hold would tell the operator
+    the prepare failed cleanly; the surviving record and the command that
+    proves and clears it are named instead. Nothing is rewritten or removed
+    here: the journal says what is true and only recovery may change it.
+
+    The path is composed without touching the filesystem and the read is
+    caught broadly, because this runs inside the handler reporting a failed
+    prepare: an unusable update directory is one of the ways preparing fails,
+    and a second error raised from here would replace the first.
+    """
+    journal = (Path(state_dir) / update_transaction.UPDATE_DIRNAME
+               / update_transaction.JOURNAL_NAME)
+    try:
+        record = update_transaction.recover_transaction(state_dir=state_dir)
+    except Exception as exc:  # must never mask the failure this note explains
+        return ("; the transaction journal at %s could not be re-read (%s), so it may still "
+                "hold state: `python3 src/safe_update.py status` inspects it before anything "
+                "else" % (journal, exc))
+    if record is None or record.get("transactionId") != transaction_id:
+        return ""
+    return ("; a transaction record for %s survived the failure in %s (phase %r) and still "
+            "closes admission: `python3 src/safe_update.py status` inspects it and "
+            "`python3 src/safe_update.py recover-abort %s` proves and clears it"
+            % (transaction_id, journal, record.get("phase"), transaction_id))
 
 
 def _authenticated_get(base_url, token, path):
@@ -948,18 +980,21 @@ def cmd_recover_abort(transaction_id, *, base_url=None):
     if status is None:
         update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
         print("Transaction %s aborted; the relay hold ended without an explicit release, so "
-              "admission reopens after the proof only. Nothing was ever activated."
+              "admission reopens after the proof only. A relay that already read this barrier "
+              "keeps refusing until it is restarted. Nothing was ever activated."
               % transaction_id)
         return 0
     try:
         update_drain.release_drain(base_url, transaction_id, token=token,
                                    revision=revision, capability=drain["capability"])
     except (update_drain.DrainError, KeyError) as exc:
-        raise UpdateError("the abort record is written and admission reopens, but the drain "
-                          "could not be released; release it explicitly first: %s" % exc)
+        raise UpdateError("the abort record is written and admission reopens on restart, but "
+                          "the drain could not be released; release it explicitly first: %s"
+                          % exc)
     update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
     print("Transaction %s aborted; the drain was released with its capability and admission "
-          "reopens. Nothing was ever activated." % transaction_id)
+          "reopens. A relay that already read this barrier keeps refusing until it is "
+          "restarted. Nothing was ever activated." % transaction_id)
     return 0
 
 

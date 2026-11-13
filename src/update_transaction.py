@@ -395,8 +395,11 @@ def begin_transaction(receipt, *, state_dir):
             "phase": "prepared",
             "revision": revision,
             "target": {"identity": receipt["identity"], "identityDigest": digest},
-            "stage": {"path": receipt["stage"],
-                      "inventory": receipt.get("inventory", [])},
+            # The stage is bound by its path; its receipt (the manifest inventory
+            # included) is bound by the hashed reference in ``state`` below. No
+            # reader ever consumed a copy of the inventory here, and the stage
+            # receipt never carried one, so no empty placeholder is recorded.
+            "stage": {"path": receipt["stage"]},
             "inventory": {"sourceRoot": receipt.get("sourceRoot"),
                           "sourceCommit": receipt.get("sourceCommit")},
             "state": _external_references(receipt, state_dir),

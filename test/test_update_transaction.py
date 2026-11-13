@@ -11,7 +11,9 @@ device state or the relay process.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import stat
@@ -222,6 +224,9 @@ class TransactionJournalTest(_Case):
         self.assertEqual(stored["revision"], OLD_COMMIT, "the old exact commit is durable")
         self.assertEqual(stored["target"]["identity"]["tag"], TAG)
         self.assertEqual(stored["stage"]["path"], str(self.fixture.stage_dir))
+        self.assertNotIn("inventory", stored["stage"],
+                         "no empty inventory placeholder is recorded: a stage receipt carries "
+                         "no inventory and no reader consumes one from the journal")
         self.assertEqual(stored["inventory"]["sourceCommit"], self.fixture.commit)
         self.assertEqual(stored["drain"]["capability"], CAPABILITY,
                          "drain ownership is recoverable")
@@ -285,6 +290,48 @@ class TransactionJournalTest(_Case):
         with self.assertRaises(identity.UpdateError):
             update_transaction.clear_transaction(TXN, state_dir=self.state)
         self.assertIsNotNone(update_transaction.recover_transaction(state_dir=self.state))
+
+
+class IncompleteJournalReaderTest(_Case):
+    """Guard: every journal reader refuses a shaped-but-incomplete record.
+
+    A syntactically valid record that lacks the fields a reader indexes must
+    fail closed into ``UpdateError`` naming the journal, never a ``KeyError``
+    that escapes the CLI's ``except UpdateError``; the untrusted record is
+    never rewritten or expunged on the way out.
+    """
+
+    def _journal(self):
+        """The private journal path, holding a shaped-but-incomplete record."""
+        update_dir = self.state / "update"
+        update_dir.mkdir(mode=0o700, exist_ok=True)
+        journal = update_dir / "transaction.json"
+        journal.write_text(json.dumps({"schema": update_transaction.TRANSACTION_SCHEMA}))
+        os.chmod(str(journal), 0o600)
+        return journal
+
+    def test_begin_transition_and_clear_refuse_an_incomplete_journal(self):
+        journal = self._journal()
+        untouched = journal.read_bytes()
+        barrier = self.state / "update" / "admission-barrier.json"
+        readers = (
+            ("begin_transaction",
+             lambda: update_transaction.begin_transaction(self.fixture.begin_receipt(),
+                                                          state_dir=self.state)),
+            ("transition",
+             lambda: update_transaction.transition(TXN, "prepared", "draining",
+                                                   state_dir=self.state)),
+            ("clear_transaction",
+             lambda: update_transaction.clear_transaction(TXN, state_dir=self.state)),
+        )
+        for name, reader in readers:
+            with self.assertRaises(identity.UpdateError, msg=name) as caught:
+                reader()
+            self.assertIn("transaction journal", str(caught.exception),
+                          "%s names the journal it refuses" % name)
+            self.assertEqual(journal.read_bytes(), untouched,
+                             "%s must not rewrite the record it cannot trust" % name)
+            self.assertFalse(barrier.exists(), "%s must not write a barrier" % name)
 
 
 class CrashDurabilityTest(_Case):
@@ -465,9 +512,15 @@ class RelayBarrierTest(_Case):
         self.assertEqual(relay2.request("GET", "/healthz")[0], 200)
         with _join([patch.object(update_drain, "relay_token", lambda: TOKEN),
                     patch.object(safe_update, "_state_dir", lambda: self.state)]):
-            self.assertEqual(safe_update.cmd_recover_abort(TXN, base_url=relay2.base), 0,
-                             "a restarted relay's drain_not_held is accepted as proof "
-                             "after the revision and unchanged-state proofs")
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                self.assertEqual(safe_update.cmd_recover_abort(TXN, base_url=relay2.base), 0,
+                                 "a restarted relay's drain_not_held is accepted as proof "
+                                 "after the revision and unchanged-state proofs")
+        self.assertIn("keeps refusing until it is restarted",
+                      printed.getvalue(),
+                      "the abort says a relay that already read the barrier needs a restart, "
+                      "which is exactly what this test then proves")
         status, body = relay2.submit(agentId="worker", input="hello")
         self.assertEqual((status, body.get("error")), (503, "update_barrier_active"),
                          "the relay that already read the barrier refuses until restart")
@@ -525,6 +578,51 @@ class PrepareAbortCliTest(_Case):
         self.assertEqual(relay.releases, [TXN])
         self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
         self.assertIsNone(self.blocker())
+
+    def test_a_prepare_failing_after_the_journal_names_the_surviving_record(self):
+        """Guard: the journal is written before the barrier, so a failure there
+        leaves a live ``prepared`` record. The error must name that record and
+        the command that clears it, not claim the prepare failed cleanly."""
+        relay = self._relay()
+        with _join(self._patches(relay) +
+                   [patch.object(safe_update, "_state_dir", lambda: self.state),
+                    patch.object(update_transaction, "_write_barrier",
+                                 side_effect=OSError(28, "No space left on device"))]):
+            with self.assertRaises(identity.UpdateError) as caught:
+                safe_update.cmd_prepare_activation(TAG, str(self.repo),
+                                                   base_url="http://127.0.0.1:9",
+                                                   transaction_id=TXN)
+        message = str(caught.exception)
+        self.assertIn("released again", message, "the released hold is still reported")
+        self.assertIn("survived the failure", message, "the leftover record is not hidden")
+        self.assertIn("`python3 src/safe_update.py recover-abort %s`" % TXN, message,
+                      "the error names the command that proves and clears the record")
+        surviving = update_transaction.recover_transaction(state_dir=self.state)
+        self.assertIsNotNone(surviving, "the failed prepare leaves its record on disk")
+        self.assertEqual((surviving["transactionId"], surviving["phase"]), (TXN, "prepared"))
+        self.assertIsNotNone(self.blocker(), "the surviving record still closes admission")
+        self.assertEqual(relay.releases, [TXN], "the stranded hold is released again")
+
+    def test_a_prepare_failure_on_an_unusable_update_dir_still_names_the_release(self):
+        """Guard: the note is built inside the failure handler, so re-reading the
+        journal for it must never raise over the error it is explaining. A
+        symlinked update directory is one way preparing itself fails."""
+        relay = self._relay()
+        os.symlink(str(self.state / "elsewhere"), str(self.state / "update"))
+        with _join(self._patches(relay) +
+                   [patch.object(safe_update, "_state_dir", lambda: self.state)]):
+            with self.assertRaises(identity.UpdateError) as caught:
+                safe_update.cmd_prepare_activation(TAG, str(self.repo),
+                                                   base_url="http://127.0.0.1:9",
+                                                   transaction_id=TXN)
+        message = str(caught.exception)
+        self.assertIn("the transaction could not be prepared", message)
+        self.assertIn("released again", message,
+                      "the released hold is reported even when the journal cannot be re-read")
+        self.assertIn("could not be re-read", message,
+                      "the unreadable journal is reported as possibly holding state, not as "
+                      "a second failure that replaces the first")
+        self.assertEqual(relay.releases, [TXN], "the stranded hold is released again")
 
     def test_a_failed_prepare_release_reports_an_unreleasable_hold(self):
         relay = self._relay()
