@@ -584,8 +584,8 @@ def rollback_transaction(transaction_id, *, state_dir, service, base_url=None,
     state and its barrier, reports an actionable remedy, and never declares
     the rollback complete or opens admission.
 
-    Returns ``{"previous", "previousObject", "restored", "serviceRestarted"}
-    when the relay reopened admission; the record is expunged by the caller.
+    Returns ``{"previous", "restored", "serviceRestarted"}`` only when the
+    relay reopened admission; the record is then expunged by the caller.
     Each caller holds no lock across this function."""
     state_dir = Path(state_dir)
     if not isinstance(service, dict) or service.get("kind") not in ("launchd", "systemd"):
@@ -805,20 +805,6 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
     update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
     print("Recovery finished: transaction %s is expunged and admission is open." % transaction_id)
     return 0
-
-
-def _enter_recovery(transaction_id, state_dir, exc):
-    """Record a durable recovery_required end for a half-built activation."""
-    try:
-        update_transaction.transition_locked(transaction_id, update_transaction.read_journal(
-            state_dir=state_dir)["phase"], "recovery_required", state_dir=state_dir,
-            reason=str(exc))
-    except Exception as recovery_exc:  # the journal is retained either way
-        raise UpdateError("activation failed (%s) and the recovery record could not be "
-                          "written (%s); the barrier still holds admission closed; "
-                          "manual recovery required" % (exc, recovery_exc)) from exc
-    raise UpdateError("activation failed: %s; the transaction now requires recovery and "
-                      "the admission barrier stays closed" % exc)
 
 
 def _refresh_barrier(base_url, token):

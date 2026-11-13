@@ -152,6 +152,36 @@ class _RollbackCase(_Case):
         if restarts is not None:
             self.assertEqual(len(self.restart_commands), restarts)
 
+    def _inventory(self):
+        """Bytes and permissions of every private file this install owns."""
+        got = {}
+        for name, rel in (("consent", "consent.json"), ("device", "device-id"),
+                          ("barrier", "update/admission-barrier.json"),
+                          ("journal", "update/transaction.json")):
+            path = self.state / rel
+            if not path.exists():
+                continue
+            data = path.read_bytes()
+            got[name] = "%s:%o" % (hashlib.sha256(data).hexdigest(),
+                                   stat.S_IMODE(path.stat().st_mode))
+        receipt = Path(self.fixture.stage) / "stage-receipt.json"
+        got["receipt"] = "%s:%o" % (hashlib.sha256(receipt.read_bytes()).hexdigest(),
+                                    stat.S_IMODE(receipt.stat().st_mode))
+        plist = self.fixture.home / "Library" / "LaunchAgents" / "com.agent-relay.plist"
+        if plist.exists():
+            got["service"] = "%s:%o" % (hashlib.sha256(plist.read_bytes()).hexdigest(),
+                                        stat.S_IMODE(plist.stat().st_mode))
+        got["updateDir"] = "%o" % stat.S_IMODE((self.state / "update").stat().st_mode)
+        return got
+
+    def assertPrivateUnchanged(self, before, after):
+        """Every private file but the transient barrier/journal kept its bytes."""
+        live = dict(before)
+        live.pop("barrier")
+        live.pop("journal")
+        self.assertEqual(after, live, "consent, device id, stage receipt and the "
+                         "service definition are byte- and permission-unchanged")
+
 
 class AutomaticRollbackTest(_RollbackCase):
     """A failed activate attempt recovers itself to the exact prior revision."""
@@ -223,9 +253,18 @@ class RecoveryCommandTest(_RollbackCase):
     """``safe_update recover`` rolls the durable failed activation back."""
 
     def test_crash_after_the_swap_is_recovered_to_the_exact_prior_revision(self):
+        """A durable failed activation whose source already moved recovers
+        through the real ``recover`` command to the exact journaled prior
+        revision, forgets the transaction and keeps every private file."""
         self._crash(swapped=True)
         self.assertEqual(self._head(), self.fixture.target)
-
+        self.fixture.write_plist()
+        before = self._inventory()
+        self.run_recover()
+        self.assertConverged(restarts=0)
+        self.assertEqual(self._head(), self.fixture.old,
+                         "the checkout runs the exact known-good revision")
+        self.assertPrivateUnchanged(before, self._inventory())
 
     def test_crash_before_the_swap_needs_no_restart_at_all(self):
         self._crash(swapped=False)
@@ -423,46 +462,56 @@ class RecoveryBoundaryTest(_RollbackCase):
 class PrivateStateTest(_RollbackCase):
     """Private config and service definitions are retained unchanged (#159)."""
 
-    def _inventory(self):
-        got = {}
-        for name, rel in (("consent", "consent.json"), ("device", "device-id")):
-            path = self.state / rel
-            data = path.read_bytes()
-            got[name] = "%s:%o" % (hashlib.sha256(data).hexdigest(),
-                                   stat.S_IMODE(path.stat().st_mode))
-        for name, rel in (("barrier", "update/admission-barrier.json"),
-                          ("journal", "update/transaction.json")):
-            path = self.state / rel
-            if not path.exists():
-                continue
-            data = path.read_bytes()
-            got[name] = "%s:%o" % (hashlib.sha256(data).hexdigest(),
-                                   stat.S_IMODE(path.stat().st_mode))
-        receipt = Path(self.fixture.stage) / "stage-receipt.json"
-        got["receipt"] = "%s:%o" % (hashlib.sha256(receipt.read_bytes()).hexdigest(),
-                                    stat.S_IMODE(receipt.stat().st_mode))
-        self.fixture.write_plist()
-        plist = self.fixture.home / "Library" / "LaunchAgents" / "com.agent-relay.plist"
-        got["service"] = "%s:%o" % (hashlib.sha256(plist.read_bytes()).hexdigest(),
-                                    stat.S_IMODE(plist.stat().st_mode))
-        got["updateDir"] = "%o" % stat.S_IMODE((self.state / "update").stat().st_mode)
-        return got
-
     def test_state_stays_private_and_unchanged_through_recovery(self):
         self._crash(swapped=True)
+        self.fixture.write_plist()
         before = self._inventory()
         self.assertEqual(before["barrier"].split(":")[1], "600")
         self.assertEqual(before["journal"].split(":")[1], "600")
         self.assertEqual(before["updateDir"], "700")
-        live = dict(before)
-        live.pop("barrier")
-        live.pop("journal")
         self.run_recover()
         after = self._inventory()
-        self.assertEqual(after, live, "consent, device id, stage receipt and the "
-                         "service definition are byte- and permission-unchanged")
+        self.assertPrivateUnchanged(before, after)
         self.assertFalse((self.state / "update" / "transaction.json").exists(),
                          "the finished record is expunged, not rewritten")
+
+    def test_state_stays_private_and_unchanged_through_a_successful_activate(self):
+        """A proven activation keeps every private file it did not finish:
+        consent, device id, stage receipt and the service definition are
+        byte- and permission-unchanged, and only the barrier and the journal
+        are removed rather than rewritten."""
+        self.fixture.write_plist()
+        before = self._inventory()
+        self.assertEqual(before["barrier"].split(":")[1], "600")
+        self.assertEqual(before["journal"].split(":")[1], "600")
+        self.assertEqual(before["updateDir"], "700")
+        self.assertEqual(self.run_activate(), 0)
+        after = self._inventory()
+        self.assertPrivateUnchanged(before, after)
+        self.assertNotIn("barrier", after, "the finished barrier is removed")
+        self.assertNotIn("journal", after, "the finished record is expunged")
+        self.assertEqual((self.state / "update").stat().st_mode & 0o777, 0o700)
+
+    def test_state_stays_private_through_a_recovery_required_end(self):
+        """An activation that fails both to restart and to roll back keeps
+        every private file: consent, device id, the stage receipt and the
+        service definition are byte- and permission-unchanged, and the
+        retained barrier and journal stay owner-only."""
+        self.fixture.write_plist()
+        before = self._inventory()
+        self.probe_raises = update_drain.DrainError("drain_unreachable", "down")
+        with self.assertRaises(identity.UpdateError):
+            self.run_activate(restart=self.failing_restart)
+        self.assertEqual(update_transaction.recover_transaction(
+            state_dir=self.state)["phase"], "recovery_required")
+        after = self._inventory()
+        for name in ("consent", "device", "receipt", "service", "updateDir"):
+            self.assertEqual(after[name], before[name],
+                             "%s is byte- and permission-unchanged" % name)
+        self.assertEqual(after["barrier"].split(":")[1], "600")
+        self.assertEqual(after["journal"].split(":")[1], "600")
+        self.assertIsNotNone(update_transaction.read_barrier(state_dir=self.state),
+                             "the barrier is retained, not dropped")
 
     def test_the_journal_carries_references_and_digests_never_secret_payloads(self):
         """Guard: the old recovery_required record also kept state private and
