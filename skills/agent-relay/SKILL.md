@@ -459,9 +459,13 @@ runs through `pending` → `running` → one of `completed`, `failed`, `cancelle
 directly `pending` → `skipped` when its dependency policy cannot be satisfied (a
 non-completed need for `all`, or no completed need for `any`). Every step reports
 `needsPolicy` as submitted, or `null` when omitted, and carries `startedAt` and
-`finishedAt`, null until it starts and finishes. A run view adds `attemptTimes`, one
-`{startedAt, finishedAt}` window per attempt — so a report can give each step its own time
-window without reading task ids.
+`finishedAt`: `startedAt` when the relay begins the attempt (rendering and submitting its
+tasks), `finishedAt` when the step becomes terminal. A step that never started (`pending`,
+`skipped`, or `cancelled` before its attempt began) keeps both null; a step whose attempt
+failed before submitting a task is `failed` with both stamped and `attempts` 0. A run view
+adds `attemptTimes`, one `{startedAt, finishedAt}` window per submitted attempt and empty
+when nothing was submitted — so a report can give each step its own time window without
+reading task ids.
 
 ```
 {"name": "review-loop", "steps": [
