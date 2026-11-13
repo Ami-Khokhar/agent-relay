@@ -113,6 +113,30 @@ class RelayTests(unittest.TestCase):
         finally:
             quick.close()
 
+    def test_evicts_the_task_that_finished_first_not_the_one_created_first(self):
+        # The eviction victim is the task that finished longest ago, not the one created first:
+        # a long run's result stays stored when the next submission needs room.
+        relay = Relay([{"id": "slow", "command": PYTHON,
+                        "args": ["-c", "import sys,time; time.sleep(0.4); print(sys.argv[1])"]},
+                       {"id": "quick", "command": PYTHON,
+                        "args": ["-c", "import sys; print(sys.argv[1])"]}],
+                      env={"A2A_RELAY_MAX_TASKS": "2"})
+        try:
+            _, first = relay.submit(agentId="slow", input="one")
+            _, second = relay.submit(agentId="quick", input="two")
+            self.assertEqual(relay.wait_task(second["id"])["status"], "completed")
+            self.assertEqual(relay.wait_task(first["id"])["status"], "completed")
+            _, third = relay.submit(agentId="slow", input="three")
+            self.assertTrue(third["id"])
+            # The first submission finished last, so it is kept; the earlier finisher is gone.
+            status, kept = relay.request("GET", f"/v1/tasks/{first['id']}")
+            self.assertEqual(status, 200)
+            self.assertEqual(kept["output"], "one")
+            status, _ = relay.request("GET", f"/v1/tasks/{second['id']}")
+            self.assertEqual(status, 404)
+        finally:
+            relay.close()
+
     def test_queues_at_the_concurrency_limit_and_evicts_the_oldest_terminal_task(self):
         relay = Relay({"id": "work", "command": PYTHON,
                        "args": ["-c", "import sys,time; time.sleep(0.1); print(sys.argv[1])"]},
