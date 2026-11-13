@@ -305,12 +305,20 @@ def now_iso():
 
 def visible(task, include_input=False):
     """The task as clients see it. The prompt is left out unless asked for: callers already
-    hold it, and echoing it on every poll fills their context. inputChars is always there."""
-    snapshot = {key: value for key, value in task.items()
-                if not key.startswith("_") and key != "input"}
-    snapshot["inputChars"] = len(task["input"])
-    if include_input:
-        snapshot["input"] = task["input"]
+    hold it, and echoing it on every poll fills their context. inputChars is always there.
+
+    Rendered under LOCK: the worker thread adds startedAt to this same dict as it starts a task
+    and finishedAt/output as it finishes one (see _drain and _finish), so a render that walked
+    the dict after releasing the lock could raise "dictionary changed size during iteration" and
+    turn an ordinary poll into a 500. LOCK is reentrant, so a caller already holding it is fine,
+    and the body therefore always describes one snapshot no worker can have half-updated.
+    """
+    with LOCK:
+        snapshot = {key: value for key, value in task.items()
+                    if not key.startswith("_") and key != "input"}
+        snapshot["inputChars"] = len(task["input"])
+        if include_input:
+            snapshot["input"] = task["input"]
     return snapshot
 
 
@@ -1698,14 +1706,15 @@ def _delegation_error(parent, agent):
 
 
 def _list_tasks(session_id=None, status=None, limit=100):
+    # One lock hold covers the filter, the order and every render: a snapshot of the listing then
+    # describes the tasks as they were at one instant, and no render walks a dict that a starting
+    # or finishing worker is still writing (see visible).
     with LOCK:
-        tasks = list(TASKS.values())
-    if session_id is not None:
-        tasks = [task for task in tasks if task.get("sessionId") == session_id]
-    if status is not None:
-        tasks = [task for task in tasks if task["status"] == status]
-    tasks.sort(key=lambda task: task.get("createdAt") or "", reverse=True)
-    return [visible(task) for task in tasks[:limit]]
+        tasks = [task for task in TASKS.values()
+                 if (session_id is None or task.get("sessionId") == session_id)
+                 and (status is None or task["status"] == status)]
+        tasks.sort(key=lambda task: task.get("createdAt") or "", reverse=True)
+        return [visible(task) for task in tasks[:limit]]
 
 
 def _is_valid_wait(value):
