@@ -45,7 +45,6 @@ import update_staging
 import update_transaction
 from release_identity import UpdateError
 
-STATE_LABEL = "release update consent"
 BARRIER_PATH = "/v1/admin/update/state"
 AGENTS_PATH = "/v1/agents"
 JSON_ACCEPT = "application/vnd.github+json"
@@ -53,8 +52,10 @@ JSON_ACCEPT = "application/vnd.github+json"
 # asset metadata, so it must be requested with the octet-stream Accept header.
 ASSET_ACCEPT = "application/octet-stream"
 # GitHub serves release assets by 302ing to one of these signed download hosts;
-# any other redirect target is an uncanonical identity and refused.
-ASSET_REDIRECT_HOSTS = frozenset(("github.com", "objects.githubusercontent.com",
+# any other redirect target is an uncanonical identity and refused. github.com
+# itself is the page host, not a download host: its /releases/download URLs are
+# another 302 to the CDN, which the one-redirect rule refuses anyway.
+ASSET_REDIRECT_HOSTS = frozenset(("objects.githubusercontent.com",
                                   "release-assets.githubusercontent.com"))
 
 
