@@ -207,7 +207,7 @@ the step starts, exactly as a registry change would be for a queued task.
 Returns the run: `id`, `name`, `status`, `sessionId`, `createdAt`, `startedAt`,
 `finishedAt`, `error`, `spec`, and `steps[]` with `id`, `agentId`, `needs`, `needsPolicy`, `status`,
 `attempts`, `startedAt`, `finishedAt`, `taskIds`, `attemptTimes`, `output`, `error`, and
-(for a failed step) `errorDetail`.
+(for a failed step with a failing task) `errorDetail`.
 Every step carries `startedAt` and `finishedAt`: `startedAt` is stamped when the relay
 begins the attempt (rendering and submitting its tasks), `finishedAt` when the step becomes
 terminal. A step that never started — `pending`, `skipped` with
@@ -227,7 +227,7 @@ instead of the full `output`, `taskIds`, and `errorDetail`. The summary is small
 the full view whenever an output is long.
 
 `?step=<stepId>` returns that one step alone, with its full `output`, `taskIds`,
-`attemptTimes`, and (for a failed step) `errorDetail`, and no `spec`. A step the run does
+`attemptTimes`, and (for a failed step with a failing task) `errorDetail`, and no `spec`. A step the run does
 not have is `404 unknown_step`, returned before long-polling; a `step` that is not a
 valid step id shape is `400 invalid_step`. Both selectors combine with `?waitMs=`.
 With both selectors, `view=summary` determines the selected step's shape: `outputChars`
@@ -467,7 +467,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
 | `steps[].output` | completed or failed | For a `foreach` step whose tasks ran, a JSON array of the item outputs whatever their outcome (a failed item contributes its own output, empty when it produced none), in that attempt's item order. No output is set when the step fails before its tasks run: an unresolved template reference, a rejected submission, or `task_evicted_from_the_relay_store`. Because `taskIds` accumulates across retries, a `taskIds` position maps to a `foreach` item only within one attempt; the failing item's error stays in `errorDetail`. |
 | `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the task error and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` for diagnostic usage/rate-limit reports, quota exceeded/reached, "too many requests" or HTTP 429. Classification reads only the full task error before tail truncation and requires HTTP, status, error or code context for 429; ordinary quota prose and stdout-only limit text do not set the quota label. |
-| `steps[].errorDetail` | failed step, single run view only | The failing task's full error text (stderr for a command agent), absent when no task ran; the list view never carries it. |
+| `steps[].errorDetail` | failed step, single run view only | The failing child task's `error`: its stderr when it printed some, otherwise the relay's or adapter's message for that failure (for example `Agent exited with N`, `Adapter exited with N` or `unknown_agent`); absent when no child task failed (a step that failed before starting one, or that detected the failure itself, such as `output_matched_fail_pattern`). On a `foreach` step it is the first failing item only — `taskIds` lists every child and `GET /v1/tasks/:id` returns each one's full error. The list view never carries it. |
 
 ## Workflow journals
 
