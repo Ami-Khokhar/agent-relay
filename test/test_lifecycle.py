@@ -210,6 +210,48 @@ class LifecycleTests(unittest.TestCase):
             relay.close()
             stop_http_server(http_server)
 
+    def test_http_deadline_bounds_headers_that_drip_bytes(self):
+        stop = []
+        seen = []
+
+        def handler(request):
+            request.rfile.read(int(request.headers.get("content-length", 0)))
+            if seen:  # the slot is free: this request is answered normally
+                send_json(request, 200, {"protocolVersion": "relay.adapter/v1",
+                                         "status": "completed", "output": "second"})
+                return
+            seen.append(True)
+            head = (b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 1\r\n\r\nx")
+            for byte in head:  # one header byte every 0.1 s: the socket timeout never fires
+                if stop:
+                    return
+                try:
+                    request.wfile.write(bytes([byte]))
+                    request.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.1)
+
+        http_server, port = start_http_server(handler)
+        relay = Relay({"id": "dripping", "type": "http", "url": f"http://127.0.0.1:{port}"})
+        try:
+            started = time.monotonic()
+            _, submitted = relay.submit(agentId="dripping", input="x", timeoutMs=1000)
+            try:
+                task = relay.wait_task(submitted["id"], timeout=4)
+            except RuntimeError:
+                self.fail("a dripping header stream held the task past its timeout")
+            self.assertEqual(task["status"], "timed_out")
+            self.assertLess(time.monotonic() - started, 2.5)
+            self.assertTrue(_wait_for(lambda: self.active(relay) == 0))
+            second = relay.run_task(agentId="dripping", input="x", timeoutMs=5000)
+            self.assertEqual(second["status"], "completed")
+            self.assertEqual(second["output"], "second")
+        finally:
+            stop.append(True)
+            relay.close()
+            stop_http_server(http_server)
+
     def _assert_foreign_group_survives(self, recorded):
         foreign = subprocess.Popen([PYTHON, "-c", "import time; time.sleep(30)"], start_new_session=True)
         self.addCleanup(foreign.wait)
