@@ -1035,6 +1035,87 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(status, 400, body)
             self.assertEqual(refused["error"], "invalid_request")
 
+    def test_resume_takes_the_same_room_rule_as_a_submission(self):
+        # A journal outlives the run it belongs to, so resuming an evicted id is the one path
+        # that could re-add runs forever: the store's bound must hold here too.
+        first_release = self.path("release-first")
+        second_release = self.path("release-second")
+        hold = ("import os, pathlib, time\n"
+                "while not pathlib.Path(os.environ['WF_RELEASE']).exists(): time.sleep(0.01)\n"
+                "print('released')\n")
+        relay = self.start(
+            [echo(),
+             {"id": "hold-a", "command": PYTHON, "args": ["-c", hold],
+              "env": {"WF_RELEASE": first_release}},
+             {"id": "hold-b", "command": PYTHON, "args": ["-c", hold],
+              "env": {"WF_RELEASE": second_release}}],
+            env={"AGENT_RELAY_MAX_WORKFLOWS": "2"})
+        self.assertEqual(relay.request("GET", "/healthz")[1]["limits"]["maxWorkflows"], 2)
+
+        status, held = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "hold-a", "input": "hold the first slot"}]})
+        self.assertEqual(status, 202, held)
+        # Fills the second slot, then gets evicted by the next submission: only its journal
+        # survives, which is exactly what a resume reads.
+        gone = run(relay, {"steps": [{"id": "only", "agentId": "echo", "input": "evictable"}]})
+        run(relay, {"steps": [{"id": "only", "agentId": "echo", "input": "replaces it"}]})
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{gone['id']}")[0], 404)
+        status, held_again = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "hold-b", "input": "hold the other slot"}]})
+        self.assertEqual(status, 202, held_again)
+        # Both stored runs are unfinished now, so nothing is evictable.
+        _, full = relay.request("GET", "/v1/workflows?limit=10")
+        self.assertEqual({wf["id"] for wf in full["workflows"]},
+                         {held["id"], held_again["id"]})
+
+        status, refused = relay.request("POST", f"/v1/workflows/{gone['id']}/resume")
+        self.assertEqual((status, refused["error"]), (503, "workflow_capacity_reached"))
+        # The refusal starts no run: the id stays out of the store and the bound holds.
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{gone['id']}")[0], 404)
+        _, still_full = relay.request("GET", "/v1/workflows?limit=10")
+        self.assertEqual({wf["id"] for wf in still_full["workflows"]},
+                         {held["id"], held_again["id"]})
+
+        # With one finished run in the store, a resume evicts it by the submission rule.
+        with open(first_release, "w", encoding="utf-8") as handle:
+            handle.write("go")
+        self.assertEqual(wait(relay, held["id"])["status"], "completed")
+        status, resumed = relay.request("POST", f"/v1/workflows/{gone['id']}/resume")
+        self.assertEqual(status, 202, resumed)
+        self.assertEqual(wait(relay, gone["id"])["status"], "completed")
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{held['id']}")[0], 404)
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{held_again['id']}")[0], 200)
+        _, bounded = relay.request("GET", "/v1/workflows?limit=10")
+        self.assertEqual({wf["id"] for wf in bounded["workflows"]},
+                         {gone["id"], held_again["id"]})
+        with open(second_release, "w", encoding="utf-8") as handle:
+            handle.write("go")
+
+    def test_resume_of_a_stored_finished_run_evicts_nothing(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_WORKFLOWS": "2"})
+        first = run(relay, {"requestId": "keep-a",
+                            "steps": [{"id": "only", "agentId": "echo", "input": "A"}]})
+        second = run(relay, {"requestId": "keep-b",
+                             "steps": [{"id": "only", "agentId": "echo", "input": "B"}]})
+        # Both are stored and finished, so the store is at the bound and the resumed id is
+        # already there: the resume replaces its own entry instead of needing a new one.
+        self.assertEqual(relay.request("GET", "/v1/workflows?limit=10")[1]["workflows"][0]["id"],
+                         second["id"])
+        status, resumed = relay.request("POST", f"/v1/workflows/{second['id']}/resume")
+        self.assertEqual(status, 202, resumed)
+        self.assertEqual(wait(relay, second["id"])["status"], "completed")
+        # Nothing was evicted: A stays stored with its requestId, so a replay returns it
+        # rather than starting a second run.
+        self.assertEqual(relay.request("GET", f"/v1/workflows/{first['id']}")[0], 200)
+        status, replay = relay.request("POST", "/v1/workflows", {
+            "requestId": "keep-a",
+            "steps": [{"id": "only", "agentId": "echo", "input": "A"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(replay["id"], first["id"])
+        _, listing = relay.request("GET", "/v1/workflows?limit=10")
+        self.assertEqual({wf["id"] for wf in listing["workflows"]},
+                         {first["id"], second["id"]})
+
     # ------------------------------------------------------------------ idempotency
 
     def test_returns_the_same_run_for_a_reused_request_id(self):

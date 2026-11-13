@@ -613,6 +613,13 @@ class WorkflowEngine:
             refused = self._drain_refusal() if self._drain_refusal else None
             if refused:
                 return refused
+            # Journals outlive eviction, so a journal-only id adds a stored run and takes the
+            # same room rule as a submission: without it each resumed id would grow the store
+            # and its executor thread past the bound. An id still stored finished is resumed
+            # in place, which adds no entry, so asking for room there would evict an unrelated
+            # finished run and release its requestId for nothing.
+            if prior is None and not self._make_room():
+                return 503, {"error": "workflow_capacity_reached"}
             workflow = self._new_workflow(saved["spec"], None, workflow_id=workflow_id)
             for step in workflow["steps"]:
                 done = saved["outputs"].get(step["id"])
