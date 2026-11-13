@@ -1,6 +1,7 @@
 """Local trust boundary tests: API token, browser origins, bind address, HTTP adapter trust."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -263,6 +264,29 @@ class ApiTokenTests(unittest.TestCase):
                 self.assertIn(b"may only contain letters, digits", done.stderr)
         finally:
             relay.close()
+
+
+class JsonBodyTests(unittest.TestCase):
+    """``_read_json_body``: the document flag alone decides whether the body shape is checked."""
+
+    def _handler(self, raw):
+        return types.SimpleNamespace(
+            headers={"content-type": "application/json", "content-length": str(len(raw))},
+            rfile=io.BytesIO(raw), close_connection=False)
+
+    def test_a_document_less_read_drops_a_body_it_does_not_check(self):
+        for raw in (b"[]", b'"x"', b"42", b"null"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    server.Handler._read_json_body(self._handler(raw), document=False),
+                    (None, None))
+
+    def test_a_document_read_still_refuses_a_body_that_is_not_an_object(self):
+        for raw in (b"[]", b'"x"'):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    server.Handler._read_json_body(self._handler(raw)),
+                    (400, {"error": "invalid_request"}))
 
 
 class NetworkBoundaryTests(unittest.TestCase):

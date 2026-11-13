@@ -966,6 +966,43 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body["error"], "unknown_workflow")
 
+    def test_a_document_less_route_drops_the_body_shape_and_still_acts(self):
+        # Resume and the kill button take no document: their body is read only to keep the
+        # connection in sync, so any valid JSON is accepted and the route still does its work.
+        mark = self.path("document-less-mark")
+        relay = self.start([
+            echo(),
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY],
+             "env": {"WF_MARK": mark}},
+            {"id": "slow", "command": PYTHON, "args": ["-c", SLOW]},
+        ])
+        _, submitted = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "flaky", "input": "retry me"}]})
+        self.assertEqual(wait(relay, submitted["id"])["status"], "failed")
+        status, _ = relay.request("POST", f"/v1/workflows/{submitted['id']}/resume", "[]")
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, submitted["id"])["status"], "completed")
+
+        _, running = relay.request("POST", "/v1/workflows", {"steps": [
+            {"id": "only", "agentId": "slow", "input": "long job"}]})
+        deadline = time.time() + 10
+        view = {}
+        while time.time() < deadline:
+            _, view = relay.request("GET", f"/v1/workflows/{running['id']}")
+            if view["steps"][0]["status"] == "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(view["steps"][0]["status"], "running")
+        status, killed = relay.request("POST", "/v1/pressure/kill", '"x"')
+        self.assertEqual(status, 200)
+        self.assertIn(running["id"], killed["killed"])
+
+        # A route that does read the document still refuses a body that is not an object.
+        for body in ("[]", '"x"'):
+            status, refused = relay.request("POST", "/v1/workflows", body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(refused["error"], "invalid_request")
+
     # ------------------------------------------------------------------ idempotency
 
     def test_returns_the_same_run_for_a_reused_request_id(self):
