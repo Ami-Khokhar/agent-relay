@@ -64,7 +64,8 @@ owner registries may still declare other values, including values that map to no
 This supersedes the output-tail classification fallback in the workflow-cause decision below.
 Failed tasks already carry a task error, including a relay-generated message when command
 stderr is empty. Classification therefore uses that error only; stdout-only limit text
-stays visible in the cause and output without setting the quota label. Numeric 429 reports
+stays visible in the cause and output without setting the quota label, except on a
+timed-out task, whose error carries the bounded tail of both captured streams. Numeric 429 reports
 need HTTP, status, error or code context, so source line numbers cannot relabel failures.
 The existing explicit limit phrases and failed-step ordering remain unchanged.
 
