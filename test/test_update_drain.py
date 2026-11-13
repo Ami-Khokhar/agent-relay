@@ -7,6 +7,8 @@ service control but its three admin verbs and healthz.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -188,6 +190,220 @@ class DrainTests(unittest.TestCase):
         update_drain.release_drain(relay.base, "txn-a", token=TOKEN,
                                    revision=revision, capability=capability)
         self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202)
+
+    def test_a_lost_acquire_response_is_recovered_by_the_same_transaction(self):
+        """The relay applied the acquire; its answer never arrived. Naming the
+        same transaction again returns that hold's capability, so the operator
+        releases it and admission reopens without restarting the relay."""
+        relay = self.start([self.sleeper()])
+        real_request = update_drain._request
+        lost = []
+
+        def losing(method, base_url, path, **kwargs):
+            status, body = real_request(method, base_url, path, **kwargs)
+            if method == "POST" and not lost:
+                # The server minted the hold; the response is lost in transit,
+                # exactly as a client timeout sees it.
+                lost.append((status, body))
+                raise update_drain.DrainError("drain_unreachable",
+                                              "the acquire answer never arrived")
+            return status, body
+
+        with patch.object(update_drain, "_request", losing):
+            acquired = update_drain.acquire_drain(relay.base, "txn-lost", token=TOKEN,
+                                                  wait_s=10)
+        self.assertEqual(len(lost), 1, "the first acquire did reach the relay")
+        self.assertEqual(lost[0][0], 200)
+        self.assertIs(lost[0][1]["reacquired"], False, "the lost answer created the hold")
+        self.assertIs(lost[0][1]["recovered"], False, "nothing was recovered there")
+        self.assertEqual(acquired["capability"], lost[0][1]["capability"],
+                         "the retry receives the capability the lost answer carried")
+        self.assertIs(acquired["reacquired"], True,
+                      "the retry is a replay at the HTTP level")
+        self.assertIs(acquired["recovered"], True,
+                      "the retry recovered this very call's own lost answer")
+        self.assertIs(acquired["createdHere"], True,
+                      "this acquire call created the hold, whatever the last answer says")
+        self.assertEqual(acquired["transactionId"], "txn-lost")
+        # That very hold closed admission, and only its release reopens it.
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 503)
+        update_drain.release_drain(relay.base, "txn-lost", token=TOKEN,
+                                   revision=acquired["revision"],
+                                   capability=acquired["capability"])
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202,
+                         "the recovered capability reopened admission, no restart")
+
+    def test_an_unreachable_relay_still_names_how_to_recover_a_possible_hold(self):
+        """Every retry may time out after the acquire landed. The refusal then
+        says how to receive that hold's capability rather than only reporting
+        the transport failure."""
+        relay = self.start([self.sleeper()])
+        real_request = update_drain._request
+        applied = []
+
+        def losing(method, base_url, path, **kwargs):
+            if method == "POST":
+                if not applied:
+                    real_request(method, base_url, path, **kwargs)  # lands, answer lost
+                    applied.append(True)
+                raise update_drain.DrainError("drain_unreachable", "no answer")
+            return real_request(method, base_url, path, **kwargs)
+
+        with patch.object(update_drain, "_request", losing):
+            with self.assertRaises(update_drain.DrainError) as unreachable:
+                update_drain.acquire_drain(relay.base, "txn-dark", token=TOKEN, wait_s=0.3)
+        self.assertEqual(unreachable.exception.code, "drain_unreachable")
+        self.assertIn("--transaction-id txn-dark", str(unreachable.exception))
+        # The abandoned hold is still there, and repeating the acquire recovers it.
+        recovered = update_drain.acquire_drain(relay.base, "txn-dark", token=TOKEN)
+        self.assertIs(recovered["reacquired"], True)
+        self.assertIs(recovered["recovered"], False,
+                      "a later call never recovered its own attempt")
+        self.assertIs(recovered["createdHere"], False,
+                      "a later call treats the abandoned hold as not its own")
+        update_drain.release_drain(relay.base, "txn-dark", token=TOKEN,
+                                   revision=recovered["revision"],
+                                   capability=recovered["capability"])
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202)
+
+    def test_a_foreign_hold_still_refuses_and_names_the_holder_and_release(self):
+        relay = self.start([self.sleeper()])
+        held = update_drain.acquire_drain(relay.base, "txn-owner", token=TOKEN)
+        with self.assertRaises(update_drain.DrainError) as refused:
+            update_drain.acquire_drain(relay.base, "txn-waiter", token=TOKEN, wait_s=0.3)
+        error = refused.exception
+        self.assertEqual((error.code, error.status), ("drain_held", 409))
+        text = str(error)
+        self.assertIn("txn-owner", text, "the refusal names who holds it")
+        self.assertIn("--transaction-id txn-owner", text,
+                      "it says how that hold can be inspected again")
+        self.assertIn("only inspects", text,
+                      "it never presents the repeat as a release or a takeover")
+        self.assertIn("recover-abort txn-owner", text,
+                      "it names the command that releases a prepared transaction")
+        # The refusal took nothing over: the owner's hold is intact.
+        self.assertTrue(update_drain.drain_status(
+            relay.base, "txn-owner", token=TOKEN, revision=held["revision"],
+            capability=held["capability"])["held"])
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 503)
+        update_drain.release_drain(relay.base, "txn-owner", token=TOKEN,
+                                   revision=held["revision"],
+                                   capability=held["capability"])
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202)
+
+    def test_the_cli_prints_the_release_path_of_a_foreign_hold(self):
+        relay = self.start([self.sleeper()])
+        held = update_drain.acquire_drain(relay.base, "txn-owner", token=TOKEN)
+        real_acquire = update_drain.acquire_drain
+
+        def bounded_acquire(*args, **kwargs):
+            kwargs.setdefault("wait_s", 0.3)
+            return real_acquire(*args, **kwargs)
+
+        printed = io.StringIO()
+        try:
+            with patch.object(safe_update, "_stage_receipt", self._fake_stage_success), \
+                    patch.object(safe_update, "_consumed_consent", self._fake_consent), \
+                    patch.object(update_drain, "acquire_drain", bounded_acquire), \
+                    patch.dict(os.environ, {"AGENT_RELAY_TOKEN": TOKEN}), \
+                    contextlib.redirect_stderr(printed):
+                self.assertEqual(safe_update.main([
+                    "drain", "0.4.0", "--install-dir", os.getcwd(),
+                    "--base-url", relay.base, "--transaction-id", "txn-waiter"]), 1)
+        finally:
+            update_drain.release_drain(relay.base, "txn-owner", token=TOKEN,
+                                       revision=held["revision"],
+                                       capability=held["capability"])
+        message = printed.getvalue()
+        self.assertIn("txn-owner", message)
+        self.assertIn("recover-abort txn-owner", message,
+                      "the CLI prints the command that releases the hold")
+
+    def test_a_replayed_rehearsal_leaves_the_holders_hold_and_admission_closed(self):
+        """Repeating `drain --transaction-id <holder>` is exactly what the refusal
+        names. The relay answers that replay, so the rehearsal must report it and
+        leave the hold alone instead of releasing a live activation's drain."""
+        relay = self.start([self.sleeper()])
+        held = update_drain.acquire_drain(relay.base, "txn-owner", token=TOKEN)
+        printed = io.StringIO()
+        with patch.object(safe_update, "_stage_receipt", self._fake_stage_success), \
+                patch.object(safe_update, "_consumed_consent", self._fake_consent), \
+                patch.dict(os.environ, {"AGENT_RELAY_TOKEN": TOKEN}), \
+                contextlib.redirect_stdout(printed):
+            self.assertEqual(safe_update.main([
+                "drain", "0.4.0", "--install-dir", os.getcwd(),
+                "--base-url", relay.base, "--transaction-id", "txn-owner"]), 1,
+                "a replayed rehearsal did not rehearse anything")
+        message = printed.getvalue()
+        self.assertIn("did not create", message)
+        self.assertIn("recover-abort txn-owner", message)
+        self.assertNotIn("Drain released", message,
+                         "a replay is never released by the command that repeated it")
+        # Nothing reopened admission: the live hold is still exactly the one there.
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 503)
+        self.assertTrue(update_drain.drain_status(
+            relay.base, "txn-owner", token=TOKEN, revision=held["revision"],
+            capability=held["capability"])["held"],
+            "the owner's capability still owns the same hold")
+        update_drain.release_drain(relay.base, "txn-owner", token=TOKEN,
+                                   revision=held["revision"],
+                                   capability=held["capability"])
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202,
+                         "only the owner's release reopens admission")
+
+    def test_a_rehearsal_that_lost_its_own_acquire_answer_still_releases(self):
+        """The reviewer's sequence: the first POST lands, its answer is lost, the
+        retry is answered `reacquired: true`, and the command must still release
+        the hold its own acquire call created instead of stranding admission."""
+        relay = self.start([self.sleeper()])
+        real_request = update_drain._request
+        lost = []
+
+        def losing(method, base_url, path, **kwargs):
+            status, body = real_request(method, base_url, path, **kwargs)
+            if method == "POST" and not lost:
+                lost.append(body)
+                raise update_drain.DrainError("drain_unreachable",
+                                              "the acquire answer never arrived")
+            return status, body
+
+        printed = io.StringIO()
+        with patch.object(safe_update, "_stage_receipt", self._fake_stage_success), \
+                patch.object(safe_update, "_consumed_consent", self._fake_consent), \
+                patch.object(update_drain, "_request", losing), \
+                patch.dict(os.environ, {"AGENT_RELAY_TOKEN": TOKEN}), \
+                contextlib.redirect_stdout(printed):
+            self.assertEqual(safe_update.main([
+                "drain", "0.4.0", "--install-dir", os.getcwd(),
+                "--base-url", relay.base, "--transaction-id", "txn-own"]), 0,
+                "the rehearsal ran on the hold its own acquire call created")
+        self.assertEqual(len(lost), 1, "the first acquire did reach the relay")
+        self.assertIs(lost[0]["reacquired"], False)
+        message = printed.getvalue()
+        self.assertIn("Drain txn-own held", message)
+        self.assertIn("Drain released", message,
+                      "the command released the hold it created, even though the "
+                      "last answer replayed it")
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202,
+                         "admission reopened without a relay restart")
+
+    def test_a_port_answering_a_non_object_revision_is_a_named_refusal(self):
+        current = {}
+        server, port = start_http_server(
+            lambda request: send_json(request, 200, current["body"]))
+        base = "http://127.0.0.1:%d" % port
+        try:
+            for body in ({"revision": "abc"}, {"revision": {"commit": 5}},
+                         {"revision": ["abc"]}, {"revision": None}):
+                with self.subTest(revision=body["revision"]):
+                    current["body"] = body
+                    with self.assertRaises(update_drain.DrainError) as refused:
+                        update_drain._server_revision(base)
+                    self.assertEqual(refused.exception.code, "drain_revision_unknown",
+                                     "a foreign answer is a named refusal, never "
+                                     "an AttributeError")
+        finally:
+            stop_http_server(server)
 
     def test_exact_starting_revision_and_malformed_requests_always_refuse(self):
         relay = self.start([self.sleeper()])

@@ -149,7 +149,9 @@ def _server_revision(base_url):
     status, body = _request("GET", base_url, HEALTH_PATH, token=None)
     if status != 200 or not isinstance(body, dict):
         raise DrainError("drain_revision_unknown", "the relay's healthz gave no revision")
-    revision = (body.get("revision") or {}).get("commit")
+    revision = body.get("revision")
+    if isinstance(revision, dict):
+        revision = revision.get("commit")
     if not isinstance(revision, str) or not COMMIT_RE.fullmatch(revision):
         raise DrainError("drain_revision_unknown",
                          "the relay runs an unknown revision; it cannot name an exact "
@@ -173,27 +175,75 @@ def acquire_drain(base_url, transaction_id, *, token, revision=None,
     relay or a revision the relay does not run are refused at once, never
     retried and never mistaken for a free drain. Returns the server's answer,
     which carries this transaction's opaque ``capability``.
+
+    The retry is safe for this transaction: if the acquire was applied and its
+    answer was lost, naming the same ``transactionId`` again returns the same
+    hold and the capability the relay already minted, so a lost response never
+    leaves a hold nobody can release. This call names itself once, in
+    ``requestId``, and repeats that name on every attempt; the relay keeps it
+    with the hold and answers ``recovered: true`` when a reissue recovers the
+    very request that created it. The answer therefore carries three facts:
+    the relay's ``reacquired`` (this answer replayed a hold instead of making
+    one), its ``recovered`` (the replay recovers this call's own earlier
+    attempt, whose answer was lost), and this client's ``createdHere`` (this
+    call created the hold, or may have) — the only flag on which a caller
+    releases. A call whose every attempt was answered ``reacquired`` without
+    ``recovered`` is a pure replay of someone else's hold.
     """
     _check_loopback(base_url)
     _validate_transaction(transaction_id)
     revision = _server_revision(base_url) if revision is None else revision
     deadline = time.monotonic() + wait_s
+    # One name for this call, not one per request: a request that landed
+    # without an answer keeps its name, so the retry can be recognised as the
+    # creator's recovery instead of a second caller's inspection.
+    request_id = secrets.token_hex(16)
     while True:
         try:
             status, body = _request("POST", base_url, DRAIN_PATH, token=token,
                                     body={"transactionId": transaction_id,
-                                          "revision": revision})
+                                          "revision": revision,
+                                          "requestId": request_id})
         except DrainError as exc:
             if exc.code == "drain_unreachable" and time.monotonic() < deadline:
                 time.sleep(POLL_S)
                 continue
+            if exc.code == "drain_unreachable":
+                # The acquire may have been applied before the transport died;
+                # repeating the same transactionId recovers its capability.
+                raise DrainError("drain_unreachable",
+                                 "%s; if the acquire reached the relay its hold stands — "
+                                 "repeat the acquire with --transaction-id %s to receive "
+                                 "that capability again (a replay is marked reacquired and "
+                                 "is never released here), or run `python3 src/safe_update.py "
+                                 "recover-abort %s` if it prepared an activation"
+                                 % (exc, transaction_id, transaction_id))
             raise
         if status == 200:
+            if isinstance(body, dict):
+                # ``reacquired`` and ``recovered`` are the relay's facts about
+                # this answer; ``createdHere`` is this call's fact about the hold.
+                body["reacquired"] = body.get("reacquired") is True
+                body["recovered"] = body.get("recovered") is True
+                body["createdHere"] = body["reacquired"] is not True or body["recovered"]
             return body
         code = (body or {}).get("error")
         if status == 409 and code == "drain_held" and time.monotonic() < deadline:
             time.sleep(POLL_S)
             continue
+        if status == 409 and code == "drain_held":
+            # Not this transaction's hold: name it, the fact that repeating only
+            # inspects it, and the command that really ends it.
+            holder = (body or {}).get("heldBy") or "another transaction"
+            raise DrainError(
+                "drain_held",
+                "the drain is held by transaction %s. Repeating the acquire with "
+                "--transaction-id %s only inspects that hold (it is answered as "
+                "reacquired and is never released here); release it with its owner's "
+                "recovery: `python3 src/safe_update.py recover-abort %s` for a "
+                "prepared record, otherwise from the process that holds it. "
+                "Admission stays closed until then" % (holder, holder, holder),
+                status=status)
         raise DrainError(code or ("drain_refused_%d" % status),
                          "acquire was refused: %s" % (body or {}).get("message", status),
                          status=status)
@@ -257,7 +307,10 @@ def release_drain(base_url, transaction_id, *, token, revision, capability,
     """Release the held drain with the exact capability that acquired it.
 
     A replayed or foreign capability is refused; the relay then still holds
-    the drain and reopening is the explicit release's business alone.
+    the drain and reopening is the explicit release's business alone. Callers
+    release only a hold their own acquire call created (``createdHere``): a
+    hold reissued to a later call belongs to the transaction that already
+    owned it, and only that transaction's own recovery may end it.
     """
     _check_loopback(base_url)
     _validate_transaction(transaction_id)

@@ -38,6 +38,9 @@ from workflows import STEP_ID_RE, WORKFLOW_STATUSES, WorkflowEngine
 # resolved a different build never holds the shared lock of this one.
 DRAIN_COMMIT_RE = re.compile(r"[0-9a-f]{40}$")
 DRAIN_TRANSACTION_RE = re.compile(r"[A-Za-z0-9_.~-]{1,128}$")
+# The client's name for one acquire call, so a replayed acquire can be told
+# apart from the call that actually created the hold.
+DRAIN_REQUEST_RE = re.compile(r"[A-Za-z0-9_.~-]{1,128}$")
 # Capability: the relay mints 64 hex; requests that name one are compared,
 # never trusted, so a replayed or forged capability is refused.
 DRAIN_CAPABILITY_RE = re.compile(r"[0-9a-f]{64}$")
@@ -2007,30 +2010,63 @@ def _drain_acquire(body):
 
     The lock and the admitted-work counts move together here: an acquire that
     races a submission can never observe a queue that both exists and counts
-    as zero. Held drains conflict, even for the same transaction without its
-    capability: there is no reacquire, only an explicit release.
+    as zero. Only the transaction that holds the drain may name it again, and
+    that answers with the capability the relay already minted: a lost acquire
+    response would otherwise strand the hold with a token nobody received and
+    keep admission closed until a restart. Every other transaction is refused,
+    and reopening admission stays the explicit release with the held capability.
+
+    The optional ``requestId`` is one acquire call's own name, repeated on
+    every attempt that call makes. The relay keeps it with the hold, so the
+    reissue can say whether it recovers the very request that created the hold
+    (``recovered``) or merely shows an existing hold to a later caller — the
+    difference between a consumer releasing its own hold and a foreign one.
     """
     params, problem = _drain_request_params(body, capability_required=False)
     if problem:
         return 400, problem
     transaction, revision, _capability = params
+    request_id = body.get("requestId") if isinstance(body, dict) else None
+    if request_id is not None and (not isinstance(request_id, str)
+                                   or not DRAIN_REQUEST_RE.fullmatch(request_id)):
+        return 400, {"error": "invalid_request_id",
+                     "message": "requestId must match [A-Za-z0-9_.~-] and be at most "
+                                "128 characters"}
     global DRAIN
     with LOCK:
         counts = _drain_counts()
         if DRAIN is not None:
-            return 409, {"error": "drain_held",
-                         "message": "A drain is already held by transaction %s"
-                                    % DRAIN["transactionId"],
-                         "heldBy": DRAIN["transactionId"]}
+            if DRAIN["transactionId"] != transaction:
+                return 409, {"error": "drain_held",
+                             "message": "A drain is already held by transaction %s"
+                                        % DRAIN["transactionId"],
+                             "heldBy": DRAIN["transactionId"]}
+            if revision != DRAIN["revision"]:
+                return 409, {"error": "revision_mismatch",
+                             "message": "the drain was acquired for revision %s"
+                                        % DRAIN["revision"]}
+            # The holder asking again: the same hold, the same capability, so a
+            # response that never arrived is recovered by repeating the request.
+            created_with = DRAIN.get("requestId")
+            view = _drain_state(counts)
+            view["held"] = True
+            view["capability"] = DRAIN["capability"]
+            view["reacquired"] = True
+            view["recovered"] = bool(request_id and created_with
+                                     and hmac.compare_digest(request_id, created_with))
+            return 200, view
         if revision != REVISION["commit"]:
             return 409, {"error": "revision_mismatch",
                          "message": "the relay runs revision %s, not %s"
                                     % (REVISION["commit"], revision)}
         DRAIN = {"transactionId": transaction, "revision": revision,
-                 "capability": secrets.token_hex(32), "startedAt": now_iso()}
+                 "capability": secrets.token_hex(32), "startedAt": now_iso(),
+                 "requestId": request_id}
         view = _drain_state(counts)
         view["held"] = True
         view["capability"] = DRAIN["capability"]
+        view["reacquired"] = False
+        view["recovered"] = False
         return 200, view
 
 

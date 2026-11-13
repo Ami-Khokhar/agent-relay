@@ -98,7 +98,8 @@ class _FakeRelay:
         self.calls.append(("acquire", transaction_id, token))
         return {"transactionId": transaction_id, "revision": self.revision,
                 "capability": self.capability, "quiesced": False,
-                "active": 1, "queued": 0, "workflows": 0}
+                "active": 1, "queued": 0, "workflows": 0,
+                "reacquired": False, "recovered": False, "createdHere": True}
 
     def status(self, _base, transaction_id, *, token=None, revision=None,
                capability=None, timeout=None):
@@ -623,6 +624,35 @@ class PrepareAbortCliTest(_Case):
                       "the unreadable journal is reported as possibly holding state, not as "
                       "a second failure that replaces the first")
         self.assertEqual(relay.releases, [TXN], "the stranded hold is released again")
+    def test_a_reissued_hold_is_never_adopted_or_released(self):
+        """The acquire replayed a transaction that already holds the drain. This
+        command did not create that hold, so it must not record it for adoption,
+        and must not release it: the live transaction still owns it."""
+        relay = _FakeRelay()
+
+        def reacquired(_base, transaction_id, *, token=None, wait_s=None):
+            relay.calls.append(("acquire", transaction_id, token))
+            return {"transactionId": transaction_id, "revision": relay.revision,
+                    "capability": relay.capability, "quiesced": False,
+                    "active": 0, "queued": 0, "workflows": 0,
+                    "reacquired": True, "recovered": False, "createdHere": False}
+
+        with _join(self._patches(relay) + [
+                patch.object(update_drain, "acquire_drain", reacquired),
+                patch.object(safe_update, "_state_dir", lambda: self.state)]):
+            with self.assertRaises(identity.UpdateError) as caught:
+                safe_update.cmd_prepare_activation(TAG, str(self.repo),
+                                                   base_url="http://127.0.0.1:9",
+                                                   transaction_id=TXN)
+        self.assertIn("not created here", str(caught.exception))
+        self.assertIn("recover-abort %s" % TXN, str(caught.exception),
+                      "the refusal names the command that really releases it")
+        self.assertEqual([call[0] for call in relay.calls], ["acquire"],
+                         "a hold this command did not create is never released")
+        self.assertEqual(relay.releases, [])
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state),
+                          "no record adopts the existing transaction's hold")
+        self.assertIsNone(self.blocker())
 
     def test_a_failed_prepare_release_reports_an_unreleasable_hold(self):
         relay = self._relay()
