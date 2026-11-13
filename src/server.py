@@ -2317,11 +2317,13 @@ class Handler(BaseHTTPRequestHandler):
             _drain()
 
     def _read_json_body(self, document=True):
-        """Read the request body as a JSON object.
+        """Read and parse the request body, consuming it so the connection stays in sync.
 
         Returns ``(error_status, error_body)`` on failure and ``(None, body)`` on success, so
-        every caller sends exactly one response. Pass ``document=False`` for a route that
-        takes no document: the body is still read, so a keep-alive connection stays in sync.
+        every caller that asks for a document sends exactly one response. Pass
+        ``document=False`` for a route that takes no document (``_kill_workflows`` and
+        ``_resume_workflow``): the body is read and dropped, so only its framing matters and
+        any valid JSON is accepted, with ``None`` returned in place of the payload.
         """
         if document:
             content_type = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
@@ -2339,6 +2341,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
             return 400, {"error": "invalid_json"}
+        if not document:
+            return None, None
         if not isinstance(body, dict):
             return 400, {"error": "invalid_request"}
         return None, body
