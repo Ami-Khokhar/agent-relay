@@ -105,6 +105,10 @@ to discovered tags, cached offers and the stable tags resolved by release_identi
 any HTTP request. For cached offers, the version bound together with bounded notes keeps
 legitimate offers within the 32 KiB read cap.
 
+## Truncated release notes say so instead of ending mid-sentence
+
+A release body longer than the 2000-character notes bound is stored as an excerpt, but nothing distinguished that excerpt from a complete body: the CLI printed it as "Release notes" and `check_updates` returned it as `releaseNotes`. `discover()` now records `notesTruncated` in the offer (true when the cleaned body exceeded the bound), the private cache validates and keeps that flag (an absent flag reads as false, so offers written before it remain valid), the CLI prints the bound and the canonical release URL when it is set, and `check_updates` returns `releaseNotesTruncated` beside the notes. Consequence: every reader can tell an excerpt from the whole body and send the person to the release URL for the rest; the notes stay bounded untrusted data.
+
 ## A foreach step matches fail patterns per item
 
 `failIfOutputMatches` used to be tested against the step's aggregated output, which for a `foreach` step is a JSON array of the item outputs. An anchored pattern then either could not see what an agent reported (`^BLOCKED` never matches a report quoted inside the array) or fired on the serialization itself (`^\[` failed every healthy fan-out). The pattern is now tested against each completed task's own raw output, before the step may complete: one matching item fails the whole step with `output_matched_fail_pattern` and its dependents are skipped, and the step still keeps the JSON array as its output for a caller to inspect. Consequence: matching is per item, so an aggregate-shaped pattern (`^\[`) no longer has a meaning on a `foreach` step, while the other terminal causes keep their precedence — a task that failed, timed out or was cancelled still decides the step before the pattern is read, and `retries`, `repeat` and journals written before the field existed behave exactly as before.

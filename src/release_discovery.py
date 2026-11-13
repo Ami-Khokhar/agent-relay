@@ -102,10 +102,14 @@ def fetch_releases():
         raise DiscoveryError("release service unavailable (HTTP %d); try again later" % exc.code) from exc
     except TimeoutError as exc:
         raise DiscoveryError("release service timed out; check connectivity and try again") from exc
-    except http.client.HTTPException as exc:
-        raise DiscoveryError("release service returned an incomplete response; try again later") from exc
+    # RemoteDisconnected subclasses both ConnectionResetError (OSError) and
+    # HTTPException, so the connectivity clause must come first: a dropped
+    # connection is an availability failure, not an incomplete response.
+    # IncompleteRead is not an OSError, so the HTTPException clause stays reachable.
     except (URLError, OSError) as exc:
         raise DiscoveryError("release service unavailable; check connectivity and try again") from exc
+    except http.client.HTTPException as exc:
+        raise DiscoveryError("release service returned an incomplete response; try again later") from exc
     if len(data) > MAX_RESPONSE:
         raise DiscoveryError("release metadata exceeded the response size limit")
     try:
@@ -146,7 +150,8 @@ def discover(installed, include_prereleases=False, releases=None):
             notes = "".join(char for char in raw_notes
                             if char in "\n\t" or unicodedata.category(char) not in ("Cc", "Cf"))
             candidates.append((version, {"version": tag, "url": expected_url,
-                                        "notes": notes[:MAX_NOTES]}))
+                                        "notes": notes[:MAX_NOTES],
+                                        "notesTruncated": len(notes) > MAX_NOTES}))
     if not candidates:
         return None
     return max(candidates, key=cmp_to_key(lambda a, b: _compare_parsed(a[0], b[0])))[1]
@@ -314,11 +319,13 @@ def _valid_offer(offer, installed):
         return None
     version, url, notes, checked = (offer.get(key) for key in
                                     ("version", "url", "notes", "checkedAt"))
+    truncated = offer.get("notesTruncated", False)
     try:
         parsed = _version(version)
     except (ValueError, TypeError):
         return None
     if (url != RELEASE_URL + version or not isinstance(notes, str) or len(notes) > MAX_NOTES
+            or not isinstance(truncated, bool)
             or len(version) > MAX_VERSION
             or not isinstance(checked, (int, float)) or isinstance(checked, bool)
             or not math.isfinite(checked)
@@ -329,7 +336,8 @@ def _valid_offer(offer, installed):
                       if char in "\n\t" or unicodedata.category(char) not in ("Cc", "Cf"))
     if cleaned != notes:
         return None
-    return {"version": version, "url": url, "notes": notes, "checkedAt": checked}
+    return {"version": version, "url": url, "notes": notes,
+            "notesTruncated": truncated, "checkedAt": checked}
 
 
 def cached_notice(installed=None):
@@ -410,6 +418,9 @@ def main(argv=None):
     print("Release: %s" % offer["url"])
     if offer["notes"]:
         print("Release notes:\n%s" % offer["notes"])
+    if offer["notesTruncated"]:
+        print("Release notes truncated at %d characters; see the full release at %s."
+              % (MAX_NOTES, offer["url"]))
     return 0
 
 
