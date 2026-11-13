@@ -71,18 +71,18 @@ def _trusted_git_paths(platform=None):
     """The absolute paths of the real git installations the relay may run, for this platform.
 
     It never searches PATH. On POSIX these are the system directories, which a task running as the
-    relay's user cannot replace. On Windows they are the ``cmd`` directory of the Git for Windows
-    installer, per machine and per user; the per-user one is skipped when LOCALAPPDATA is unset.
+    relay's user cannot replace. On Windows it is the machine-wide Git for Windows installation,
+    whose directory the relay's own tasks cannot write; a per-user install lives under the user's
+    profile, where a task could plant a git, so it is refused like any other location and needs
+    AGENT_RELAY_GIT. An unset ProgramFiles leaves the list empty, which reports an unknown revision.
     Windows paths are built with ntpath so the list names them the same on any host.
     """
     if (os.name if platform is None else platform) != "nt":
         return ("/usr/bin/git", "/bin/git")
-    programs = os.environ.get("ProgramFiles") or r"C:\Program Files"
-    paths = [ntpath.join(programs, "Git", "cmd", "git.exe")]
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        paths.append(ntpath.join(local, "Programs", "Git", "cmd", "git.exe"))
-    return tuple(paths)
+    programs = os.environ.get("ProgramFiles")
+    if not programs:
+        return ()
+    return (ntpath.join(programs, "Git", "cmd", "git.exe"),)
 
 
 # Where the relay looks for git when the owner names none (AGENT_RELAY_GIT). It never searches PATH.

@@ -371,8 +371,9 @@ metadata is (missing, slower than five seconds or the task's remaining time, non
 unusable output), the task ends `failed` with an error that starts `read_only_git_unknown:` and
 does not run. A `cwd` with no such sign above it runs without git. The lookup runs outside the
 sandbox, so the relay runs its trusted git by absolute path, never through `PATH`: `/usr/bin/git`
-or `/bin/git` on macOS and Linux, Git for Windows' `cmd\git.exe` on Windows (or the owner's
-`AGENT_RELAY_GIT`, an absolute path set in the relay's environment), in a minimal environment
+or `/bin/git` on macOS and Linux, machine-wide `%ProgramFiles%\Git\cmd\git.exe` on Windows (a
+per-user or `PATH`-found git is refused, since a task could plant it), or the owner's
+`AGENT_RELAY_GIT`, an absolute path set in the relay's environment, in a minimal environment
 (`PATH=/usr/bin:/bin`, `HOME`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`). It does not
 read the global git config, which a read-only task could have written, so `safe.directory` there
 does not help: fix the directory's ownership, or submit without `readOnly`.

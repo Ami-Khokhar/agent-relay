@@ -192,8 +192,9 @@ nest sandboxes, so an adapter that applies its own sandbox fails under `"sandbox
 when a `.git` entry (or a directory with `HEAD`, `objects` and `refs`, as a bare repository has)
 exists at or above the `cwd` and git cannot answer, the task fails with `read_only_git_unknown`
 and the adapter does not start. The lookup runs outside the sandbox, so it runs its trusted git
-(`/usr/bin/git` or `/bin/git` on macOS and Linux, Git for Windows' `cmd\git.exe` on Windows, or the
-owner's `AGENT_RELAY_GIT`) by absolute path, never through `PATH`, with only `PATH=/usr/bin:/bin`,
+(`/usr/bin/git` or `/bin/git` on macOS and Linux, machine-wide `%ProgramFiles%\Git\cmd\git.exe` on
+Windows — a per-user or `PATH`-found git is refused, since a task could plant it — or the owner's
+`AGENT_RELAY_GIT`) by absolute path, never through `PATH`, with only `PATH=/usr/bin:/bin`,
 `HOME`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`: the global git config is not read,
 so a repository that needs `safe.directory` there is refused. The relay checks a queued task against the
 registry entry again when it dispatches it, so a reload that removed the profile fails the task
