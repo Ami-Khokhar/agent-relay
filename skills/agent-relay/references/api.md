@@ -67,7 +67,9 @@ next run is restarted, since an old relay cannot report counts).
 for command/stdio adapters and `request_only` for HTTP. `role` and `roleDescription` appear only
 when the agent names a role in the registry; the instructions themselves are never listed. `model`
 and `tags` appear only when the registry declares them: `model` is the model that worker runs and
-`tags` are its labels, so a caller selects by data rather than by matching `name` prose.
+`tags` are its labels, so a caller selects by data rather than by matching `name` prose. Both must be
+non-blank strings, and both are stored trimmed, so the listing shows the value that was validated (which
+is why `?tag=%20reviewer` matches nothing).
 `GET /v1/agents?tag=<name>` keeps only the agents carrying that tag — an agent must carry every
 tag the query names, and an unknown tag returns an empty list rather than an error. `cwd`, `allowedRoots`, and
 `delegateTo` (the agents its tasks may delegate to) appear only when configured. `options`
@@ -166,7 +168,7 @@ Step fields:
 | --- | --- | --- |
 | `id` | yes | Unique in the document; `[A-Za-z0-9_.~-]`, ≤128 chars. |
 | `agentId` | yes | Must match a registry id. |
-| `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. |
+| `input` | yes | Non-empty prompt. May contain `{{stepId.output}}`, and `{{item}}` / `{{index}}` on a `foreach` step. A JSON escape such as `"\ud800"` decodes to a lone surrogate, which is not UTF-8 text and returns `400 invalid_input` naming the step's index and field. |
 | `needs` | no | Step ids that must complete first. Acyclic; forward references allowed. |
 | `needsPolicy` | no | `"all"` (default) or `"any"`. `any` requires at least one `needs` entry, otherwise `400 invalid_needs_policy`. With `all`, every need must complete. With `any`, every need must be terminal and at least one completed; without a completed need the step is skipped with `dependency_not_completed`. In an `any` prompt, `{{id.output}}` of a failed (including timed-out), skipped or cancelled ancestor becomes a marker like `[id did not complete: status=failed error=…]`. Unfinished ancestors stay empty under either policy; `all` also keeps non-completed terminal ancestors empty. A tolerated failed/skipped branch still makes the run `failed`; run cancellation remains `cancelled`. |
 | `foreach` | no | 1 to `A2A_RELAY_MAX_FOREACH` (default 32) strings, each ≤1024 chars. |
@@ -174,7 +176,7 @@ Step fields:
 | `repeat` | no | `{ "max": 1..10, "untilOutputMatches": "<regex>" }`. Not allowed with `foreach`. |
 | `failIfOutputMatches` | no | Python regular expression. A match on the output of a completed task fails the step with `output_matched_fail_pattern` and skips its dependents. The pattern is tested against each task's own output, so on a `foreach` step every item is matched separately and never the JSON array the step aggregates: one item reading `^BLOCKED` fails the whole step, while `^\[` does not fire on the serialization alone. |
 | `timeoutMs` | no | Positive integer, same cap as a task. |
-| `cwd` | no | Same `allowedRoots` check as a task. |
+| `cwd` | no | Same `allowedRoots` check as a task. A path carrying a NUL or a lone surrogate returns `400 invalid_cwd` naming the step's index and field. |
 | `options` | no | `{"<name>": "<value>"}`, exactly as for a task submission. The agent decides which names and values it allows. |
 | `readOnly` | no | Boolean, exactly as for a task submission. |
 
@@ -191,7 +193,7 @@ Validation failures use `400` with: `invalid_steps`, `invalid_step_id`, `duplica
 `unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_needs_policy`, `invalid_foreach`, `invalid_retries`,
 `invalid_repeat`, `invalid_fail_if`, `invalid_template`, `unknown_reference`, `invalid_options`,
 `invalid_read_only`, `command_input_too_large`, and the shared `unknown_field`,
-`unknown_agent`, `input_required`, `invalid_name`, `invalid_session_id`,
+`unknown_agent`, `input_required`, `invalid_input`, `invalid_name`, `invalid_session_id`,
 `invalid_request_id`, `invalid_timeout`, `invalid_cwd`, `cwd_not_allowed`.
 
 A step whose `options` or `readOnly` the agent cannot honour fails when the relay launches
@@ -463,7 +465,7 @@ Set `A2A_RELAY_AUTOSTART=0` to disable.
 | `steps[].startedAt` / `steps[].finishedAt` | always | ISO-8601. `startedAt` is stamped when the relay begins the attempt — rendering and submitting its tasks — and `finishedAt` when the step reaches a terminal status, and only if it started. A step that never started (`pending`, `skipped` with `dependency_not_completed`, or `cancelled` with the run before its attempt began) keeps both null. A step whose attempt failed before submitting any task (an unresolved template reference, or a submission the relay refuses, such as `read_only_unsupported: ...`) is `failed` with both stamped and `attempts` `0`. Restored from the journal on resume. |
 | `steps[].attemptTimes` | single run only | One `{startedAt, finishedAt}` window per submitted attempt, oldest first; `finishedAt` is null for an attempt still open. Empty when no attempt submitted a task: a `pending`, `skipped` or pre-launch `cancelled` step, and a failure before the first submission. Absent from `GET /v1/workflows` list entries; present in the full, `view=summary` and `?step=` run views. Restored from the journal on resume. |
 | `steps[].taskIds` | single run only | Every task the step started, oldest first; empty for a resumed step that already finished. |
-| `steps[].output` | completed or failed | For a `foreach` step, a JSON array of the item outputs. |
+| `steps[].output` | completed or failed | For a `foreach` step whose tasks ran, a JSON array of the item outputs whatever their outcome (a failed item contributes its own output, empty when it produced none), in that attempt's item order. No output is set when the step fails before its tasks run: an unresolved template reference, a rejected submission, or `task_evicted_from_the_relay_store`. Because `taskIds` accumulates across retries, a `taskIds` position maps to a `foreach` item only within one attempt; the failing item's error stays in `errorDetail`. |
 | `steps[].error` | not completed | `dependency_not_completed`, `repeat_limit_reached`, `output_matched_fail_pattern`, `task_evicted_from_the_relay_store`, a rejected submission message, or — when the child task failed — the short cause: the last non-empty lines of the task error and output (coding CLIs print the banner first and the reason last), capped in length, with `agent_quota: ` for diagnostic usage/rate-limit reports, quota exceeded/reached, "too many requests" or HTTP 429. Classification reads only the full task error before tail truncation and requires HTTP, status, error or code context for 429; ordinary quota prose and stdout-only limit text do not set the quota label. |
 | `steps[].errorDetail` | failed step, single run view only | The failing task's full error text (stderr for a command agent), absent when no task ran; the list view never carries it. |
 
