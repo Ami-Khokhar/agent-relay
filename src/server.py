@@ -1406,13 +1406,20 @@ def _pressure_guard():
 
 
 def _make_room():
+    """Evict the task that finished longest ago, so a long run's result survives its own arrival.
+
+    Every terminal task records ``_finished`` when it leaves queued/running, and that monotonic
+    stamp — not insertion order, which is creation order — decides the victim. A terminal record
+    without the stamp is not produced by any path here; such a record is not evictable rather
+    than ranked by a guessed time.
+    """
     if len(TASKS) < MAX_TASKS:
         return True
-    terminal = next((task for task in TASKS.values()
-                     if task["status"] not in ("queued", "running")), None)
-    if terminal is None:
+    finished = [task for task in TASKS.values()
+                if task["status"] not in ("queued", "running") and "_finished" in task]
+    if not finished:
         return False
-    _forget(terminal)
+    _forget(min(finished, key=lambda task: task["_finished"]))
     return True
 
 
