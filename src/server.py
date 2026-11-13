@@ -1437,6 +1437,20 @@ def _valid(value, limit=128):
     return isinstance(value, str) and 0 < len(value) <= limit
 
 
+def _encodable(text):
+    """True when ``text`` survives a UTF-8 encode.
+
+    ``json.loads`` accepts an escape such as ``"\\ud800"`` and hands back a lone surrogate, and a
+    path built the same way reaches ``os.path``. Encoding those raises ``UnicodeEncodeError``,
+    which would surface as a 500, so callers refuse them as malformed input first.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _is_positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
@@ -1453,6 +1467,10 @@ def _resolve_task_cwd(agent, requested):
     if requested is None:
         return None, None
     if not isinstance(requested, str) or not requested:
+        return None, "invalid_cwd"
+    # os.path.realpath rejects a NUL and cannot encode a lone surrogate, so refuse both here: a
+    # ValueError out of realpath would reach the handler's blanket except and answer 500.
+    if "\0" in requested or not _encodable(requested):
         return None, "invalid_cwd"
     candidate = os.path.realpath(requested)
     roots = list(agent.get("allowedRoots") or [])
@@ -1928,6 +1946,11 @@ def _create_task(request, _internal=False):
     input_text = request.get("input")
     if not _valid(input_text, MAX_BODY):
         return 400, {"error": "input_required"}
+    if not _encodable(input_text):
+        # A JSON escape can decode to a lone surrogate, which the later size check would fail to
+        # encode; refuse the text itself, naming the field, instead of answering 500.
+        return 400, {"error": "invalid_input",
+                     "message": "input must be UTF-8 text; it contains an unpaired surrogate"}
     session_id = request.get("sessionId")
     if session_id is not None and not _valid(session_id):
         return 400, {"error": "invalid_session_id"}
