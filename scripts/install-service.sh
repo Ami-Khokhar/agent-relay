@@ -48,18 +48,53 @@ for arg in "$@"; do
 done
 
 if [ "$UNINSTALL" = "1" ]; then
-  rm -f "$HOME/.local/bin/agent-relay"
+  # Remove only the wrapper this installer writes. A file the user or another
+  # tool put here is not ours to delete.
+  BIN_DIR="$HOME/.local/bin"
+  COMMAND="$BIN_DIR/agent-relay"
+  if [ -L "$COMMAND" ]; then
+    echo "left $COMMAND: not the installer's wrapper"
+  elif [ -e "$COMMAND" ]; then
+    FIRST_LINE="$(sed -n '1p' "$COMMAND" 2>/dev/null || true)"
+    SECOND_LINE="$(sed -n '2p' "$COMMAND" 2>/dev/null || true)"
+    case "$SECOND_LINE" in
+      "# installed by agent-relay scripts/install-service.sh"|exec\ *src/cli.py*)
+        if [ "$FIRST_LINE" = "#!/bin/sh" ]; then
+          rm -f "$COMMAND"
+          echo "removed $COMMAND"
+        else
+          echo "left $COMMAND: not the installer's wrapper"
+        fi
+        ;;
+      *)
+        echo "left $COMMAND: not the installer's wrapper"
+        ;;
+    esac
+  fi
   if [ "$(uname -s)" = "Darwin" ]; then
     PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
     launchctl unload "$PLIST" 2>/dev/null || true
-    rm -f "$PLIST"
-    echo "removed $PLIST"
+    if [ -f "$PLIST" ]; then
+      rm -f "$PLIST"
+      echo "removed $PLIST"
+    else
+      echo "relay service not installed ($PLIST was already absent)"
+    fi
     UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
-    launchctl bootout "gui/$(id -u)/$UPDATE_LABEL" 2>/dev/null \
-      || launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
+    REMOVED_UPDATE_TIMER=0
+    if launchctl bootout "gui/$(id -u)/$UPDATE_LABEL" 2>/dev/null; then
+      REMOVED_UPDATE_TIMER=1
+    elif launchctl unload "$UPDATE_PLIST" 2>/dev/null; then
+      REMOVED_UPDATE_TIMER=1
+    fi
     if [ -f "$UPDATE_PLIST" ]; then
       rm -f "$UPDATE_PLIST"
-      echo "removed $UPDATE_PLIST"
+      REMOVED_UPDATE_TIMER=1
+    fi
+    if [ "$REMOVED_UPDATE_TIMER" = "1" ]; then
+      echo "removed the release-check timer ($UPDATE_LABEL)"
+    else
+      echo "no release-check timer installed ($UPDATE_PLIST was already absent)"
     fi
   else
     UNIT="$HOME/.config/systemd/user/agent-relay.service"
@@ -178,16 +213,30 @@ UNIT_EOF
   echo "log: journalctl --user -u agent-relay -f"
 fi
 
-# The agent-relay command sits in the per-user bin directory the login shell
-# PATH usually contains, so the docs' commands work without an absolute path.
+# The agent-relay command goes in the per-user bin directory. That directory is
+# not on the default macOS login PATH, so say how to add it instead of assuming
+# it is there.
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
 if [ -f "$TARGET_DIR/src/cli.py" ]; then
-  printf '#!/bin/sh\nexec %q %q "$@"\n' "$PYTHON" "$TARGET_DIR/src/cli.py" \
-    > "$BIN_DIR/agent-relay"
+  {
+    echo '#!/bin/sh'
+    echo '# installed by agent-relay scripts/install-service.sh'
+    # The canonical port name wins over any A2A_RELAY_PORT the caller exported,
+    # so `agent-relay info` names the port the service was installed with.
+    printf 'exec env AGENT_RELAY_PORT=%q %q %q "$@"\n' \
+      "$PORT" "$PYTHON" "$TARGET_DIR/src/cli.py"
+  } > "$BIN_DIR/agent-relay"
   chmod +x "$BIN_DIR/agent-relay"
   echo "command installed: $BIN_DIR/agent-relay (run 'agent-relay info' for the"
   echo "relay URL, artifact page, token path and checkout in use)"
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+      echo "warning: $BIN_DIR is not on your PATH; add it with:"
+      printf '  export PATH="%s:$PATH"\n' "$BIN_DIR"
+      ;;
+  esac
 else
   echo "warning: $TARGET_DIR/src/cli.py not found; no agent-relay command installed" >&2
 fi

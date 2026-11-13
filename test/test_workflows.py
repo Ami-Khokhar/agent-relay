@@ -378,6 +378,9 @@ class WorkflowTests(unittest.TestCase):
         listed = listing["workflows"][0]["steps"][0]
         self.assertNotIn("errorDetail", listed)
         self.assertNotIn("output", listed)
+        # attemptTimes is a run-view field: the list view leaves it out, the run view has it.
+        self.assertNotIn("attemptTimes", listed)
+        self.assertIn("attemptTimes", step)
 
     # -------------------------------------------------------- summary and step views
 
@@ -570,6 +573,31 @@ class WorkflowTests(unittest.TestCase):
         error = steps_of(workflow)["only"]["error"]
         self.assertTrue(error.startswith("read_only_unsupported: "), error)
         self.assertIn("no readOnly profile", error)
+
+    def test_a_rejected_attempt_is_timed_while_a_skipped_step_keeps_null_timestamps(self):
+        # The documented contract: startedAt marks the attempt the relay began, so a step
+        # that failed before submitting a task still carries a window while attempts and
+        # attemptTimes stay empty; a step that never started keeps both null.
+        relay = self.start(echo())
+        workflow = run(relay, {"steps": [
+            {"id": "only", "agentId": "echo", "input": "go", "readOnly": True},
+            {"id": "after", "agentId": "echo", "needs": ["only"], "input": "never"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        steps = steps_of(workflow)
+        rejected = steps["only"]
+        self.assertEqual(rejected["status"], "failed")
+        self.assertIsNotNone(rejected["startedAt"])
+        self.assertIsNotNone(rejected["finishedAt"])
+        self.assertLessEqual(rejected["startedAt"], rejected["finishedAt"])
+        self.assertEqual(rejected["attempts"], 0)
+        self.assertEqual(rejected["attemptTimes"], [])
+        skipped = steps["after"]
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertIsNone(skipped["startedAt"])
+        self.assertIsNone(skipped["finishedAt"])
+        self.assertEqual(skipped["attempts"], 0)
+        self.assertEqual(skipped["attemptTimes"], [])
 
     # --------------------------------------------------------------------- loops
 
