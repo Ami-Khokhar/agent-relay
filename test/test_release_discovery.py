@@ -114,6 +114,18 @@ class ReleaseDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(discovery.discover("1.0.0", releases=[release("1.1.0", notes="x" * 5000)])[
             "notes"]), discovery.MAX_NOTES)
 
+    def test_release_notes_record_whether_the_body_was_cut(self):
+        exact = discovery.discover("1.0.0", releases=[
+            release("1.1.0", notes="x" * discovery.MAX_NOTES)])
+        self.assertEqual(len(exact["notes"]), discovery.MAX_NOTES)
+        self.assertFalse(exact["notesTruncated"])
+        longer = discovery.discover("1.0.0", releases=[
+            release("1.1.0", notes="x" * (discovery.MAX_NOTES + 1))])
+        self.assertEqual(len(longer["notes"]), discovery.MAX_NOTES)
+        self.assertTrue(longer["notesTruncated"])
+        self.assertFalse(discovery.discover("1.0.0", releases=[
+            release("1.1.0", notes="short notes")])["notesTruncated"])
+
     def test_equal_and_older_are_no_update_and_prereleases_are_opt_in(self):
         releases = [release("1.0.0"), release("0.9.9"), release("1.1.0-rc.1", prerelease=True)]
         self.assertIsNone(discovery.discover("1.0.0", releases=releases))
@@ -162,6 +174,18 @@ class ReleaseDiscoveryTests(unittest.TestCase):
         opener = FakeOpener(FakeResponse(b"[]"))
         opener.response.read = lambda limit: (_ for _ in ()).throw(http.client.IncompleteRead(b"", 10))
         with patch.object(discovery, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(discovery.DiscoveryError, "incomplete response"):
+                discovery.fetch_releases()
+
+    def test_fetch_classifies_a_dropped_connection_as_unavailable(self):
+        # RemoteDisconnected is both an OSError and an HTTPException; the reset is
+        # an availability failure, while a non-OSError HTTPException stays incomplete.
+        reset = FakeOpener(error=http.client.RemoteDisconnected("remote closed without a response"))
+        with patch.object(discovery, "build_opener", return_value=reset):
+            with self.assertRaisesRegex(discovery.DiscoveryError, "unavailable; check connectivity"):
+                discovery.fetch_releases()
+        malformed = FakeOpener(error=http.client.BadStatusLine("garbage"))
+        with patch.object(discovery, "build_opener", return_value=malformed):
             with self.assertRaisesRegex(discovery.DiscoveryError, "incomplete response"):
                 discovery.fetch_releases()
 
@@ -224,6 +248,23 @@ class ReleaseDiscoveryTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(cache.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_cli_reports_truncated_notes_instead_of_cutting_them_silently(self):
+        installed = discovery.installed_version()
+        offer_version = newer_version(installed)
+        for notes, truncated in (("short notes", False),
+                                 ("x" * (discovery.MAX_NOTES + 1), True)):
+            with self.subTest(truncated=truncated), tempfile.TemporaryDirectory() as temp:
+                output = io.StringIO()
+                opener = fake_api([release(offer_version, notes=notes)])
+                with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}), \
+                        patch.object(discovery, "build_opener", return_value=opener), \
+                        patch("sys.stdout", output):
+                    self.assertEqual(discovery.main(["--notify"]), 0)
+                marker = "Release notes truncated at %d characters" % discovery.MAX_NOTES
+                self.assertEqual(marker in output.getvalue(), truncated)
+                cache = Path(temp) / "agent-relay" / "release-notices.json"
+                self.assertEqual(json.loads(cache.read_text())["offer"]["notesTruncated"], truncated)
 
     def test_cache_path_ignores_empty_and_relative_xdg_values(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -332,6 +373,18 @@ class ReleaseDiscoveryTests(unittest.TestCase):
             self.assertEqual(output.getvalue(), "")
             self.assertFalse((Path(temp) / "agent-relay").exists())
 
+    def test_truncated_offer_survives_the_notice_cache(self):
+        notes = "x" * (discovery.MAX_NOTES + 1)
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+            with patch.object(discovery, "build_opener",
+                              return_value=fake_api([release("0.4.0", notes=notes)])):
+                _, offer = discovery.cache_latest_offer(installed="0.3.0")
+            self.assertIs(offer["notesTruncated"], True)
+            cache = json.loads((Path(temp) / "agent-relay" / "release-notices.json").read_text())
+            self.assertIs(cache["offer"]["notesTruncated"], True)
+            self.assertEqual(discovery.cached_notice("0.3.0"),
+                             {"version": "0.4.0", "url": discovery.RELEASE_URL + "0.4.0"})
+
     def test_cached_notice_validates_fresh_canonical_offer_and_marks_only_version(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
@@ -359,6 +412,10 @@ class ReleaseDiscoveryTests(unittest.TestCase):
                 self.assertIsNone(discovery.cached_notice("0.3.0"))
                 offer["url"] = discovery.RELEASE_URL + "0.4.0"
                 offer["checkedAt"] = time.time() - discovery.OFFER_MAX_AGE - 1
+                path.write_text(json.dumps({"offer": offer, "notifiedVersion": None}))
+                self.assertIsNone(discovery.cached_notice("0.3.0"))
+                offer["checkedAt"] = time.time()
+                offer["notesTruncated"] = "yes"
                 path.write_text(json.dumps({"offer": offer, "notifiedVersion": None}))
                 self.assertIsNone(discovery.cached_notice("0.3.0"))
                 if os.name == "posix":

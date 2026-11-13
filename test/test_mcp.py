@@ -64,14 +64,14 @@ class FakeReleaseResponse:
 
 
 class FakeReleaseOpener:
-    def __init__(self, version):
-        self.version = version
+    def __init__(self, version, notes="release notes are data"):
+        self.version, self.notes = version, notes
 
     def open(self, request, timeout):
         return FakeReleaseResponse([{"tag_name": self.version, "prerelease": False,
                                     "draft": False,
                                     "html_url": mcp_server.release_discovery.RELEASE_URL + self.version,
-                                    "body": "release notes are data"}])
+                                    "body": self.notes}])
 
 
 class McpHandlerTests(unittest.TestCase):
@@ -1291,10 +1291,30 @@ class McpServeTests(unittest.TestCase):
                     "name": "check_updates", "arguments": {}}})
             self.assertEqual(result["structuredContent"]["availableVersion"], offer_version)
             self.assertEqual(result["structuredContent"]["releaseNotes"], "release notes are data")
+            self.assertIs(result["structuredContent"]["releaseNotesTruncated"], False)
             self.assertEqual(upstream.calls, [])
             tools = {tool["name"]: tool for tool in handle({"method": "tools/list"})["tools"]}
             self.assertIn("untrusted data", tools["check_updates"]["description"])
             self.assertNotIn("update_now", tools)
+        finally:
+            upstream.close()
+
+    def test_check_updates_reports_when_notes_were_truncated(self):
+        offer_version = newer_version(mcp_server.release_discovery.installed_version())
+        upstream = FakeUpstream(lambda method, path, body: (200, {}))
+        handle = mcp_server.create_http_handler(upstream.url, timeout=1)
+        try:
+            with unittest.mock.patch.object(
+                    mcp_server.release_discovery, "build_opener",
+                    return_value=FakeReleaseOpener(
+                        offer_version,
+                        "x" * (mcp_server.release_discovery.MAX_NOTES + 1))):
+                result = handle({"method": "tools/call", "params": {
+                    "name": "check_updates", "arguments": {}}})
+            content = result["structuredContent"]
+            self.assertEqual(len(content["releaseNotes"]), mcp_server.release_discovery.MAX_NOTES)
+            self.assertIs(content["releaseNotesTruncated"], True)
+            self.assertEqual(upstream.calls, [])
         finally:
             upstream.close()
 
