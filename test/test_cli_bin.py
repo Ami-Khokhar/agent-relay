@@ -40,15 +40,17 @@ class InstallerPutsTheCommandOnPathTests(unittest.TestCase):
 
     def test_the_installer_puts_the_command_on_path(self):
         with tempfile.TemporaryDirectory() as tmp:
-            checkout = os.path.join(tmp, "checkout")
+            checkout = os.path.join(os.path.realpath(tmp), "checkout")
             _fake_checkout(checkout)
             env = _installer_env(tmp, checkout)
             result = subprocess.run(
                 ["bash", INSTALL_SERVICE, "--no-update-timer"], env=env,
                 cwd=ROOT, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
+            bin_dir = os.path.join(tmp, ".local", "bin")
+            self.assertIn(f'export PATH="{bin_dir}:$PATH"', result.stdout)
 
-            command = os.path.join(tmp, ".local", "bin", "agent-relay")
+            command = os.path.join(bin_dir, "agent-relay")
             self.assertTrue(os.path.exists(command))
             mode = os.stat(command).st_mode
             self.assertTrue(mode & stat.S_IXUSR)
@@ -61,6 +63,64 @@ class InstallerPutsTheCommandOnPathTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines()[0], command)
             self.assertIn(f"checkout: {checkout}", result.stdout)
+
+    def test_info_reports_the_port_the_installer_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(os.path.realpath(tmp), "checkout")
+            _fake_checkout(checkout)
+            env = {**_installer_env(tmp, checkout), "A2A_RELAY_PORT": "5001"}
+            result = subprocess.run(
+                ["bash", INSTALL_SERVICE, "--no-update-timer"], env=env,
+                cwd=ROOT, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            command = os.path.join(tmp, ".local", "bin", "agent-relay")
+            for name in ("AGENT_RELAY_URL", "A2A_RELAY_URL",
+                         "AGENT_RELAY_PORT", "A2A_RELAY_PORT"):
+                env.pop(name, None)
+            env["PATH"] = f"{os.path.dirname(command)}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", "agent-relay info"], env=env,
+                cwd=ROOT, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("relay: http://127.0.0.1:5001", result.stdout)
+
+    def test_uninstall_removes_only_the_installers_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(os.path.realpath(tmp), "checkout")
+            _fake_checkout(checkout)
+            env = _installer_env(tmp, checkout)
+            result = subprocess.run(
+                ["bash", INSTALL_SERVICE, "--no-update-timer"], env=env,
+                cwd=ROOT, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            command = os.path.join(tmp, ".local", "bin", "agent-relay")
+            self.assertTrue(os.path.exists(command))
+
+            result = subprocess.run(
+                ["bash", INSTALL_SERVICE, "--uninstall"], env=env,
+                cwd=ROOT, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(os.path.exists(command))
+            self.assertIn(f"removed {command}", result.stdout)
+
+    def test_uninstall_leaves_a_foreign_file_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _installer_env(tmp, os.path.join(tmp, "checkout"))
+            command = os.path.join(tmp, ".local", "bin", "agent-relay")
+            os.makedirs(os.path.dirname(command))
+            with open(command, "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\necho not the installer\n")
+            with open(command, encoding="utf-8") as handle:
+                foreign = handle.read()
+
+            result = subprocess.run(
+                ["bash", INSTALL_SERVICE, "--uninstall"], env=env,
+                cwd=ROOT, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(command, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), foreign)
+            self.assertIn(f"left {command}", result.stdout)
 
 
 class InfoTests(unittest.TestCase):
