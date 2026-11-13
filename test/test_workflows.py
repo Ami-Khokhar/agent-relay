@@ -235,6 +235,38 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(finished["collect"]["output"],
                          'collected=["item=one index=0", "item=two index=1"]')
 
+    def test_a_failed_foreach_step_keeps_the_array_shape_and_names_the_failing_task(self):
+        relay = self.start([
+            {"id": "gate", "command": PYTHON, "args": ["-c", EXIT_ON_FAIL]},
+            {"id": "silent", "command": PYTHON, "args": ["-c", "import sys; sys.exit(1)"]},
+        ])
+        workflow = run(relay, {"steps": [
+            {"id": "fan", "agentId": "gate", "foreach": ["ok", "FAIL item"],
+             "input": "{{item}}"},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        fan = steps_of(workflow)["fan"]
+        self.assertEqual(fan["status"], "failed")
+        # A caller parses foreach output as JSON, including on the failing run.
+        self.assertEqual(json.loads(fan["output"]), ["ok", "FAIL item"])
+        self.assertEqual(len(fan["taskIds"]), 2)
+        tasks = [relay.request("GET", f"/v1/tasks/{task_id}")[1] for task_id in fan["taskIds"]]
+        failed = [task for task in tasks if task["status"] == "failed"]
+        # Which item failed stays reachable: its id is in taskIds, its error in errorDetail.
+        self.assertEqual([task["id"] for task in failed], [fan["taskIds"][1]])
+        self.assertEqual(fan["errorDetail"], failed[0]["error"])
+        self.assertIn(fan["errorDetail"], fan["error"])
+
+        # A failing item that wrote no stdout still holds its position in the array.
+        silent = run(relay, {"steps": [
+            {"id": "fan", "agentId": "silent", "foreach": ["one", "two"],
+             "input": "{{item}}"},
+        ]})
+        quiet = steps_of(silent)["fan"]
+        self.assertEqual(quiet["status"], "failed")
+        self.assertEqual(json.loads(quiet["output"]), ["", ""])
+        self.assertEqual(len(json.loads(quiet["output"])), 2)
+
     # --------------------------------------------------------- failure and retry
 
     def test_skips_downstream_steps_when_a_dependency_fails(self):

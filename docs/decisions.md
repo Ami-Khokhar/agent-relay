@@ -15,6 +15,10 @@ path read `model` or `tags` contradicts a public contract and must supersede thi
 rather than edit it, and the trimming is pinned because a stored untrimmed value would list
 something no validation accepted.
 
+## A failed foreach step keeps its JSON array output
+
+`_reap` stored the first failing task's scalar output in a failed `foreach` step, while a successful one stored `json.dumps(outputs)`, so the documented array shape broke exactly on the run a caller was inspecting. A `foreach` step whose tasks ran now serializes every item's output in that attempt's order whatever the outcome — the failed item as its own output, empty when it produced none; a step that fails before its tasks run (unresolved template, rejected submission, evicted task) still has no output. Non-foreach steps keep their scalar output, and `taskIds` lists each attempt's tasks in foreach order, oldest first, so a position maps to an item only within one attempt. Consequence: the shape no longer depends on the outcome of the tasks that did run, and no field is added to the payload.
+
 ## prepare-activation proves the checkout against the stage receipt's source commit
 
 `prepare-activation` compared the active checkout's HEAD with the approved

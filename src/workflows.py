@@ -934,7 +934,14 @@ class WorkflowEngine:
             # The full task error stays available on request (a single-run view), never in
             # the step error a summary or an event carries.
             step["errorDetail"] = task_error or None
-            step["output"] = failed.get("output") or None
+            if spec["foreach"] is not None:
+                # Keep the documented array shape on failure too: a caller parsing a
+                # foreach output must not break on the run it is inspecting. The failed
+                # item is serialized like any completed one (its own output, empty when it
+                # produced none); taskIds and errorDetail still name it.
+                step["output"] = json.dumps([task.get("output") or "" for task in tasks])
+            else:
+                step["output"] = failed.get("output") or None
             self._settle(step)
             return True
 
