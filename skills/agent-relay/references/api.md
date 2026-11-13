@@ -429,9 +429,14 @@ Each result is returned as `content: [{ type: "text", text: "<json>" }]` plus
 with `structuredContent` such as `{ "error": "unknown_task", "message": "...", "status": 404 }`.
 Invalid tool arguments raise JSON-RPC error `-32602` before any HTTP call.
 
-When the relay is unreachable and `A2A_RELAY_URL` is loopback, the MCP process starts
-`src/server.py` detached (log `~/.local/state/agent-relay/relay.log`) and retries once.
-Set `A2A_RELAY_AUTOSTART=0` to disable.
+When the relay refuses the connection and `A2A_RELAY_URL` is loopback, the MCP process starts
+`src/server.py` detached (log `~/.local/state/agent-relay/relay.log`) and retries the same
+request once, POST included: nothing reached the relay, so the re-issued request is the same
+request. A read that times out instead was sent and never answered, so it comes back at once
+as `{ "error": "relay_timeout" }` and is never re-issued — the wait was already spent, one
+call is bounded by its `maxWaitMs` plus a few seconds of transport grace rather than twice
+that, and a POST may already be submitted. Other transport failures keep the generic
+`relay_request_failed` and are not retried either. Set `A2A_RELAY_AUTOSTART=0` to disable.
 
 ## Task object fields
 

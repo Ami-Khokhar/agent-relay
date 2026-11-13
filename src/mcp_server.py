@@ -326,7 +326,7 @@ TOOLS = [
                 "taskId": {"type": "string", "minLength": 1, "maxLength": 128,
                            "description": "Task ID returned by delegate."},
                 "maxWaitMs": {"type": "integer", "minimum": 1,
-                              "description": "Maximum time to wait, in milliseconds, before returning the current status. Omit it to return the current status at once with no wait. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit: the result then carries waitMs (the wait used) and waitClamped: true. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
+                              "description": "Maximum time to wait, in milliseconds, before returning the current status. Omit it to return the current status at once with no wait. A value above the relay's limit (A2A_RELAY_MAX_WAIT_MS, default 600000) is clamped to that limit: the result then carries waitMs (the wait used) and waitClamped: true. A wait whose reply the client's read times out returns error relay_timeout at once and is never re-issued, so one call waits at most this maxWaitMs plus a few seconds of transport grace. Use about 110000 or less where a tool call longer than 120 s moves to the background."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -600,6 +600,31 @@ class _NoRedirect(urlrequest.HTTPRedirectHandler):
         return None
 
 
+RELAY_TIMEOUT = "relay_timeout"
+RELAY_UNREACHABLE = "relay_unreachable"
+
+
+def _transport_error(exc, timeout):
+    """RelayError for a request that produced no response, named by what the failure proves.
+
+    ``relay_unreachable`` is a refused connection: no byte was sent, so the relay is absent
+    and a retry after an autostart is the same request. ``relay_timeout`` is a read that ran
+    out of time after the request was sent: the relay is there, the wait is already spent,
+    and re-issuing it would double the bound the caller asked for. Every other failure may
+    have delivered the request (a reset, say), so it keeps the generic code and is never
+    retried either.
+    """
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        message = (f"the client's read timed out after {timeout:g} s waiting for the relay's "
+                   f"response; the wait was not re-issued")
+        return RelayError(None, {"error": RELAY_TIMEOUT, "message": message}, message)
+    if isinstance(reason, ConnectionRefusedError):
+        return RelayError(None, {"error": RELAY_UNREACHABLE, "message": str(reason)}, str(reason))
+    message = str(reason)
+    return RelayError(None, {"error": "relay_request_failed", "message": message}, message)
+
+
 def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
     from urllib import error as urlerror
 
@@ -630,8 +655,7 @@ def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
         code = exc.code
         ok = False
     except (urlerror.URLError, socket.timeout, TimeoutError, OSError) as exc:
-        raise RelayError(None, {"error": "relay_request_failed", "message": str(getattr(exc, "reason", exc))},
-                         str(getattr(exc, "reason", exc)))
+        raise _transport_error(exc, timeout) from exc
     try:
         value = json.loads(raw.decode("utf-8") or "null")
     except ValueError:
@@ -711,12 +735,23 @@ def _maybe_start_relay(base_url):
         return False
 
 
+def _retry_after_autostart(exc):
+    """True only for a failure that proves nothing reached the relay: a refused connection."""
+    return exc.status is None and (exc.data or {}).get("error") == RELAY_UNREACHABLE
+
+
 def _relay_request(base_url, path, method="GET", body=None, timeout=10.0):
-    """Issue a relay request, starting the HTTP service on demand for loopback URLs."""
+    """Issue a relay request, starting the HTTP service on demand for loopback URLs.
+
+    Only a refused connection is retried, and only after an autostart: no byte was sent, so
+    the re-issued request is the same request, POST included. A read timeout means the relay
+    answered nothing within the caller's transport budget after the request was sent — the
+    wait is spent and a POST may already be submitted — so it is raised as it is.
+    """
     try:
         return _http_request(base_url, path, method=method, body=body, timeout=timeout)
     except RelayError as exc:
-        if exc.status is not None:
+        if not _retry_after_autostart(exc):
             raise
         if not _maybe_start_relay(base_url):
             raise

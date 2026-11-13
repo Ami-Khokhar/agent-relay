@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,39 @@ class FakeUpstream:
 
     def close(self):
         stop_http_server(self.server)
+
+
+class SilentUpstream:
+    """Accept connections and never answer, so every read times out at the client."""
+
+    def __init__(self):
+        self.connections = 0
+        self._accepted = []
+        self._stop = threading.Event()
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self._sock.settimeout(0.05)
+        self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._sock.accept()
+            except OSError:
+                continue
+            self.connections += 1
+            self._accepted.append(connection)
+
+    def close(self):
+        self._stop.set()
+        self._sock.close()
+        self._thread.join(2)
+        for connection in self._accepted:
+            connection.close()
 
 
 class FakeReleaseResponse:
@@ -803,26 +837,91 @@ class McpHandlerTests(unittest.TestCase):
         self.assertIn("list_agents", options["description"])
         self.assertIn("options", tools["list_agents"]["description"])
 
-    def test_retries_a_loopback_request_after_starting_the_relay(self):
-        calls = []
+    def test_retries_a_refused_request_after_starting_the_relay(self):
+        for verb in ("GET", "POST"):
+            with self.subTest(verb=verb):
+                calls = []
 
-        def fake_request(base_url, path, method="GET", body=None, timeout=10.0):
-            calls.append(path)
-            if len(calls) == 1:
-                raise mcp_server.RelayError(None, {"error": "relay_request_failed"}, "refused")
-            return {"ok": True}
+                def fake_request(base_url, path, method="GET", body=None, timeout=10.0):
+                    calls.append((method, path))
+                    if len(calls) == 1:
+                        raise mcp_server.RelayError(None, {"error": "relay_unreachable"}, "refused")
+                    return {"ok": True}
 
-        original_request = mcp_server._http_request
+                original_request = mcp_server._http_request
+                original_start = mcp_server._maybe_start_relay
+                mcp_server._http_request = fake_request
+                mcp_server._maybe_start_relay = lambda base_url: True
+                try:
+                    value = mcp_server._relay_request("http://127.0.0.1:1", "/healthz", method=verb)
+                    self.assertEqual(value, {"ok": True})
+                    self.assertEqual(calls, [(verb, "/healthz"), (verb, "/healthz")])
+                finally:
+                    mcp_server._http_request = original_request
+                    mcp_server._maybe_start_relay = original_start
+
+    def test_a_failure_that_may_have_reached_the_relay_is_not_retried(self):
+        for error in ("relay_timeout", "relay_request_failed"):
+            with self.subTest(error=error):
+                calls, starts = [], []
+
+                def fake_request(base_url, path, method="GET", body=None, timeout=10.0):
+                    calls.append((method, path))
+                    raise mcp_server.RelayError(None, {"error": error}, error)
+
+                original_request = mcp_server._http_request
+                original_start = mcp_server._maybe_start_relay
+                mcp_server._http_request = fake_request
+                mcp_server._maybe_start_relay = lambda base_url: starts.append(base_url) or True
+                try:
+                    with self.assertRaises(mcp_server.RelayError):
+                        mcp_server._relay_request("http://127.0.0.1:1",
+                                                  "/v1/tasks/task-1?waitMs=500", method="POST")
+                finally:
+                    mcp_server._http_request = original_request
+                    mcp_server._maybe_start_relay = original_start
+                self.assertEqual(calls, [("POST", "/v1/tasks/task-1?waitMs=500")])
+                self.assertEqual(starts, [])
+
+    def test_a_timed_out_wait_is_reported_at_once_and_never_reissued(self):
+        silent = SilentUpstream()
+        starts = []
         original_start = mcp_server._maybe_start_relay
-        mcp_server._http_request = fake_request
-        mcp_server._maybe_start_relay = lambda base_url: True
+        mcp_server._maybe_start_relay = lambda base_url: starts.append(base_url) or True
         try:
-            value = mcp_server._relay_request("http://127.0.0.1:1", "/healthz")
-            self.assertEqual(value, {"ok": True})
-            self.assertEqual(calls, ["/healthz", "/healthz"])
+            handle = mcp_server.create_http_handler(silent.url, timeout=0.2)
+            started = time.monotonic()
+            result = handle({"method": "tools/call", "params": {
+                "name": "wait_task", "arguments": {"taskId": "task-slow", "maxWaitMs": 200}}})
+            elapsed = time.monotonic() - started
         finally:
-            mcp_server._http_request = original_request
             mcp_server._maybe_start_relay = original_start
+            silent.close()
+        # A second attempt would open a second connection and spend a second full wait.
+        self.assertEqual(silent.connections, 1)
+        self.assertEqual(starts, [])
+        self.assertLess(elapsed, 0.2 + 5 + 1.5)
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["structuredContent"]["error"], "relay_timeout")
+        self.assertIn("timed out", result["structuredContent"]["message"])
+
+    def test_a_refused_connection_still_starts_the_relay_once(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        base_url = f"http://127.0.0.1:{port}"
+        starts = []
+        original_start = mcp_server._maybe_start_relay
+        mcp_server._maybe_start_relay = lambda url: starts.append(url) or False
+        try:
+            with self.assertRaises(mcp_server.RelayError) as raised:
+                mcp_server._relay_request(base_url, "/v1/pressure", timeout=1)
+        finally:
+            mcp_server._maybe_start_relay = original_start
+        self.assertIsNone(raised.exception.status)
+        self.assertEqual(raised.exception.data["error"], "relay_unreachable")
+        self.assertEqual(starts, [base_url])
 
     def test_validates_tool_arguments_before_calling_the_relay(self):
         upstream = FakeUpstream(lambda method, path, body: (200, {}))
