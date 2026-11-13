@@ -18,7 +18,6 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import release_discovery
@@ -250,6 +249,13 @@ def private_state_dir(path, label):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
         raise UpdateError("cannot prepare the %s directory; check permissions" % label) from exc
+    if IS_POSIX:
+        # mkdir(mode=0o700) does not tighten a directory that already exists,
+        # so a shared or attacker-prepared XDG_STATE_HOME would stay 0755/0777.
+        try:
+            os.chmod(path, 0o700)
+        except OSError as exc:
+            raise UpdateError("cannot secure the %s directory; check permissions" % label) from exc
     try:
         info = path.lstat()
     except FileNotFoundError as exc:
@@ -259,6 +265,9 @@ def private_state_dir(path, label):
         owner = owner()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner:
             raise UpdateError("%s directory is not a private directory of this user" % label)
+    if IS_POSIX and info.st_mode & 0o077:
+        raise UpdateError("%s directory is readable or writable by others; refusing unsafe state"
+                          % label)
     if Path(os.path.realpath(path)) != path:
         raise UpdateError("%s directory resolves elsewhere; refusing unsafe state" % label)
     return path
@@ -377,7 +386,11 @@ def _atomic_write(path, payload):
 class _StdTerminal:
     """Default interactive terminal that refuses to prompt without a real TTY."""
     def is_tty(self):
-        return IS_POSIX and sys.stdin.isatty() and sys.stdout.isatty()
+        # isatty() answers correctly for Windows consoles too, so there is no
+        # platform guard here: the contract really is an interactive stdin
+        # *and* stdout, and a POSIX-only term would treat a real Windows
+        # console as non-interactive and always refuse approval.
+        return sys.stdin.isatty() and sys.stdout.isatty()
 
     def prompt(self, message):
         print(message, end="", flush=True)
