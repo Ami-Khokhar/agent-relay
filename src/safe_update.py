@@ -234,7 +234,9 @@ def cmd_drain(tag, install_dir, *, base_url=None, transaction_id=None,
     Nothing is installed or restarted and no service control is called; the
     relay is only asked for its drain and releases it again. This is the
     explicit updater consumer, so the server acknowledges quiescence instead
-    of the updater inferring it from healthz.
+    of the updater inferring it from healthz. A drain the relay reissues
+    (``createdHere`` false) is not this rehearsal's hold: it is reported and left in
+    place, because only its existing transaction may end it.
     """
     state_dir = _state_dir()
     _receipt, identity = _stage_receipt(tag, install_dir, state_dir)
@@ -245,9 +247,21 @@ def cmd_drain(tag, install_dir, *, base_url=None, transaction_id=None,
         acquired = update_drain.acquire_drain(base_url, transaction_id, token=token)
     except update_drain.DrainError as exc:
         raise UpdateError("the drain could not be acquired: %s" % exc)
-    revision, capability = acquired["revision"], acquired["capability"]
+    revision, capability = acquired["revision"], acquired.get("capability")
     status = None
     try:
+        if acquired.get("createdHere") is not True:
+            # The relay reissued a hold this command did not create: entering its
+            # waiting/releasing path would end a live transaction's hold. The
+            # reissue carries no capability for a caller that did not create it.
+            print("Transaction %s already holds the relay's drain. This command did "
+                  "not create that hold, so it leaves it in place; release it with its "
+                  "owner's recovery (`python3 src/safe_update.py recover-abort %s` for a "
+                  "prepared record, otherwise from the process that holds it). A hold "
+                  "whose owning process is gone and which has no prepared record ends "
+                  "only when the relay restarts."
+                  % (transaction_id, transaction_id))
+            return 1
         try:
             status = update_drain.wait_for_quiescence(
                 base_url, transaction_id, token=token, revision=revision,
@@ -264,15 +278,16 @@ def cmd_drain(tag, install_dir, *, base_url=None, transaction_id=None,
                    "active=%(active)s queued=%(queued)s workflows=%(workflows)s"
                    % status))
     finally:
-        try:
-            released = update_drain.release_drain(
-                base_url, transaction_id, token=token, revision=revision,
-                capability=capability)
-            print("Drain released: transaction %s (only the explicit release "
-                  "reopens admission)." % released["transactionId"])
-        except update_drain.DrainError as exc:
-            print("warning: the drain could not be released: %s; the hold stands "
-                  "until an explicit release recovers it." % exc, file=sys.stderr)
+        if acquired.get("createdHere"):
+            try:
+                released = update_drain.release_drain(
+                    base_url, transaction_id, token=token, revision=revision,
+                    capability=capability)
+                print("Drain released: transaction %s (only the explicit release "
+                      "reopens admission)." % released["transactionId"])
+            except update_drain.DrainError as exc:
+                print("warning: the drain could not be released: %s; the hold stands "
+                      "until an explicit release recovers it." % exc, file=sys.stderr)
     return 0 if status and status["quiesced"] else 1
 
 
@@ -294,7 +309,9 @@ def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=No
     device-local consent's durable single-use record is re-proven one last
     time; and only when all of that holds is the exact-revision authenticated
     drain acquired and a durable, recoverable transaction written. The drain
-    is held after this command returns.
+    is held after this command returns. A drain that already exists (the relay
+    reissues it) is never adopted: it belongs to the transaction that holds it
+    and is left in place.
     """
     state_dir = _state_dir()
     resolved = Path(install_dir).resolve()
@@ -319,6 +336,17 @@ def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=No
         acquired = update_drain.acquire_drain(base_url, transaction_id, token=token)
     except update_drain.DrainError as exc:
         raise UpdateError("the drain could not be acquired: %s" % exc)
+    if acquired.get("createdHere") is not True:
+        # A hold that already existed belongs to the transaction that owns it.
+        # Adopting it would write a record for a live hold and let a later
+        # release reopen admission for a transaction this command never made.
+        note = _release_drain_after_failure(base_url, transaction_id, token, acquired)
+        raise UpdateError("transaction %s already holds the relay's drain; %s. "
+                          "Release it with its owner's recovery (`python3 "
+                          "src/safe_update.py recover-abort %s` for a prepared "
+                          "record, otherwise from the process that holds it). "
+                          "Nothing was prepared"
+                          % (transaction_id, note, transaction_id))
     drained = acquired.get("revision")
     if drained != receipt["sourceCommit"]:
         # activate returns the checkout to this exact starting revision; a
@@ -348,7 +376,14 @@ def cmd_prepare_activation(tag, install_dir, *, base_url=None, transaction_id=No
 
 
 def _release_drain_after_failure(base_url, transaction_id, token, acquired):
-    """The hold the effect boundary acquired is released again, and said so."""
+    """A hold this command created is released again, and the note says which.
+
+    A reissued hold (``createdHere`` false) was not created here: it belongs to the
+    transaction that already owned it, so it is left exactly as it is.
+    """
+    if acquired.get("createdHere") is not True:
+        return ("that hold was not created here, so it was not released and still "
+                "stands with its existing transaction")
     revision, capability = acquired.get("revision"), acquired.get("capability")
     if not revision or not capability:
         return "the drain was never acquired"
