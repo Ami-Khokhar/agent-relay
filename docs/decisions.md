@@ -19,6 +19,24 @@ something no validation accepted.
 
 `_reap` stored the first failing task's scalar output in a failed `foreach` step, while a successful one stored `json.dumps(outputs)`, so the documented array shape broke exactly on the run a caller was inspecting. A `foreach` step whose tasks ran now serializes every item's output in that attempt's order whatever the outcome — the failed item as its own output, empty when it produced none; a step that fails before its tasks run (unresolved template, rejected submission, evicted task) still has no output. Non-foreach steps keep their scalar output, and `taskIds` lists each attempt's tasks in foreach order, oldest first, so a position maps to an item only within one attempt. Consequence: the shape no longer depends on the outcome of the tasks that did run, and no field is added to the payload.
 
+## A resume continues the change feed instead of replaying it
+
+`_record_events` compares every step against the last status it published, defaulting to
+`pending`, but `resume` rebuilt the run from the journal without that memory: each
+journaled completion was published again as `pending → completed`, so a consumer following
+`GET /v1/workflows/events` with a cursor reacted twice to the same step and the feed
+claimed work that resume deliberately skipped. A resume now stamps a step restored from the
+journal with its completion and leaves a step it will run at the `pending` baseline, so a
+retried attempt always publishes its outcome — including failing before it ever reaches
+`running`, when the registry no longer offers its agent. The run-level status is stamped
+only when every step was restored, because then the resume has nothing to run and finishes
+at the status its feed already reported; a run with work left must publish that work's
+transitions. After a restart the feed is empty, so the journal's completion is the baseline.
+Consequence: `after=<seq>` taken before a resume never replays a completion, and the seeding
+covers only work the resume will not repeat, so it cannot suppress a real post-resume
+transition. A terminal run evicted by the workflow store bound keeps its events but has no
+run object to continue from, so its run-level restart publishes normally.
+
 ## prepare-activation proves the checkout against the stage receipt's source commit
 
 `prepare-activation` compared the active checkout's HEAD with the approved

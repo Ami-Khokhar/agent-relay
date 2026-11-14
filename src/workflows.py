@@ -621,15 +621,29 @@ class WorkflowEngine:
             if prior is None and not self._make_room():
                 return 503, {"error": "workflow_capacity_reached"}
             workflow = self._new_workflow(saved["spec"], None, workflow_id=workflow_id)
+            restored = 0
             for step in workflow["steps"]:
                 done = saved["outputs"].get(step["id"])
-                if done is not None:
-                    step["status"] = "completed"
-                    step["output"] = done["output"]
-                    step["attempts"] = done["attempts"]
-                    step["startedAt"] = done["startedAt"]
-                    step["finishedAt"] = done["finishedAt"]
-                    step["attemptTimes"] = done["attemptTimes"]
+                if done is None:
+                    # A step the resume will run keeps the pending baseline, so its attempt
+                    # always publishes what it does — including failing before it ever
+                    # reaches running, when the registry no longer offers its agent.
+                    continue
+                step["status"] = "completed"
+                step["output"] = done["output"]
+                step["attempts"] = done["attempts"]
+                step["startedAt"] = done["startedAt"]
+                step["finishedAt"] = done["finishedAt"]
+                step["attemptTimes"] = done["attemptTimes"]
+                # The feed already reported this completion before the run stopped, so the
+                # resume continues from it instead of replaying pending → completed.
+                step["_event_status"] = "completed"
+                restored += 1
+            if restored == len(workflow["steps"]) and prior is not None:
+                # Nothing is left to run, so the resume finishes at the status its feed
+                # already reported. A run with work left must publish that work.
+                workflow["_event_run_status"] = prior.get(
+                    "_event_run_status", workflow["status"])
             self._workflows[workflow_id] = workflow
             # The one field _new_workflow sets and _make_room releases; reading the old
             # name left every resumed run unregistered.
