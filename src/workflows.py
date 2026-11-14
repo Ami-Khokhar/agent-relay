@@ -30,6 +30,7 @@ polling each run.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -87,6 +88,17 @@ def _encodable(text):
     except UnicodeEncodeError:
         return False
     return True
+
+
+def _spec_digest(spec):
+    """A stable fingerprint of a normalized document, for comparing an evicted replay.
+
+    ``ensure_ascii`` escapes a lone surrogate as text instead of encoding it, so this is total
+    over every JSON value: validation does not inspect every field (a ``name`` or an ``options``
+    value may hold ``"\\ud800"``), and eviction must never fail a submission over one.
+    """
+    encoded = json.dumps(spec, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _tail_lines(text, keep):
@@ -439,6 +451,9 @@ class WorkflowEngine:
         self._now = now
         self._workflows = {}
         self._request_ids = {}
+        # Evicted terminal runs stay answerable by their requestId, so a replay cannot start a
+        # second run; bounded like the store (see _remember_evicted).
+        self._evicted_request_ids = {}
         self._events = []
         self._seq = 0
 
@@ -481,6 +496,13 @@ class WorkflowEngine:
                     if prior["_requested_spec"] != normalized:
                         return 409, {"error": "idempotency_conflict"}
                     return 200, self._public(prior, detail=False)
+                evicted = self._evicted_request_ids.get(request_id)
+                if evicted is not None:
+                    # The run left memory but is terminal and answerable: replaying it must
+                    # return it, never a second run that repeats its agent work.
+                    if evicted["digest"] != _spec_digest(normalized):
+                        return 409, {"error": "idempotency_conflict"}
+                    return 200, evicted["run"]
             # The shared-lock drain closes admission entirely, starting with
             # new runs: asked here, under the lock, so the refusal and the
             # registration of a new run cannot interleave with an acquire.
@@ -510,9 +532,36 @@ class WorkflowEngine:
         if not finished:
             return False
         oldest = min(finished, key=lambda run: run["finishedAt"] or run["createdAt"])
+        self._remember_evicted(oldest)
         del self._workflows[oldest["id"]]
         self._request_ids.pop(oldest["_requested_request_id"], None)
         return True
+
+    def _remember_evicted(self, workflow):
+        """Keep an evicted terminal run answerable by its requestId. Call with the lock held.
+
+        A replay of a requestId whose run was evicted must not start new work, so its final
+        projection (terminal and immutable) and a digest of the submitted document stay here.
+        The map is bounded like the store: it holds at most ``max_workflows`` ids, and the
+        oldest one is forgotten first, after which a replay of it starts a new run.
+        """
+        request_id = workflow["_requested_request_id"]
+        if request_id is None:
+            return
+        self._evicted_request_ids.pop(request_id, None)
+        self._evicted_request_ids[request_id] = {
+            "digest": _spec_digest(workflow["_requested_spec"]),
+            "run": self._public(workflow, detail=False),
+        }
+        while len(self._evicted_request_ids) > self._max_workflows:
+            del self._evicted_request_ids[next(iter(self._evicted_request_ids))]
+
+    def _evicted_request_id(self, workflow_id):
+        """The requestId still remembered for an evicted run id, if any. Call with the lock held."""
+        for request_id, remembered in self._evicted_request_ids.items():
+            if remembered["run"]["id"] == workflow_id:
+                return request_id
+        return None
 
     def get(self, workflow_id):
         if not RUN_ID_RE.fullmatch(workflow_id or ""):
@@ -617,7 +666,11 @@ class WorkflowEngine:
             # same room rule as a submission: without it each resumed id would grow the store
             # and its executor thread past the bound. An id still stored finished is resumed
             # in place, which adds no entry, so asking for room there would evict an unrelated
-            # finished run and release its requestId for nothing.
+            # finished run and spend a slot of the evicted-requestId memory for nothing. A
+            # journal-only id reads its remembered requestId first: _make_room remembers what
+            # it evicts, so at the bound it can forget this run's own entry and the resume
+            # would register no id, letting a replay of the old document start a second run.
+            remembered = self._evicted_request_id(workflow_id) if prior is None else None
             if prior is None and not self._make_room():
                 return 503, {"error": "workflow_capacity_reached"}
             workflow = self._new_workflow(saved["spec"], None, workflow_id=workflow_id)
@@ -647,10 +700,13 @@ class WorkflowEngine:
             self._workflows[workflow_id] = workflow
             # The one field _new_workflow sets and _make_room releases; reading the old
             # name left every resumed run unregistered.
-            request_id = (prior or {}).get("_requested_request_id")
+            # An evicted run's requestId is still remembered: taking it back here means a
+            # replay answers this live run rather than the old terminal view.
+            request_id = (prior or {}).get("_requested_request_id") or remembered
             if request_id is not None:
                 workflow["_requested_request_id"] = request_id
                 self._request_ids[request_id] = workflow
+                self._evicted_request_ids.pop(request_id, None)
             self._journal(workflow, {"type": "resumed", "at": self._now()})
             body = self._public(workflow, detail=False)
             self._start(workflow)

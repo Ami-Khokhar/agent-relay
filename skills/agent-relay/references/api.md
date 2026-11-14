@@ -189,6 +189,17 @@ placeholder is `400 invalid_template`.
 Returns `202` with the run. Replaying the same `requestId` with the same document returns
 `200`; with a different document, `409 idempotency_conflict`.
 
+The replay answer survives eviction: when the store reaches `A2A_RELAY_MAX_WORKFLOWS`
+and the oldest finished run is dropped, its `requestId`, a digest of its submitted document
+and its final view stay remembered for the most recent `A2A_RELAY_MAX_WORKFLOWS` evictions.
+A replay within that memory returns `200` with that terminal run — never a second run that
+repeats its agent work — and a different document is still `409 idempotency_conflict`. A
+`requestId` evicted longer ago than that is forgotten, so its replay starts a new run.
+`GET /v1/workflows/:id` still returns `404` for an evicted run, and
+`POST /v1/workflows/:id/resume` continues it from its journal; that resume
+takes the remembered `requestId` back, so a later replay answers the resumed
+run rather than the evicted terminal view.
+
 Validation failures use `400` with: `invalid_steps`, `invalid_step_id`, `duplicate_step`,
 `unknown_step`, `cyclic_dependency`, `invalid_needs`, `invalid_needs_policy`, `invalid_foreach`, `invalid_retries`,
 `invalid_repeat`, `invalid_fail_if`, `invalid_template`, `unknown_reference`, `invalid_options`,
