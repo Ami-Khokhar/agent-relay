@@ -1398,17 +1398,183 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "invalid_status")
 
-    def test_evicts_the_oldest_finished_run_and_releases_its_request_id(self):
-        relay = self.start(echo(), env={"AGENT_RELAY_MAX_WORKFLOWS": "1"})
-        first = run(relay, {"requestId": "keep-1",
-                            "steps": [{"id": "a", "agentId": "echo", "input": "one"}]})
-        second = run(relay, {"steps": [{"id": "a", "agentId": "echo", "input": "two"}]})
+    def test_a_replay_of_an_evicted_run_returns_it_and_starts_no_second_run(self):
+        release = self.path("release-after-eviction")
+        calls = self.path("once-calls")
+        hold = ("import os, pathlib, time\n"
+                "while not pathlib.Path(os.environ['WF_RELEASE']).exists(): time.sleep(0.01)\n"
+                "print('released')\n")
+        once = ("import os, pathlib\n"
+                "with open(os.environ['WF_CALLS'], 'a', encoding='utf-8') as handle:\n"
+                "    handle.write('call\\n')\n"
+                "print('done')\n")
+        relay = self.start([
+            {"id": "once", "command": PYTHON, "args": ["-c", once], "env": {"WF_CALLS": calls}},
+            {"id": "hold", "command": PYTHON, "args": ["-c", hold], "env": {"WF_RELEASE": release}},
+        ], env={"AGENT_RELAY_MAX_WORKFLOWS": "2"})
+        spec = {"requestId": "evicted-1",
+                "steps": [{"id": "only", "agentId": "once", "input": "go"}]}
+        status, first = relay.request("POST", "/v1/workflows", spec)
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, first["id"])["status"], "completed")
+        status, _ = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "slow", "agentId": "hold", "input": "wait"}]})
+        self.assertEqual(status, 202)
+        try:
+            # The store holds one finished and one held run, so this submission evicts the
+            # finished one: its memory goes, its journal and requestId stay answerable.
+            status, evictor = relay.request("POST", "/v1/workflows", {
+                "steps": [{"id": "again", "agentId": "once", "input": "evict"}]})
+            self.assertEqual(status, 202)
+            self.assertEqual(wait(relay, evictor["id"])["status"], "completed")
+            status, body = relay.request("GET", f"/v1/workflows/{first['id']}")
+            self.assertEqual((status, body["error"]), (404, "unknown_workflow"))
+
+            # Replaying the same document returns the evicted run, never a second run whose
+            # steps would launch the agent's work again.
+            status, again = relay.request("POST", "/v1/workflows", spec)
+            self.assertEqual(status, 200, again)
+            self.assertEqual(again["id"], first["id"])
+            self.assertEqual(again["status"], "completed")
+
+            def calls_made():
+                try:
+                    with open(calls, encoding="utf-8") as handle:
+                        return len(handle.read().splitlines())
+                except OSError:
+                    return 0
+
+            # The original run and the evicting run are the only work; a replay that created a
+            # run would launch the agent a third time.
+            deadline = time.time() + 2
+            while time.time() < deadline and calls_made() < 2:
+                time.sleep(0.02)
+            time.sleep(0.3)
+            self.assertEqual(calls_made(), 2)
+
+            different = dict(spec, name="different")
+            status, body = relay.request("POST", "/v1/workflows", different)
+            self.assertEqual((status, body["error"]), (409, "idempotency_conflict"))
+        finally:
+            with open(release, "w", encoding="utf-8") as handle:
+                handle.write("finish")
+
+    def test_a_resumed_evicted_run_takes_its_request_id_back(self):
+        release = self.path("release-after-resume")
+        mark = self.path("resumed-after-eviction-mark")
+        hold = ("import os, pathlib, time\n"
+                "while not pathlib.Path(os.environ['WF_RELEASE']).exists(): time.sleep(0.01)\n"
+                "print('released')\n")
+        relay = self.start([
+            {"id": "flaky", "command": PYTHON, "args": ["-c", FLAKY], "env": {"WF_MARK": mark}},
+            {"id": "hold", "command": PYTHON, "args": ["-c", hold], "env": {"WF_RELEASE": release}},
+            echo(),
+        ], env={"AGENT_RELAY_MAX_WORKFLOWS": "2"})
+        spec = {"requestId": "resume-evicted-1",
+                "steps": [{"id": "only", "agentId": "flaky", "input": "go"}]}
+        status, submitted = relay.request("POST", "/v1/workflows", spec)
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, submitted["id"])["status"], "failed")
+        status, _ = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "slow", "agentId": "hold", "input": "wait"}]})
+        self.assertEqual(status, 202)
+        try:
+            # The store is full (one failed, one held run), so this evicts the failed run and
+            # remembers its requestId.
+            status, evictor = relay.request("POST", "/v1/workflows", {
+                "steps": [{"id": "a", "agentId": "echo", "input": "evict"}]})
+            self.assertEqual(status, 202)
+            status, body = relay.request("GET", f"/v1/workflows/{submitted['id']}")
+            self.assertEqual((status, body["error"]), (404, "unknown_workflow"))
+
+            # The evicting run must be terminal before the resume: the store has two slots and
+            # resume's _make_room() can only evict a finished run, so a still-running evictor
+            # would make the resume answer 503 workflow_capacity_reached.
+            self.assertEqual(wait(relay, evictor["id"])["status"], "completed")
+            status, _ = relay.request("POST", f"/v1/workflows/{submitted['id']}/resume")
+            self.assertEqual(status, 202)
+            self.assertEqual(wait(relay, submitted["id"])["status"], "completed")
+            # The resume took the requestId back, so a replay answers this live run instead of
+            # the remembered failed view.
+            status, again = relay.request("POST", "/v1/workflows", spec)
+            self.assertEqual(status, 200, again)
+            self.assertEqual(again["id"], submitted["id"])
+            self.assertEqual(again["status"], "completed")
+        finally:
+            with open(release, "w", encoding="utf-8") as handle:
+                handle.write("finish")
+
+    def test_a_resume_at_the_memory_bound_keeps_the_evicted_request_id(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_WORKFLOWS": "2"})
+
+        def submit(request_id):
+            return run(relay, {"requestId": request_id,
+                                "steps": [{"id": "a", "agentId": "echo",
+                                           "input": request_id}]})
+
+        first = submit("bound-a")
+        submit("bound-b")       # fills both store slots
+        submit("bound-c")       # evicts the first run and remembers bound-a
+        submit("bound-d")       # evicts the second run, so the memory is at its bound
         status, body = relay.request("GET", f"/v1/workflows/{first['id']}")
         self.assertEqual((status, body["error"]), (404, "unknown_workflow"))
-        self.assertEqual(relay.request("GET", f"/v1/workflows/{second['id']}")[0], 200)
-        # The evicted run's requestId is free again, so a retry starts new work.
+
+        # The resume asks for room, which remembers one more evicted run: at the bound that
+        # forgets the oldest remembered id, and the run being resumed is exactly that one.
+        # It still has to take its requestId back, or a replay repeats its agent work.
+        status, _ = relay.request("POST", f"/v1/workflows/{first['id']}/resume")
+        self.assertEqual(status, 202)
+        self.assertEqual(wait(relay, first["id"])["status"], "completed")
         status, again = relay.request("POST", "/v1/workflows", {
-            "requestId": "keep-1", "steps": [{"id": "a", "agentId": "echo", "input": "three"}]})
+            "requestId": "bound-a",
+            "steps": [{"id": "a", "agentId": "echo", "input": "bound-a"}]})
+        self.assertEqual(status, 200, again)
+        self.assertEqual(again["id"], first["id"])
+
+    def test_evicting_a_run_whose_document_holds_a_lone_surrogate_never_500s(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_WORKFLOWS": "1"})
+        # validate_spec checks name only for type and length, so a lone surrogate reaches the
+        # run; eviction then fingerprints the document for the replay memory.
+        spec = {"requestId": "surrogate-1", "name": "\ud800",
+                "steps": [{"id": "a", "agentId": "echo", "input": "go"}]}
+        status, first = relay.request("POST", "/v1/workflows", spec)
+        self.assertEqual(status, 202, first)
+        self.assertEqual(wait(relay, first["id"])["status"], "completed")
+        # Filling the store evicts that run: the digest must escape the surrogate as text
+        # rather than encode it, so the submission still creates its run.
+        status, second = relay.request("POST", "/v1/workflows", {
+            "steps": [{"id": "a", "agentId": "echo", "input": "next"}]})
+        self.assertEqual(status, 202, second)
+        self.assertEqual(wait(relay, second["id"])["status"], "completed")
+        status, again = relay.request("POST", "/v1/workflows", spec)
+        self.assertEqual(status, 200, again)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(again["name"], "\ud800")
+        status, body = relay.request("POST", "/v1/workflows", dict(spec, name="plain"))
+        self.assertEqual((status, body["error"]), (409, "idempotency_conflict"))
+
+    def test_the_evicted_request_id_memory_is_bounded_by_the_store_limit(self):
+        relay = self.start(echo(), env={"AGENT_RELAY_MAX_WORKFLOWS": "1"})
+
+        def submit(request_id):
+            status, body = relay.request("POST", "/v1/workflows", {
+                "requestId": request_id,
+                "steps": [{"id": "a", "agentId": "echo", "input": request_id}]})
+            self.assertEqual(status, 202, body)
+            return wait(relay, body["id"])
+
+        first = submit("evicted-a")
+        second = submit("evicted-b")    # evicts first and remembers its requestId
+        submit("evicted-c")             # evicts second and forgets first
+        # Within the bound a replay still answers the evicted run ...
+        status, again = relay.request("POST", "/v1/workflows", {
+            "requestId": "evicted-b",
+            "steps": [{"id": "a", "agentId": "echo", "input": "evicted-b"}]})
+        self.assertEqual((status, again["id"]), (200, second["id"]))
+        # ... and one older than the bound is forgotten, so its replay starts new work.
+        status, again = relay.request("POST", "/v1/workflows", {
+            "requestId": "evicted-a",
+            "steps": [{"id": "a", "agentId": "echo", "input": "evicted-a"}]})
         self.assertEqual(status, 202)
         self.assertNotEqual(again["id"], first["id"])
 
