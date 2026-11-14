@@ -56,11 +56,11 @@ class RelayTests(unittest.TestCase):
     def test_a_timed_out_command_task_keeps_the_last_words_it_printed(self):
         relay = Relay({"id": "slow", "command": PYTHON,
                        "args": ["-c", "import sys, time; print('hello', flush=True); sys.stderr.write('boom\\n'); time.sleep(10)"]},
-                      env={"A2A_RELAY_TIMEOUT_MS": "300"})
+                      env={"A2A_RELAY_TIMEOUT_MS": "1000"})
         try:
             task = relay.run_task(agentId="slow", input="wait")
             self.assertEqual(task["status"], "timed_out")
-            self.assertEqual(task["error"], "Agent exceeded 300 ms\nhello\nboom")
+            self.assertEqual(task["error"], "Agent exceeded 1000 ms\nhello\nboom")
             self.assertEqual(task["output"], "hello")
         finally:
             relay.close()
@@ -72,11 +72,11 @@ class RelayTests(unittest.TestCase):
                   "sys.stderr.flush()\n"
                   "time.sleep(10)\n")
         relay = Relay({"id": "slow", "type": "stdio", "command": PYTHON, "args": ["-c", script]},
-                      env={"A2A_RELAY_TIMEOUT_MS": "300"})
+                      env={"A2A_RELAY_TIMEOUT_MS": "1000"})
         try:
             task = relay.run_task(agentId="slow", input="wait")
             self.assertEqual(task["status"], "timed_out")
-            self.assertEqual(task["error"], "Agent exceeded 300 ms\nhello\nboom")
+            self.assertEqual(task["error"], "Agent exceeded 1000 ms\nhello\nboom")
             self.assertEqual(task["output"], "hello")
         finally:
             relay.close()
@@ -84,16 +84,51 @@ class RelayTests(unittest.TestCase):
     def test_a_timed_out_task_that_prints_past_the_cap_is_truncated_under_the_limit(self):
         relay = Relay({"id": "slow", "command": PYTHON,
                        "args": ["-c", "import sys, time; sys.stdout.write('x' * 100); sys.stdout.flush(); time.sleep(10)"]},
-                      env={"A2A_RELAY_TIMEOUT_MS": "300", "A2A_RELAY_MAX_OUTPUT_BYTES": "32"})
+                      env={"A2A_RELAY_TIMEOUT_MS": "1000", "A2A_RELAY_MAX_OUTPUT_BYTES": "32"})
         try:
             task = relay.run_task(agentId="slow", input="wait")
             self.assertEqual(task["status"], "timed_out")
             self.assertEqual(len(task["output"].encode("utf-8")), 32)
             self.assertTrue(task["outputTruncated"])
             self.assertLessEqual(len(task["error"].encode("utf-8")),
-                                 len("Agent exceeded 300 ms\n") + 32)
+                                 len("Agent exceeded 1000 ms\n") + 32)
         finally:
             relay.close()
+
+    def test_a_timed_out_task_keeps_the_last_printed_words_when_the_capture_is_truncated(self):
+        script = ("import sys, time\n"
+                  "sys.stdout.write('HEAD-MARKER' + 'x' * 200 + 'LAST-WORDS\\n')\n"
+                  "sys.stdout.flush()\n"
+                  "time.sleep(10)\n")
+        relay = Relay({"id": "slow", "command": PYTHON, "args": ["-c", script]},
+                      env={"A2A_RELAY_TIMEOUT_MS": "1000", "A2A_RELAY_MAX_OUTPUT_BYTES": "32"})
+        try:
+            task = relay.run_task(agentId="slow", input="wait")
+            self.assertEqual(task["status"], "timed_out")
+            self.assertTrue(task["outputTruncated"])
+            self.assertTrue(task["error"].endswith("LAST-WORDS"))
+            self.assertNotIn("HEAD-MARKER", task["error"])
+            self.assertLessEqual(len(task["error"].encode("utf-8")),
+                                 len("Agent exceeded 1000 ms\n") + 32)
+        finally:
+            relay.close()
+
+    def test_an_untruncated_timed_out_task_reports_output_not_truncated(self):
+        script = "import time; print('hello', flush=True); time.sleep(10)"
+        cases = (
+            ("command", {"id": "slow", "command": PYTHON, "args": ["-c", script]}),
+            ("stdio", {"id": "slow", "type": "stdio", "command": PYTHON, "args": ["-c", script]}),
+        )
+        for label, agent in cases:
+            with self.subTest(agent=label):
+                relay = Relay(agent, env={"A2A_RELAY_TIMEOUT_MS": "1000"})
+                try:
+                    task = relay.run_task(agentId="slow", input="wait")
+                    self.assertEqual(task["status"], "timed_out")
+                    self.assertIn("outputTruncated", task)
+                    self.assertEqual(task["outputTruncated"], False)
+                finally:
+                    relay.close()
 
     def test_cancels_tasks_and_bounds_captured_output(self):
         relay = Relay({"id": "output", "command": PYTHON,

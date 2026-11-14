@@ -226,3 +226,11 @@ A task's dict is read for every listing, single-task read, long poll, replay, su
 ## The trusted git allowlist names each platform's own installation
 
 The allowlist was `/usr/bin/git` and `/bin/git` on every host, so on Windows the relay found no git and reported `revision` as `unknown` even inside a real checkout — while still refusing to search `PATH`, which is the protection the allowlist exists for. The list is now chosen by platform: the POSIX system paths, or the machine-wide Git for Windows `cmd` executable under `ProgramFiles` on Windows. A per-user install under `LOCALAPPDATA` is deliberately not a candidate: it sits in the relay user's own profile, which a task can write, so a planted git there would run unsandboxed at the next relay start — exactly what the allowlist prevents. An unset `ProgramFiles` leaves no Windows candidate. Consequence: Windows reports a real revision from a standard machine-wide Git for Windows install; a per-user or otherwise non-standard install still needs `AGENT_RELAY_GIT`, and no path is ever looked up in `PATH`.
+## A timed-out task's error carries both captured streams
+
+This supersedes the "Quota labels require task-error diagnostics and contextual HTTP status
+codes" decision above, for timed-out tasks only. A timeout reports `Agent exceeded <n> ms`
+followed by the bounded tail of what the agent last printed on stdout and stderr, and the
+step cause is classified on that merged error. Limit text printed only on stdout therefore
+does set `agent_quota: ` on a timed-out step, while a task that exits non-zero keeps the
+earlier rule and reports the label only from its own stderr.

@@ -748,7 +748,28 @@ class _Capture:
             return kept
 
 
-def _pump(stream, sink, capture):
+class _Tail:
+    """Keeps the last ``limit`` bytes a stream printed, for the timeout diagnostic.
+
+    ``_Capture`` keeps the head of a stream, which is what the other paths report; a timeout
+    instead needs the last words an agent printed, so the same bytes go through here too.
+    """
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.buffer = bytearray()
+
+    def feed(self, chunk):
+        self.buffer += chunk
+        over = len(self.buffer) - self.limit
+        if over > 0:
+            del self.buffer[:over]
+
+    def text(self):
+        return bytes(self.buffer).decode("utf-8", "replace").strip()
+
+
+def _pump(stream, sink, capture, tail):
     # read1 returns what is available; read(n) would wait for n bytes or EOF.
     read = getattr(stream, "read1", stream.read)
 
@@ -758,6 +779,7 @@ def _pump(stream, sink, capture):
                 chunk = read(65536)
                 if not chunk:
                     break
+                tail.feed(chunk)
                 kept = capture.feed(chunk)
                 if kept:
                     sink.append(kept)
@@ -853,14 +875,20 @@ def _join_all(threads, seconds):
 
 
 def _timeout_error(task, output, error):
-    """The timeout message plus a bounded tail of what the agent last printed.
+    """The timeout message plus the last bytes the agent printed on each stream.
 
-    The captured streams share one MAX_OUTPUT budget, so the tail cannot outgrow the limit
-    the other paths already apply. An agent that printed nothing keeps the bare message.
+    ``output`` and ``error`` are the bounded tails of the captured stdout and stderr, so their
+    join can reach twice MAX_OUTPUT; the last MAX_OUTPUT bytes are kept, the same budget the
+    other paths apply. An agent that printed nothing keeps the bare message.
     """
     message = f"Agent exceeded {task['timeoutMs']} ms"
     tail = "\n".join(part for part in (output, error) if part)
-    return f"{message}\n{tail}" if tail else message
+    if not tail:
+        return message
+    encoded = tail.encode("utf-8")
+    if len(encoded) > MAX_OUTPUT:
+        tail = encoded[-MAX_OUTPUT:].decode("utf-8", "replace")
+    return f"{message}\n{tail}"
 
 
 def _collect(proc, threads):
@@ -1135,14 +1163,16 @@ def _run_command(agent, task):
         return
     capture = _Capture(MAX_OUTPUT)
     out, err = [], []
-    readers = (_pump(proc.stdout, out, capture), _pump(proc.stderr, err, capture))
+    out_tail, err_tail = _Tail(MAX_OUTPUT), _Tail(MAX_OUTPUT)
+    readers = (_pump(proc.stdout, out, capture, out_tail),
+               _pump(proc.stderr, err, capture, err_tail))
     timed_out = _wait(proc, task)
     _collect(proc, readers)
     output = b"".join(out).decode("utf-8", "replace").strip()
     error = b"".join(err).decode("utf-8", "replace").strip()
     if timed_out:
-        _finish(task, "timed_out", error=_timeout_error(task, output, error),
-                output=output or None, outputTruncated=capture.truncated or None)
+        _finish(task, "timed_out", error=_timeout_error(task, out_tail.text(), err_tail.text()),
+                output=output or None, outputTruncated=capture.truncated)
     elif proc.returncode == 0:
         _finish(task, "completed", output=output, outputTruncated=capture.truncated)
     else:
@@ -1162,7 +1192,9 @@ def _run_stdio(agent, task):
         return
     capture = _Capture(MAX_OUTPUT)
     out, err = [], []
-    readers = (_pump(proc.stdout, out, capture), _pump(proc.stderr, err, capture))
+    out_tail, err_tail = _Tail(MAX_OUTPUT), _Tail(MAX_OUTPUT)
+    readers = (_pump(proc.stdout, out, capture, out_tail),
+               _pump(proc.stderr, err, capture, err_tail))
     writer, fed = _feed(proc, (json.dumps(adapter_request(task, agent)) + "\n").encode("utf-8"))
     timed_out = _wait(proc, task)
     _collect(proc, (writer, *readers))
@@ -1170,8 +1202,8 @@ def _run_stdio(agent, task):
     stdout = b"".join(out).decode("utf-8", "replace")
     stderr = b"".join(err).decode("utf-8", "replace")
     if timed_out:
-        _finish(task, "timed_out", error=_timeout_error(task, stdout.strip(), stderr.strip()),
-                output=stdout.strip() or None, outputTruncated=capture.truncated or None)
+        _finish(task, "timed_out", error=_timeout_error(task, out_tail.text(), err_tail.text()),
+                output=stdout.strip() or None, outputTruncated=capture.truncated)
         return
     if proc.returncode != 0:
         _finish(task, "failed", error=stderr.strip() or f"Adapter exited with {proc.returncode}",

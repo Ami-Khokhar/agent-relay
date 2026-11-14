@@ -378,6 +378,28 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("429 too many requests", step["output"])
         self.assertFalse(step["error"].startswith("agent_quota:"), step["error"])
 
+    def test_a_timed_out_step_labels_limit_text_printed_on_stdout(self):
+        # The fail path above keeps stdout out of the classification. A timeout merges the
+        # bounded tail of both captured streams into the task error, so limit text printed
+        # only on stdout does set the label there. The 429 comes after more output than the
+        # byte cap keeps, so only the tail the timeout path captures still carries it.
+        script = ("import sys, time\n"
+                  "sys.stdout.write('HEAD-MARKER' * 40 + '\\n')\n"
+                  "sys.stdout.write('429 too many requests\\n')\n"
+                  "sys.stdout.flush()\n"
+                  "time.sleep(30)\n")
+        relay = self.start({"id": "limited", "command": PYTHON, "args": ["-c", script]},
+                           env={"A2A_RELAY_MAX_OUTPUT_BYTES": "32"})
+        workflow = run(relay, {"steps": [
+            {"id": "source", "agentId": "limited", "input": "go", "timeoutMs": 300},
+        ]})
+        self.assertEqual(workflow["status"], "failed")
+        step = steps_of(workflow)["source"]
+        self.assertEqual(step["status"], "failed")
+        self.assertIn("429 too many requests", step["errorDetail"])
+        self.assertTrue(step["error"].startswith("agent_quota: "), step["error"])
+        self.assertTrue(step["errorDetail"].startswith("Agent exceeded 300 ms"), step["errorDetail"])
+
     def test_limit_diagnostic_before_traceback_still_labels_the_cause(self):
         for diagnostic in ("quota exceeded", "quota reached", "usage limit", "rate-limit",
                            "too many requests", "HTTP 429", "HTTP/1.1 429", "status:429",
