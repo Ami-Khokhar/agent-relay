@@ -236,7 +236,7 @@ class DrainTests(unittest.TestCase):
     def test_an_unreachable_relay_still_names_how_to_recover_a_possible_hold(self):
         """Every retry may time out after the acquire landed. The refusal then
         says how to receive that hold's capability rather than only reporting
-        the transport failure."""
+        the transport failure, and says where a hold no live process owns ends."""
         relay = self.start([self.sleeper()])
         real_request = update_drain._request
         applied = []
@@ -254,17 +254,23 @@ class DrainTests(unittest.TestCase):
                 update_drain.acquire_drain(relay.base, "txn-dark", token=TOKEN, wait_s=0.3)
         self.assertEqual(unreachable.exception.code, "drain_unreachable")
         self.assertIn("--transaction-id txn-dark", str(unreachable.exception))
-        # The abandoned hold is still there, and repeating the acquire recovers it.
+        # The abandoned hold is still there. A later call that did not create it
+        # is shown the hold but never its capability: releasing is the creating
+        # call's act, and the holder's name is public in the 409.
         recovered = update_drain.acquire_drain(relay.base, "txn-dark", token=TOKEN)
         self.assertIs(recovered["reacquired"], True)
         self.assertIs(recovered["recovered"], False,
                       "a later call never recovered its own attempt")
         self.assertIs(recovered["createdHere"], False,
                       "a later call treats the abandoned hold as not its own")
-        update_drain.release_drain(relay.base, "txn-dark", token=TOKEN,
-                                   revision=recovered["revision"],
-                                   capability=recovered["capability"])
-        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 202)
+        self.assertNotIn("capability", recovered,
+                         "a foreign caller is told the hold, never the release")
+        with self.assertRaises(update_drain.DrainError):
+            update_drain.release_drain(relay.base, "txn-dark", token=TOKEN,
+                                       revision=recovered["revision"],
+                                       capability="0" * 64)
+        self.assertEqual(relay.submit(agentId="slow", input="0.05")[0], 503,
+                         "the orphaned hold keeps admission closed until a restart")
 
     def test_a_foreign_hold_still_refuses_and_names_the_holder_and_release(self):
         relay = self.start([self.sleeper()])
@@ -281,6 +287,8 @@ class DrainTests(unittest.TestCase):
                       "it never presents the repeat as a release or a takeover")
         self.assertIn("recover-abort txn-owner", text,
                       "it names the command that releases a prepared transaction")
+        self.assertIn("ends only when the relay restarts", text,
+                      "it names the one ending left when the owner is gone")
         # The refusal took nothing over: the owner's hold is intact.
         self.assertTrue(update_drain.drain_status(
             relay.base, "txn-owner", token=TOKEN, revision=held["revision"],
@@ -431,6 +439,19 @@ class DrainTests(unittest.TestCase):
         self.assertEqual(relay.request(
             "POST", "/v1/admin/update/drain",
             {"transactionId": "a?", "revision": revision})[0], 400)
+        # The creating call's name is validated like the transaction id: a
+        # malformed one is a refusal that creates nothing.
+        for bad in ("a?", "x" * 129, 5, ["a"]):
+            status, body = relay.request("POST", "/v1/admin/update/drain",
+                                         {"transactionId": "txn-a",
+                                          "revision": revision, "requestId": bad})
+            self.assertEqual((status, body.get("error")),
+                             (400, "invalid_request_id"), bad)
+        with self.assertRaises(update_drain.DrainError) as nothing_created:
+            update_drain.drain_status(relay.base, "txn-a", token=TOKEN,
+                                      revision=revision, capability="0" * 64)
+        self.assertEqual(nothing_created.exception.code, "drain_not_held",
+                         "no hold was created by a malformed requestId")
 
     def test_a_redirect_answer_is_never_followed_with_the_token(self):
         """The relay's answer is final: no 3xx is followed, so the bearer token

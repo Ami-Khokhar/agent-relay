@@ -216,7 +216,9 @@ def acquire_drain(base_url, transaction_id, *, token, revision=None,
                                  "repeat the acquire with --transaction-id %s to receive "
                                  "that capability again (a replay is marked reacquired and "
                                  "is never released here), or run `python3 src/safe_update.py "
-                                 "recover-abort %s` if it prepared an activation"
+                                 "recover-abort %s` if it prepared an activation. A hold "
+                                 "whose owning process is gone and which has no prepared "
+                                 "record ends only when the relay restarts"
                                  % (exc, transaction_id, transaction_id))
             raise
         if status == 200:
@@ -241,8 +243,10 @@ def acquire_drain(base_url, transaction_id, *, token, revision=None,
                 "--transaction-id %s only inspects that hold (it is answered as "
                 "reacquired and is never released here); release it with its owner's "
                 "recovery: `python3 src/safe_update.py recover-abort %s` for a "
-                "prepared record, otherwise from the process that holds it. "
-                "Admission stays closed until then" % (holder, holder, holder),
+                "prepared record, otherwise from the process that holds it. A hold "
+                "whose owning process is gone and which has no prepared record ends "
+                "only when the relay restarts. Admission stays closed until then"
+                % (holder, holder, holder),
                 status=status)
         raise DrainError(code or ("drain_refused_%d" % status),
                          "acquire was refused: %s" % (body or {}).get("message", status),

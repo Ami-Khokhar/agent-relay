@@ -37,10 +37,10 @@ from workflows import STEP_ID_RE, WORKFLOW_STATUSES, WorkflowEngine
 # The exact starting revision a drain acquire must name, so an updater that
 # resolved a different build never holds the shared lock of this one.
 DRAIN_COMMIT_RE = re.compile(r"[0-9a-f]{40}$")
+# A drain's transaction id, and the creating call's own name for one acquire
+# attempt (``requestId``): the same bounded alphabet, so one pattern serves both
+# and a replayed acquire can be told apart from the call that created the hold.
 DRAIN_TRANSACTION_RE = re.compile(r"[A-Za-z0-9_.~-]{1,128}$")
-# The client's name for one acquire call, so a replayed acquire can be told
-# apart from the call that actually created the hold.
-DRAIN_REQUEST_RE = re.compile(r"[A-Za-z0-9_.~-]{1,128}$")
 # Capability: the relay mints 64 hex; requests that name one are compared,
 # never trusted, so a replayed or forged capability is refused.
 DRAIN_CAPABILITY_RE = re.compile(r"[0-9a-f]{64}$")
@@ -2028,7 +2028,7 @@ def _drain_acquire(body):
     transaction, revision, _capability = params
     request_id = body.get("requestId") if isinstance(body, dict) else None
     if request_id is not None and (not isinstance(request_id, str)
-                                   or not DRAIN_REQUEST_RE.fullmatch(request_id)):
+                                   or not DRAIN_TRANSACTION_RE.fullmatch(request_id)):
         return 400, {"error": "invalid_request_id",
                      "message": "requestId must match [A-Za-z0-9_.~-] and be at most "
                                 "128 characters"}
@@ -2045,15 +2045,20 @@ def _drain_acquire(body):
                 return 409, {"error": "revision_mismatch",
                              "message": "the drain was acquired for revision %s"
                                         % DRAIN["revision"]}
-            # The holder asking again: the same hold, the same capability, so a
-            # response that never arrived is recovered by repeating the request.
+            # The creating call asking again recovers its own lost answer: the
+            # name it repeats is the one the hold was made with, so it gets the
+            # capability back. Any other caller may see the hold, but not the
+            # capability: releasing is the holder's act, and the holder's name
+            # is public in the 409 above.
             created_with = DRAIN.get("requestId")
+            recovered = bool(request_id and created_with
+                             and hmac.compare_digest(request_id, created_with))
             view = _drain_state(counts)
             view["held"] = True
-            view["capability"] = DRAIN["capability"]
+            if recovered:
+                view["capability"] = DRAIN["capability"]
             view["reacquired"] = True
-            view["recovered"] = bool(request_id and created_with
-                                     and hmac.compare_digest(request_id, created_with))
+            view["recovered"] = recovered
             return 200, view
         if revision != REVISION["commit"]:
             return 409, {"error": "revision_mismatch",

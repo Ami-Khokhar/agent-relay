@@ -247,16 +247,19 @@ def cmd_drain(tag, install_dir, *, base_url=None, transaction_id=None,
         acquired = update_drain.acquire_drain(base_url, transaction_id, token=token)
     except update_drain.DrainError as exc:
         raise UpdateError("the drain could not be acquired: %s" % exc)
-    revision, capability = acquired["revision"], acquired["capability"]
+    revision, capability = acquired["revision"], acquired.get("capability")
     status = None
     try:
         if acquired.get("createdHere") is not True:
             # The relay reissued a hold this command did not create: entering its
-            # waiting/releasing path would end a live transaction's hold.
+            # waiting/releasing path would end a live transaction's hold. The
+            # reissue carries no capability for a caller that did not create it.
             print("Transaction %s already holds the relay's drain. This command did "
                   "not create that hold, so it leaves it in place; release it with its "
                   "owner's recovery (`python3 src/safe_update.py recover-abort %s` for a "
-                  "prepared record, otherwise from the process that holds it)."
+                  "prepared record, otherwise from the process that holds it). A hold "
+                  "whose owning process is gone and which has no prepared record ends "
+                  "only when the relay restarts."
                   % (transaction_id, transaction_id))
             return 1
         try:
