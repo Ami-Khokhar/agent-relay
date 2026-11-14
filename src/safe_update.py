@@ -764,7 +764,14 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
     another transaction's id is refused as a replay, and a terminal record is
     finalized without repeating a service action: a rolled-back record first
     releases and verifies its recorded drain, and a rolled-back or activated
-    record retries the pending barrier refresh before it is expunged. Every
+    record retries the pending barrier refresh before it is expunged — if that
+    refresh still reports closure, the barrier that still names this finished
+    transaction is removed and the refresh retried once. A live activation
+    record whose barrier write never landed is accepted instead of refused:
+    the barrier is rebuilt from the record, the interrupted activation is
+    advanced to ``recovery_required`` and rolled back. A prepared or draining
+    record is refused up front, before any relay credential is needed, in
+    favor of ``recover-abort``, which rebuilds the same barrier itself. Every
     failed proof keeps the record and names the remedy.
     """
     state_dir = _state_dir()
@@ -776,6 +783,27 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
         raise UpdateError("the recorded transaction is %s, not %s; refusing to replay "
                           "another transaction's recovery"
                           % (record["transactionId"], transaction_id))
+    barrier_note = ""
+    if record["phase"] in ("prepared", "draining"):
+        # the documented remedy needs no relay credentials and no repair here:
+        # recover-abort owns this phase and rebuilds a missing barrier itself
+        raise UpdateError("the transaction is in phase %r; recover recovers only a "
+                          "failed activation (recovery_required), recover-abort aborts "
+                          "a prepared one." % record["phase"])
+    if record["phase"] not in update_transaction.TERMINAL_PHASES:
+        # an interrupted activation: the journal and its barrier are two
+        # writes, so a crash between them leaves a live record with no
+        # barrier. Admission is closed by the live record either way, so the
+        # barrier is rebuilt before any step assumes it and the activation is
+        # finished by the rollback below, exactly like a recorded failure.
+        base_url, token = _authorize_drain(base_url)
+        if _restore_barrier(transaction_id, state_dir=state_dir,
+                            base_url=base_url, token=token):
+            barrier_note = (" Its missing admission barrier was rebuilt from the record"
+                            " before recovery.")
+        record = update_transaction.transition(
+            transaction_id, record["phase"], "recovery_required", state_dir=state_dir,
+            reason="interrupted activation recovery")
     if record["phase"] == "activated":
         # the activation stands; its only outstanding effect is the admission
         # barrier, whose refresh the original activate could not confirm —
@@ -783,17 +811,15 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
         # rolled_back branch, so the named remedy cannot strand the barrier
         base_url, token = _authorize_drain(base_url)
         try:
-            refresh = _refresh_barrier(base_url, token)
-            if refresh.get("admissionClosed"):
-                raise update_drain.DrainError("barrier_still_closed",
-                                              "the relay still reports admission closed")
+            note = _open_admission(transaction_id, state_dir=state_dir,
+                                   base_url=base_url, token=token)
         except update_drain.DrainError as exc:
             raise UpdateError("the activated record of %s is durable, but the relay has "
                               "not reopened admission (%s); fix the relay and run "
                               "recover again" % (transaction_id, exc)) from exc
         update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
-        print("Transaction %s already finished as activated; admission is open and "
-              "its durable record was expunged and nothing else was done." % transaction_id)
+        print("Transaction %s already finished as activated; its durable record was "
+              "expunged and nothing else was done. %s" % (transaction_id, note))
         return 0
     if record["phase"] == "rolled_back":
         base_url, token = _authorize_drain(base_url)
@@ -823,22 +849,16 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
                               "release is pending (%s); fix the relay and run recover "
                               "again; the capability is retained" % (transaction_id, exc)) from exc
         try:
-            refresh = _refresh_barrier(base_url, token)
-            if refresh.get("admissionClosed"):
-                raise update_drain.DrainError("barrier_still_closed",
-                                              "the relay still reports admission closed")
+            note = _open_admission(transaction_id, state_dir=state_dir,
+                                   base_url=base_url, token=token)
         except update_drain.DrainError as exc:
             raise UpdateError("the rolled-back record of %s is durable, but the relay has "
                               "not reopened admission (%s); fix the relay and run recover "
                               "again" % (transaction_id, exc)) from exc
         update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
-        print("Transaction %s was already rolled back; the relay reopened admission and "
-              "the record is expunged." % transaction_id)
+        print("Transaction %s was already rolled back and its record is expunged. %s"
+              % (transaction_id, note))
         return 0
-    if record["phase"] != "recovery_required":
-        raise UpdateError("the transaction is in phase %r; recover recovers only a failed "
-                          "activation (recovery_required), recover-abort aborts a "
-                          "prepared one" % record["phase"])
     base_url, token = _authorize_drain(base_url)
     root = (record.get("inventory") or {}).get("sourceRoot")
     if not root:
@@ -855,7 +875,8 @@ def cmd_recover(transaction_id, *, base_url=None, inspect=None, restart=None,
                           "its barrier are retained; fix the failing step and run "
                           "`safe_update recover %s`" % (transaction_id, exc, transaction_id)) from exc
     update_transaction.clear_transaction(transaction_id, state_dir=state_dir)
-    print("Recovery finished: transaction %s is expunged and admission is open." % transaction_id)
+    print("Recovery finished: transaction %s is expunged and admission is open.%s"
+          % (transaction_id, barrier_note))
     return 0
 
 
@@ -867,6 +888,56 @@ def _refresh_barrier(base_url, token):
                                       "the relay refused the barrier refresh: %s"
                                       % (body or {}).get("message", status))
     return body
+
+
+def _open_admission(transaction_id, *, state_dir, base_url, token):
+    """Verify admission reopened, repairing this transaction's own stale barrier.
+
+    The relay re-reads the same files, so a terminal record that kept its
+    barrier (an interrupted unlink) reports closure forever. When the refresh
+    still reports closure, the barrier is removed only if it names this
+    terminal transaction and the refresh is retried once; another
+    transaction's barrier is never touched and is named in the refusal. The
+    returned sentence says which of the two happened.
+    """
+    refresh = _refresh_barrier(base_url, token)
+    if not refresh.get("admissionClosed"):
+        return "Admission is open."
+    removed = update_transaction.clear_barrier(transaction_id, state_dir=state_dir)
+    if removed is None:
+        raise update_drain.DrainError(
+            "barrier_not_ours",
+            "the relay still reports admission closed, and no admission barrier of %s is "
+            "present to remove; admission is held by other update state" % transaction_id)
+    refresh = _refresh_barrier(base_url, token)
+    if refresh.get("admissionClosed"):
+        raise update_drain.DrainError(
+            "barrier_still_closed",
+            "the relay still reports admission closed after the leftover admission "
+            "barrier of %s (phase %r) was removed"
+            % (transaction_id, removed.get("phase")))
+    return ("Admission reopened after the transaction's leftover admission barrier "
+            "(phase %r) was removed." % removed.get("phase"))
+
+
+def _restore_barrier(transaction_id, *, state_dir, base_url, token):
+    """Rebuild a live record's missing barrier, then let the relay re-read it.
+
+    A live record and its barrier are two writes, so a crash between them (or
+    between the barrier unlink and the terminal record) leaves the record with
+    no barrier: admission stays closed on the record alone, but no command
+    accepted that state. The barrier duplicates the record, so it is rebuilt
+    from it and the running relay is asked to re-read the private state before
+    any recovery step assumes it. Returns True only when a missing barrier was
+    rebuilt; a barrier already on disk is left exactly as it is, and one naming
+    another transaction refuses rather than being overwritten.
+    """
+    if update_transaction.read_barrier(state_dir=state_dir) is not None:
+        return False
+    if update_transaction.restore_barrier(transaction_id, state_dir=state_dir) is None:
+        return False
+    _refresh_barrier(base_url, token)
+    return True
 
 
 def _activated_revision_request(base_url, token):
@@ -919,8 +990,11 @@ def cmd_recover_abort(transaction_id, *, base_url=None):
     The proof is the running relay's exact starting revision, the drain it
     still holds for this transaction (proving ownership), the unchanged
     source, stage and hashed state references, and a phase that shows no
-    activation has occurred yet. Anything else is a refusal for manual
-    recovery; nothing is reopened or quietly expunged.
+    activation has occurred yet. A record whose barrier write never landed (a
+    crash between the journal and the barrier) is accepted: the barrier is
+    rebuilt from the record first, and the proof is unchanged either way.
+    Anything else is a refusal for manual recovery; nothing is reopened or
+    quietly expunged.
     """
     state_dir = _state_dir()
     record = update_transaction.recover_transaction(state_dir=state_dir)
@@ -938,6 +1012,9 @@ def cmd_recover_abort(transaction_id, *, base_url=None):
                           "recover-abort aborts only a prepared or draining transaction"
                           % record["phase"])
     base_url, token = _authorize_drain(base_url)
+    if _restore_barrier(transaction_id, state_dir=state_dir, base_url=base_url, token=token):
+        print("Transaction %s had no admission barrier; it was rebuilt from the record "
+              "before the proofs." % transaction_id)
     # Prove before any effect: unchanged external state, the exact starting
     # revision still running, this transaction's owned drain and its quiescence.
     _proof_references(record, state_dir)

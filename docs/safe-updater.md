@@ -124,8 +124,18 @@ accepted work finishes normally.
 fetching the staged object locally, restarts only the positively validated
 per-user service, and accepts the result only when the restarted relay reports
 the exact full target commit through an authenticated endpoint and still names
-this transaction's admission barrier. Only then is the record finalized to
-`activated`, the barrier removed, and admission reopened on the live relay.
+this transaction's admission barrier. Only then is the barrier removed and the
+record finalized to `activated`, in that order: a crash before the unlink
+leaves the finished record beside its barrier (repaired by `recover`), and a
+crash between the unlink and the terminal write leaves a live `restarted`
+record without its barrier, which still refuses admission on the journal alone
+and is finished by `recover` — it rebuilds the barrier from the record, records
+`recovery_required` and rolls back. Neither direction needs a hand-deleted
+file. The rollback's own finalize is the mirror case: `recovery_required` is
+held closed only by its barrier, so its `rolled_back` record is written
+*before* the barrier is unlinked, and a crash between the two leaves the
+finished record beside its barrier, which `recover` removes before expunging.
+Admission is then reopened on the live relay.
 
 ## Refusals and recovery
 
@@ -147,10 +157,21 @@ this transaction's admission barrier. Only then is the record finalized to
 - **A crash mid-activation** leaves the journal and barrier on disk: a
   restarted relay boots inside the barrier and refuses admission naming the
   transaction, and `recover` finishes the rollback to the journaled prior
-  revision.
+  revision. A crash that leaves a live record with no barrier — between the
+  journal write and its barrier write, or between the barrier unlink and the
+  terminal write of a live predecessor — keeps admission closed on the record
+  alone, and the command that owns the phase repairs it: `recover` rebuilds the
+  barrier from the record, records `recovery_required` and rolls an interrupted
+  activation back, while a `prepared` record is rebuilt and then ended by
+  `recover-abort`. Both say they rebuilt it.
 - **A relay that will not reopen admission** after a durable terminal record
   is named by the error with the exact remedy (`fix the relay and run
   safe_update recover <transaction-id>`); nothing is ever reopened on a guess.
+  When the closure is that record's own leftover barrier — an interrupted
+  unlink of a `rolled_back` or `activated` end — `recover` removes that barrier
+  and retries the refresh once, saying so; a barrier naming another
+  transaction is left in place and refused by name, so hand-deleting
+  `admission-barrier.json` is never the remedy.
 
 ## Relation to the legacy updater and to automatic checks
 

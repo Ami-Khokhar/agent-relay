@@ -15,8 +15,19 @@ autostart can never admit work inside an activation gap.
 Fail-closed rules: a journal or barrier that is missing, malformed, torn,
 stale (barrier present without a live transaction) or foreign (bound to
 another device/install) refuses admission and is never silently ignored or
-rewritten; only ``recover-abort`` reopens, and only after proving the original
-revision, unchanged source/state and that no activation occurred. Every write
+rewritten; only ``recover-abort`` reopens a live transaction's barrier, and
+only after proving the original revision, unchanged source/state and that no
+activation occurred. A barrier-free end is written in the order that keeps
+admission closed through every crash point, which depends on what held it
+closed before (``_admission_held_by_journal``): after a live phase, whose own
+record refuses admission, the barrier goes first and a crash leaves a live
+record without a barrier that ``safe_update recover`` rebuilds; after
+``recovery_required``, held closed only by its barrier, the terminal record
+lands first and a crash leaves the finished-record-plus-barrier pair that
+``recover`` repairs. The repair and ``clear_transaction`` never remove another
+transaction's barrier, while the finishing terminal write itself discards
+whatever barrier is present because this install records one transaction at a
+time and the record that barrier belonged to is the one ending. Every write
 is private (0600/0700, no symlinks), fsynced and atomic (temp file + rename),
 so a crash at any point leaves the previous complete record or the new one,
 never a torn one. One transaction at a time per install: a live journal
@@ -273,6 +284,122 @@ def _remove_barrier(state_dir):
     _fsync_dir(_update_dir(state_dir))
 
 
+def _remove_own_barrier(state_dir, transaction_id):
+    """Remove the admission barrier only when it names exactly this transaction.
+
+    A barrier naming another transaction, or a malformed one (which fails
+    closed), is left untouched: it is never this record's leftover to discard.
+    """
+    barrier = read_barrier(state_dir)
+    if barrier is None or barrier.get("transactionId") != transaction_id:
+        return None
+    _remove_barrier(state_dir)
+    return barrier
+
+
+def _admission_held_by_journal(phase):
+    """Whether a record in this phase refuses admission without its barrier.
+
+    Only a live phase does: the admission gate refuses it on the phase alone.
+    A terminal phase — ``recovery_required`` is the one a barrier-free end can
+    follow — is admitted unless a barrier holds it, so a write into one must
+    land before that barrier is gone.
+    """
+    return phase is not None and phase not in TERMINAL_PHASES
+
+
+def _record_barrier(record):
+    """The barrier that duplicates one journal record."""
+    return {
+        "schema": BARRIER_SCHEMA,
+        "transactionId": record["transactionId"],
+        "phase": record["phase"],
+        "revision": record["revision"],
+        "binding": record["binding"],
+    }
+
+
+def _recorded_transaction(state_dir, transaction_id):
+    """This install's record for exactly this id; refused or missing otherwise."""
+    record = read_journal(state_dir)
+    if record is None:
+        return None
+    _check_shape(record, "transaction journal", TRANSACTION_SCHEMA)
+    if record["binding"] != install_fingerprint(state_dir):
+        raise UpdateError("the transaction journal was written for another device or "
+                          "install; refusing unsafe state")
+    if record["transactionId"] != transaction_id:
+        raise UpdateError("the transaction journal is for %s, not %s"
+                          % (record["transactionId"], transaction_id))
+    return record
+
+
+def clear_barrier(transaction_id, *, state_dir):
+    """Remove the leftover admission barrier of a barrier-free terminal record.
+
+    Used to repair the crash state a terminal journal write can leave behind:
+    the record is in a barrier-free phase yet its barrier still holds every
+    admission closed. The record is re-read under this lock and the id and
+    phase proved here — only a terminal record in a barrier-free phase may
+    discard its own barrier — and only a barrier naming this transaction is
+    removed, so another transaction's barrier is never opened up. Returns the
+    removed barrier record, or None when this install records no such
+    transaction or no barrier names it.
+    """
+    if not isinstance(transaction_id, str) or not TRANSACTION_RE.fullmatch(transaction_id):
+        raise UpdateError("transactionId must name a well-formed transaction")
+    _update_dir(state_dir)
+    fd = _flock(_lock_path(state_dir))
+    try:
+        record = _recorded_transaction(state_dir, transaction_id)
+        if record is None:
+            return None
+        if record["phase"] not in BARRIER_FREE_PHASES:
+            raise UpdateError("the transaction is in %r; only a barrier-free end may "
+                              "discard its admission barrier" % record["phase"])
+        return _remove_own_barrier(state_dir, transaction_id)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def restore_barrier(transaction_id, *, state_dir):
+    """Rebuild this transaction's admission barrier from its own journal record.
+
+    A crash between a live journal write and its barrier write — or between the
+    terminal barrier unlink and the terminal record — leaves a live record with
+    no barrier. Admission stays closed on the live record alone, so nothing is
+    reopened by rebuilding it: the barrier is a duplicate of the record and is
+    restored so every shipped recovery step runs from the state it assumes.
+    Returns the barrier now on disk, or None when the record is in a
+    barrier-free phase (nothing to restore). An existing barrier naming this
+    transaction is left exactly as it is; one naming another transaction is a
+    fail-closed refusal, never overwritten.
+    """
+    if not isinstance(transaction_id, str) or not TRANSACTION_RE.fullmatch(transaction_id):
+        raise UpdateError("transactionId must name a well-formed transaction")
+    _update_dir(state_dir)
+    fd = _flock(_lock_path(state_dir))
+    try:
+        record = _recorded_transaction(state_dir, transaction_id)
+        if record is None:
+            raise UpdateError("no transaction is recorded; nothing to restore")
+        if record["phase"] in BARRIER_FREE_PHASES:
+            return None
+        barrier = read_barrier(state_dir)
+        if barrier is not None:
+            if barrier.get("transactionId") != transaction_id:
+                raise UpdateError(
+                    "an admission barrier naming %s is present; refusing to overwrite "
+                    "another transaction's barrier" % barrier.get("transactionId"))
+            return barrier
+        _write_barrier(state_dir, _record_barrier(record))
+        return _record_barrier(record)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def admission_blocker(*, state_dir, running_revision=None):
     """A refusal for this install's update state, or None when admission is open.
 
@@ -319,20 +446,30 @@ def admission_blocker(*, state_dir, running_revision=None):
     return None
 
 
-def _write_journal(state_dir, record):
-    """Write one transaction record: journal first, then the barrier it commands."""
+def _write_journal(state_dir, record, previous_phase=None):
+    """Write one transaction record in the order that keeps admission closed.
+
+    A live phase is journaled first and then commands the barrier that
+    duplicates it. The order of a barrier-free end depends on what held
+    admission closed for the phase it leaves (``_admission_held_by_journal``):
+    out of a live phase the journal alone closes admission, so the barrier is
+    unlinked first and a crash between the two leaves a live record without a
+    barrier that ``safe_update recover`` rebuilds; out of a terminal
+    ``recovery_required`` only the barrier closes admission, so the terminal
+    record is persisted first and the barrier unlinked after, and a crash
+    between the two leaves the pair ``recover`` already repairs. Both windows
+    fail closed; neither needs a hand-deleted file.
+    """
+    barrier_free = record["phase"] in BARRIER_FREE_PHASES
+    unlink_first = barrier_free and _admission_held_by_journal(previous_phase)
+    if unlink_first:
+        _remove_barrier(state_dir)
     _atomic_write(_journal_path(state_dir), json.dumps(record, indent=1).encode("utf-8"))
     os.chmod(_journal_path(state_dir), 0o600)
-    if record["phase"] in BARRIER_FREE_PHASES:
+    if not barrier_free:
+        _write_barrier(state_dir, _record_barrier(record))
+    elif not unlink_first:
         _remove_barrier(state_dir)
-    else:
-        _write_barrier(state_dir, {
-            "schema": BARRIER_SCHEMA,
-            "transactionId": record["transactionId"],
-            "phase": record["phase"],
-            "revision": record["revision"],
-            "binding": record["binding"],
-        })
 
 
 def _external_references(receipt, state_dir):
@@ -515,7 +652,7 @@ def transition_locked(transaction_id, expected_phase, next_phase, *, state_dir, 
     now = time.time()
     record["updatedAt"] = now
     record["evidence"].append({"phase": next_phase, "at": now, **evidence})
-    _write_journal(state_dir, record)
+    _write_journal(state_dir, record, expected_phase)
     return record
 
 
@@ -551,7 +688,11 @@ def clear_transaction(transaction_id, *, state_dir):
 
     Only a terminal-phase journal of this install for exactly this id is
     removed; a live transaction is refused, so an abort can never forget
-    its own proof by clearing itself early.
+    its own proof by clearing itself early. A barrier-free end also discards
+    the barrier that still named this transaction — a crash between the
+    terminal write and the unlink — and does so *before* the journal, so a
+    crash here can never strand a barrier with no record left to name it. A
+    barrier naming another transaction is never touched.
     """
     if not isinstance(transaction_id, str) or not TRANSACTION_RE.fullmatch(transaction_id):
         raise UpdateError("transactionId must name a well-formed transaction")
@@ -571,6 +712,8 @@ def clear_transaction(transaction_id, *, state_dir):
         if record["phase"] not in TERMINAL_PHASES:
             raise UpdateError("the transaction is live in %r; it can only be expunged after "
                               "a proven end" % record["phase"])
+        if record["phase"] in BARRIER_FREE_PHASES:
+            _remove_own_barrier(state_dir, transaction_id)
         os.unlink(str(_journal_path(state_dir)))
         _fsync_dir(_update_dir(state_dir))
         return record
