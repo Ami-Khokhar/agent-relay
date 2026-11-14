@@ -102,9 +102,12 @@ If the harness exposes only an API or needs structured output:
 
 Add the MCP server to the client's config and start the HTTP service alongside it (or let
 the MCP process start it on demand). The client then sees the task tools (`list_agents`,
-`delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`) and the workflow tools
+`delegate`, `wait_task`, `get_task`, `list_tasks`, `cancel_task`), the workflow tools
 (`run_workflow`, `get_workflow`, `wait_workflow_events`, `list_workflows`, `cancel_workflow`,
-`resume_workflow`) and `get_pressure`. Submission is asynchronous and no call waits by
+`resume_workflow`), `get_pressure`, `check_updates`, and `prepare_feedback`. `check_updates`
+fetches canonical release metadata only when explicitly called and returns notes as data;
+`prepare_feedback` returns a local report draft and makes no relay or network call.
+Submission is asynchronous and no call waits by
 default: read a result when you need it with `get_task` (or `list_tasks`), and block on it
 only by asking — `wait_task` with a `maxWaitMs`, or `delegate` with `waitMs`. Use a wait
 of about 110000 ms or less, and wait again while the result has `waitExpired: true`. When

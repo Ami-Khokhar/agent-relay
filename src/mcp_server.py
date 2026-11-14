@@ -18,11 +18,11 @@ import sys
 import threading
 import time
 from pathlib import Path
-from feedback import prepare_feedback
-import release_discovery
-from workflows import STEP_ID_RE
 from urllib import request as urlrequest
 from urllib.parse import quote, urlencode, urlsplit
+import release_discovery
+from feedback import prepare_feedback
+from workflows import STEP_ID_RE
 
 STATUSES = ("queued", "running", "completed", "failed", "timed_out", "cancelled")
 WORKFLOW_STATUSES = ("queued", "running", "completed", "failed", "cancelled")

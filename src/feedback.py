@@ -1,13 +1,11 @@
 """Prepare a bounded, local agent-relay issue draft for human review."""
-import argparse
-import json
 import re
-import sys
 import unicodedata
 from urllib.parse import urlencode
 
 REPOSITORY = "https://github.com/Ami-Khokhar/agent-relay/issues/new"
 LIMIT = 1000
+VERSION_LIMIT = 80
 _CATEGORIES = {"crash", "incorrect_behavior", "unavailable", "other"}
 _OPERATIONS = {"start", "delegate", "wait", "cancel", "workflow", "mcp", "other"}
 _SYSTEMS = {"Linux", "macOS", "Windows", "Other"}
@@ -19,7 +17,7 @@ _SECRET = re.compile(r"(?i)(?:\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
                      r"API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH[_-]?KEY)"
                      r"[A-Z0-9_-]*\b\s*[:=]\s*[^,;\s]+|"
                      r"gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
-                     r"sk-[A-Za-z0-9_-]{20,}|Bearer\s+\S+|xox[baprs]-[A-Za-z0-9-]{10,})")
+                     r"sk-[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._~+/=-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})")
 
 
 def _field(value, name, choices=None, required=True, limit=LIMIT):
@@ -48,7 +46,7 @@ def prepare_feedback(category, operation, system, version, blocked_action="", wo
     category = _field(category, "category", _CATEGORIES)
     operation = _field(operation, "operation", _OPERATIONS)
     system = _field(system, "system", _SYSTEMS)
-    version = _free_text(version, "version", limit=80)
+    version = _free_text(version, "version", limit=VERSION_LIMIT)
     if not version.isascii() or not _VERSION.fullmatch(version):
         raise ValueError("version must be SemVer, a 7-40 character hex revision, or unknown")
     blocked_action = _free_text(blocked_action, "blocked action")
@@ -59,30 +57,10 @@ def prepare_feedback(category, operation, system, version, blocked_action="", wo
             "\n\n## Blocked action\n" + blocked_action +
             "\n\n## Workaround used\n" + workaround +
             "\n\nReview all public contents in GitHub before clicking Submit.\n")
-    if len(body) > 4096:
-        raise ValueError("draft is too long")
+    # There is no second length bound: the per-field limits above already cap this draft, and
+    # urlencode writes each UTF-8 byte as "%XX", so one code point costs at most 12 URL
+    # characters and the largest accepted draft (both narrative fields and the version at their
+    # limits, every code point astral) yields a prefilled link of about 25 kB, which browsers
+    # and GitHub carry. A lower cap here is what made #123's two bounds contradict each other.
     form_url = REPOSITORY + "?" + urlencode({"title": title, "body": body})
-    if len(form_url) > 2000:
-        raise ValueError("description makes the prefilled URL too long; shorten it")
     return {"title": title, "body": body, "formUrl": form_url}
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Prepare a local agent-relay feedback draft; never submits it.")
-    parser.add_argument("--category", required=True)
-    parser.add_argument("--operation", required=True)
-    parser.add_argument("--system", required=True)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--blocked-action", required=True)
-    parser.add_argument("--workaround", required=True)
-    args = parser.parse_args(argv)
-    try:
-        print(json.dumps(prepare_feedback(args.category, args.operation, args.system,
-                                          args.version, args.blocked_action,
-                                          args.workaround), ensure_ascii=False))
-    except ValueError as exc:
-        parser.error(str(exc))
-
-
-if __name__ == "__main__":
-    main()
