@@ -16,7 +16,9 @@ touched.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import stat
@@ -610,6 +612,86 @@ class PostActivatedFailureTest(_RollbackCase):
         rc = self.run_recover()
         self.assertEqual(rc, 0)
         self.assertIsNone(update_transaction.read_journal(state_dir=self.state))
+
+
+class InterruptedBarrierWriteTest(_RollbackCase):
+    """A live record whose barrier write never landed is recoverable (#324).
+
+    The journal and its barrier are two writes, so a crash between a barrier
+    unlink and the terminal record (the order this PR enforces) leaves a live
+    ``restarted`` record with no barrier. Admission is closed on the record
+    alone, and the shipped ``recover`` must rebuild the barrier and finish the
+    interrupted activation instead of refusing the phase forever.
+    """
+
+    def _interrupt_at_restarted(self):
+        """The exact crash window: unlink done, terminal journal replace lost."""
+        record = update_transaction.recover_transaction(state_dir=self.state)
+        update_transaction.transition(TXN, "prepared", "draining",
+                                      state_dir=self.state, quiesced=True)
+        update_transaction.transition(TXN, "draining", "quiescent",
+                                      state_dir=self.state, service={"kind": "launchd"})
+        update_transaction.transition(TXN, "quiescent", "activating", state_dir=self.state,
+                                      oldRevision=self.fixture.old,
+                                      targetCommit=self.fixture.target)
+        update_staging.activate_transaction_source(record, git=self._git())
+        update_transaction.transition(TXN, "activating", "restarted",
+                                      state_dir=self.state, commit=self.fixture.target)
+        with patch.object(update_transaction.os, "replace", side_effect=OSError(5, "torn")):
+            with self.assertRaises(identity.UpdateError):
+                update_transaction.transition(TXN, "restarted", "activated",
+                                              state_dir=self.state)
+        record = update_transaction.read_journal(state_dir=self.state)
+        self.assertEqual(record["phase"], "restarted", "the live record survives the crash")
+        self.assertIsNone(update_transaction.read_barrier(state_dir=self.state))
+        self.assertIsNotNone(update_transaction.admission_blocker(state_dir=self.state),
+                             "a live record closes admission without any barrier")
+
+    def test_recover_rebuilds_the_barrier_and_finishes_the_interrupted_activation(self):
+        self._interrupt_at_restarted()
+        notes = []
+        real_note = update_transaction.journal_recovery_note
+
+        def note(*args, **kwargs):
+            notes.append(update_transaction.read_barrier(state_dir=self.state))
+            return real_note(*args, **kwargs)
+
+        output = io.StringIO()
+        with patch.object(update_transaction, "journal_recovery_note", side_effect=note), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(self.run_recover(), 0,
+                             "recover accepts a live record that lost its barrier")
+        self.assertConverged(restarts=0)
+        self.assertTrue(notes, "the recovery stepped through its journaled notes")
+        self.assertTrue(all(item is not None for item in notes),
+                        "the barrier is rebuilt before any recovery step assumes it")
+        self.assertIn("missing admission barrier was rebuilt", output.getvalue(),
+                      "the operator learns the barrier, not the journal, was the repair")
+
+    def test_a_prepared_record_without_its_barrier_is_ended_by_recover_abort(self):
+        """Nothing was activated, so the documented remedy must come first —
+        without needing relay credentials — and recover-abort rebuilds the
+        barrier it finds missing before its proofs."""
+        self.assertEqual(update_transaction.recover_transaction(
+            state_dir=self.state)["phase"], "prepared")
+        (self.state / "update" / "admission-barrier.json").unlink()
+        self.assertIsNotNone(update_transaction.admission_blocker(state_dir=self.state))
+        with patch.dict(os.environ, {"AGENT_RELAY_URL": "", "AGENT_RELAY_TOKEN": ""}):
+            with self.assertRaises(identity.UpdateError) as caught:
+                self.run_recover()
+        message = str(caught.exception)
+        self.assertIn("recover-abort", message,
+                      "the phase refusal precedes any relay authorization")
+        self.assertNotIn("relay token", message)
+        self.assertIsNone(update_transaction.read_barrier(state_dir=self.state),
+                          "recover touches no barrier it cannot yet prove")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(safe_update.cmd_recover_abort(
+                TXN, base_url="http://127.0.0.1-fake"), 0)
+        self.assertIn("had no admission barrier; it was rebuilt", output.getvalue())
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
+        self.assertIsNone(update_transaction.admission_blocker(state_dir=self.state))
 
 
 class TerminalDrainRecoveryTest(unittest.TestCase):

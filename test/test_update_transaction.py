@@ -211,6 +211,24 @@ class _Case(unittest.TestCase):
     def blocker(self, **kwargs):
         return update_transaction.admission_blocker(state_dir=self.state, **kwargs)
 
+    def stage_interrupted_terminal(self, phase):
+        """The crash state a terminal journal write could leave before #324.
+
+        A started transaction has its barrier; the journal is rewritten with a
+        terminal phase while that barrier survives, exactly the bytes the old
+        write order left between its journal replace and the unlink.
+        """
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        path = self.state / "update" / "transaction.json"
+        record = json.loads(path.read_text())
+        record["phase"] = phase
+        path.write_bytes(json.dumps(record, indent=1).encode("utf-8"))
+        os.chmod(str(path), 0o600)
+        self.assertEqual(update_transaction.read_barrier(state_dir=self.state)["transactionId"],
+                         TXN)
+        self.assertIsNotNone(self.blocker(),
+                             "the wedge: a finished transaction still holds admission closed")
+
 
 class TransactionJournalTest(_Case):
     """begin/transition: the private atomic journal and its phase compare-and-swap."""
@@ -290,6 +308,157 @@ class TransactionJournalTest(_Case):
         with self.assertRaises(identity.UpdateError):
             update_transaction.clear_transaction(TXN, state_dir=self.state)
         self.assertIsNotNone(update_transaction.recover_transaction(state_dir=self.state))
+
+    def test_the_barrier_is_gone_before_the_terminal_journal_is_persisted(self):
+        """Guard (#324): the reverse order leaves a terminal journal plus a
+        barrier, which refuses every admission with no shipped command to fix
+        it, so the unlink must happen first — crash-safe because a live phase
+        without a barrier still refuses admission and stays recoverable."""
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        seen = []
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if Path(dst).name == update_transaction.JOURNAL_NAME:
+                seen.append(update_transaction.read_barrier(state_dir=self.state))
+            return real_replace(src, dst)
+
+        with patch.object(update_transaction.os, "replace", side_effect=replace):
+            update_transaction.transition(TXN, "prepared", "rolled_back",
+                                          state_dir=self.state,
+                                          reason="operator recover-abort")
+        self.assertEqual(seen, [None],
+                         "no barrier survives the instant the terminal record lands")
+        self.assertIsNone(self.blocker())
+
+    def test_a_crash_between_the_unlink_and_the_terminal_write_fails_closed(self):
+        """Guard (#324): the inverted order's own crash window must be the safe
+        one — a still-live phase without a barrier keeps admission closed and
+        is recoverable through the shipped commands."""
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        with patch.object(update_transaction.os, "replace", side_effect=OSError(5, "torn")):
+            with self.assertRaises(identity.UpdateError):
+                update_transaction.transition(TXN, "prepared", "rolled_back",
+                                              state_dir=self.state,
+                                              reason="operator recover-abort")
+        self.assertEqual(update_transaction.recover_transaction(state_dir=self.state)["phase"],
+                         "prepared", "the live record survives, nothing is torn")
+        self.assertIsNone(update_transaction.read_barrier(state_dir=self.state))
+        refused = self.blocker()
+        self.assertIsNotNone(refused, "a live phase refuses admission on the journal alone")
+        self.assertIn("live", refused["reason"])
+
+    def test_the_finalize_of_a_barrier_held_end_writes_the_journal_first(self):
+        """Guard (#324 review): `recovery_required` is held closed by its
+        barrier, not by its record, so `rolled_back` must land before the
+        unlink — the reverse would open admission for a failed activation."""
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        update_transaction.transition(TXN, "prepared", "recovery_required",
+                                      state_dir=self.state, reason="simulated interruption")
+        seen = []
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if Path(dst).name == update_transaction.JOURNAL_NAME:
+                seen.append(update_transaction.read_barrier(state_dir=self.state))
+            return real_replace(src, dst)
+
+        with patch.object(update_transaction.os, "replace", side_effect=replace):
+            update_transaction.transition(TXN, "recovery_required", "rolled_back",
+                                          state_dir=self.state, reason="recovered")
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0],
+                             "the barrier still holds admission closed when the terminal "
+                             "record lands")
+        self.assertIsNone(update_transaction.read_barrier(state_dir=self.state))
+
+    def test_a_crash_before_the_finalize_journal_keeps_admission_closed(self):
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        update_transaction.transition(TXN, "prepared", "recovery_required",
+                                      state_dir=self.state, reason="simulated interruption")
+        with patch.object(update_transaction.os, "replace", side_effect=OSError(5, "torn")):
+            with self.assertRaises(identity.UpdateError):
+                update_transaction.transition(TXN, "recovery_required", "rolled_back",
+                                              state_dir=self.state, reason="recovered")
+        self.assertEqual(update_transaction.recover_transaction(state_dir=self.state)["phase"],
+                         "recovery_required", "nothing but the barrier moved")
+        self.assertIsNotNone(update_transaction.read_barrier(state_dir=self.state))
+        self.assertIsNotNone(self.blocker(),
+                             "a failed activation without a barrier would be admitted")
+
+    def test_a_crash_before_the_finalize_unlink_keeps_admission_closed(self):
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        update_transaction.transition(TXN, "prepared", "recovery_required",
+                                      state_dir=self.state, reason="simulated interruption")
+        with patch.object(update_transaction, "_remove_barrier",
+                          side_effect=identity.UpdateError("simulated crash")):
+            with self.assertRaises(identity.UpdateError):
+                update_transaction.transition(TXN, "recovery_required", "rolled_back",
+                                              state_dir=self.state, reason="recovered")
+        self.assertEqual(update_transaction.recover_transaction(state_dir=self.state)["phase"],
+                         "rolled_back", "the terminal record landed before its unlink")
+        self.assertIsNotNone(update_transaction.read_barrier(state_dir=self.state))
+        self.assertIsNotNone(self.blocker(),
+                             "the finished record plus its barrier stays repaired by recover")
+
+    def test_restore_barrier_refuses_another_transactions_barrier(self):
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        barrier_path = self.state / "update" / update_transaction.BARRIER_NAME
+        other = json.loads(barrier_path.read_text())
+        other["transactionId"] = "txn-other"
+        barrier_path.write_text(json.dumps(other))
+        os.chmod(str(barrier_path), 0o600)
+        with self.assertRaises(identity.UpdateError) as caught:
+            update_transaction.restore_barrier(TXN, state_dir=self.state)
+        self.assertIn("refusing to overwrite another transaction's barrier",
+                      str(caught.exception))
+        self.assertEqual(update_transaction.read_barrier(state_dir=self.state)["transactionId"],
+                         "txn-other", "a fail-closed signal is never overwritten")
+
+    def test_clear_expunges_a_terminal_record_with_its_leftover_barrier(self):
+        """Guard (#324): a crash between the terminal write and the unlink left
+        the barrier behind; clearing the record it named must open admission."""
+        self.stage_interrupted_terminal("rolled_back")
+        cleared = update_transaction.clear_transaction(TXN, state_dir=self.state)
+        self.assertEqual(cleared["phase"], "rolled_back")
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
+        self.assertIsNone(update_transaction.read_barrier(state_dir=self.state),
+                          "the expunged record's own barrier is removed with it")
+        self.assertIsNone(self.blocker(), "admission is open again")
+
+    def test_clear_barrier_refuses_a_live_record_and_another_transactions_id(self):
+        """Guard (#324): the repair lock re-proves the record, so it can never
+        open admission for a live transaction, and an id that is not the
+        recorded one touches neither the record nor its barrier."""
+        update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
+        with self.assertRaises(identity.UpdateError) as caught:
+            update_transaction.clear_barrier(TXN, state_dir=self.state)
+        self.assertIn("only a barrier-free end", str(caught.exception))
+        self.assertEqual(update_transaction.read_barrier(state_dir=self.state)["transactionId"],
+                         TXN, "a live transaction keeps its own barrier")
+        with self.assertRaises(identity.UpdateError) as caught:
+            update_transaction.clear_barrier("txn-other", state_dir=self.state)
+        self.assertIn("the transaction journal is for %s, not txn-other" % TXN,
+                      str(caught.exception))
+        self.assertEqual(update_transaction.read_barrier(state_dir=self.state)["transactionId"],
+                         TXN, "another id touches neither the record nor its barrier")
+
+    def test_clear_never_removes_another_transactions_barrier(self):
+        """Guard (#324): only the barrier naming the expunged transaction is
+        this record's leftover; another transaction's is a fail-closed refusal."""
+        self.stage_interrupted_terminal("rolled_back")
+        barrier_path = self.state / "update" / update_transaction.BARRIER_NAME
+        other = json.loads(barrier_path.read_text())
+        other["transactionId"] = "txn-other"
+        barrier_path.write_text(json.dumps(other))
+        os.chmod(str(barrier_path), 0o600)
+        self.assertIsNotNone(update_transaction.clear_transaction(TXN, state_dir=self.state))
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
+        kept = update_transaction.read_barrier(state_dir=self.state)
+        self.assertEqual(kept["transactionId"], "txn-other",
+                         "another transaction's barrier is left exactly in place")
+        self.assertIsNotNone(self.blocker(),
+                             "and it still holds admission closed, never silently ignored")
 
 
 class IncompleteJournalReaderTest(_Case):
@@ -465,6 +634,79 @@ class RelayBarrierTest(_Case):
         relay = self._relay()
         status, body = relay.submit(agentId="worker", input="hello")
         self.assertEqual((status, body.get("error")), (503, "update_barrier_active"))
+
+    def test_the_e2e_recover_repairs_a_terminal_record_and_its_barrier(self):
+        """Guard (#324): a crash between the terminal journal write and the
+        unlink used to turn the relay into a 503 machine that no command could
+        fix. The shipped `recover` must remove this finished transaction's own
+        leftover barrier and reopen admission on the running relay."""
+        self.stage_interrupted_terminal("activated")
+        relay = self._relay()
+        status, body = relay.submit(agentId="worker", input="hello")
+        self.assertEqual((status, body.get("error")), (503, "update_barrier_active"))
+        with _join([patch.object(update_drain, "relay_token", lambda: TOKEN),
+                    patch.object(safe_update, "_state_dir", lambda: self.state)]):
+            self.assertEqual(safe_update.cmd_recover(TXN, base_url=relay.base), 0,
+                             "recover succeeds on a terminal record with a stale barrier")
+        self.assertIsNone(update_transaction.read_barrier(state_dir=self.state))
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
+        status, body = relay.submit(agentId="worker", input="hello")
+        self.assertEqual(status, 202,
+                         "the repaired relay admits work again, no hand-deleted file")
+
+    def test_recover_never_removes_a_barrier_that_names_another_transaction(self):
+        """Guard (#324): the repair is the finished transaction's own unlink,
+        never a licence to discard another transaction's barrier — the refusal
+        names it and the record is kept."""
+        self.stage_interrupted_terminal("activated")
+        barrier_path = self.state / "update" / update_transaction.BARRIER_NAME
+        other = json.loads(barrier_path.read_text())
+        other["transactionId"] = "txn-other"
+        barrier_path.write_text(json.dumps(other))
+        os.chmod(str(barrier_path), 0o600)
+        relay = self._relay()
+        with _join([patch.object(update_drain, "relay_token", lambda: TOKEN),
+                    patch.object(safe_update, "_state_dir", lambda: self.state)]):
+            with self.assertRaises(identity.UpdateError) as caught:
+                safe_update.cmd_recover(TXN, base_url=relay.base)
+        self.assertIn("no admission barrier of %s is present to remove" % TXN,
+                      str(caught.exception),
+                      "the refusal names the barrier that is not this transaction's to remove")
+        self.assertEqual(update_transaction.read_barrier(state_dir=self.state)["transactionId"],
+                         "txn-other", "another transaction's barrier is never removed")
+        self.assertEqual(update_transaction.recover_transaction(state_dir=self.state)["phase"],
+                         "activated", "the durable record is kept for an explicit retry")
+
+    def test_cli_recover_abort_rebuilds_a_missing_barrier_and_reopens_admission(self):
+        """Guard (#324): a prepared record whose barrier write never landed is
+        accepted by the shipped abort — it rebuilds the barrier, names it, and
+        reopens admission instead of stranding a live record nobody may end."""
+        probe = self._relay()
+        revision = update_drain._server_revision(probe.base)
+        probe.close()
+        update_transaction.begin_transaction(
+            self.fixture.begin_receipt(drain={"revision": revision,
+                                              "capability": "c" * 64}),
+            state_dir=self.state)
+        (self.state / "update" / update_transaction.BARRIER_NAME).unlink()
+        self.assertIsNotNone(self.blocker(),
+                             "a live record refuses admission without a barrier")
+        relay = self._relay()
+        output = io.StringIO()
+        with _join([patch.object(update_drain, "relay_token", lambda: TOKEN),
+                    patch.object(safe_update, "_state_dir", lambda: self.state)]), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(safe_update.cmd_recover_abort(TXN, base_url=relay.base), 0,
+                             "recover-abort accepts a record whose barrier is missing")
+        self.assertIn("had no admission barrier; it was rebuilt", output.getvalue(),
+                      "the repair is named, not silent")
+        self.assertIsNone(update_transaction.read_barrier(state_dir=self.state))
+        self.assertIsNone(update_transaction.recover_transaction(state_dir=self.state))
+        self.assertIsNone(self.blocker())
+        relay.close()
+        relay = self._relay()
+        status, body = relay.submit(agentId="worker", input="hello")
+        self.assertEqual(status, 202, "the aborted transaction reopens ordinary admission")
 
     def test_a_malformed_live_journal_fails_closed_even_without_a_barrier(self):
         update_transaction.begin_transaction(self.fixture.begin_receipt(), state_dir=self.state)
