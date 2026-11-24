@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pressure
 import update_transaction
+from teams import TeamError
 from workflows import STEP_ID_RE, WORKFLOW_STATUSES, WorkflowEngine
 
 # The exact starting revision a drain acquire must name, so an updater that
@@ -221,6 +222,10 @@ TASKS = {}
 REQUEST_IDS = {}
 QUEUE = []
 ACTIVE = 0
+# Team credentials are deliberately process-local capabilities. A restart invalidates them;
+# the owner can mint a replacement for one participant without exposing the owner token.
+TEAM_CREDENTIALS = {}
+TEAM_STORE = None
 # The held shared lock during a safe update: None when no drain is held, else a
 # dict bound to one transaction, one exact starting revision and one opaque
 # capability. Guarded by LOCK, so admission and drain decisions share it.
@@ -2354,6 +2359,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(value).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        self.send_header("cache-control", "no-store")
         if status >= 400:
             # An error may leave the request body unread; never parse it as a next request.
             self.close_connection = True
@@ -2390,11 +2396,20 @@ class Handler(BaseHTTPRequestHandler):
                 # The body is left unread, so drop the connection rather than parse it as a request.
                 self.close_connection = True
                 return self._json(403, {"error": "origin_not_allowed"})
-            if path.startswith("/v1/") and not self._authorized():
+            if path == "/board" or path.startswith("/board/"):
+                if method == "GET":
+                    return self._board_file(path)
+                return self._json(405, {"error": "method_not_allowed"})
+            principal = self._team_principal()
+            owner = self._authorized()
+            team_path = path == "/v1/teams" or path.startswith("/v1/teams/")
+            if path.startswith("/v1/") and not owner and principal is None:
                 self.close_connection = True
                 return self._json(401, {"error": "unauthorized",
                                         "message": unauthorized_message()},
                                   headers={"www-authenticate": "Bearer"})
+            if path.startswith("/v1/") and not owner and (not team_path or principal is None):
+                return self._json(403, {"error": "forbidden"})
             if path.startswith("/v1/"):
                 with LOCK:
                     _purge_expired()
@@ -2410,6 +2425,8 @@ class Handler(BaseHTTPRequestHandler):
                                             "revision": REVISION,
                                             "update": update_status(CHECKOUT_ROOT)})
                 return self._json(405, {"error": "method_not_allowed"})
+            if team_path:
+                return self._team_route(method, path, principal, owner)
             if path == "/v1/agents":
                 if method == "GET":
                     # Re-read the query with blank values kept, so "?tag=" names a tag no
@@ -2526,6 +2543,172 @@ class Handler(BaseHTTPRequestHandler):
         scheme, _, supplied = header.partition(" ")
         return scheme.lower() == "bearer" and hmac.compare_digest(
             supplied.strip().encode("utf-8"), TOKEN.encode("utf-8"))
+
+    def _team_principal(self):
+        header = self.headers.get("authorization") or ""
+        scheme, _, supplied = header.partition(" ")
+        if scheme.lower() != "bearer" or not supplied.strip():
+            return None
+        key = hashlib.sha256(supplied.strip().encode("utf-8")).hexdigest()
+        return TEAM_CREDENTIALS.get(key)
+
+    def _team_store(self):
+        global TEAM_STORE
+        with LOCK:
+            if TEAM_STORE is None:
+                from teams import TeamStore
+                STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+                TEAM_STORE = TeamStore(STATE_DIR / "teams.sqlite3")
+            return TEAM_STORE
+
+    def _board_file(self, path):
+        if path == "/board":
+            self.send_response(301)
+            self.send_header("location", "/board/")
+            self.send_header("cache-control", "no-store")
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        names = {"/board": "index.html", "/board/": "index.html",
+                 "/board/index.html": "index.html", "/board/board.css": "board.css",
+                 "/board/board.js": "board.js"}
+        name = names.get(path)
+        if name is None:
+            return self._json(404, {"error": "not_found"})
+        target = Path(__file__).resolve().parent / "team_board" / name
+        try:
+            body = target.read_bytes()
+        except FileNotFoundError:
+            return self._json(404, {"error": "not_found"})
+        content_type = "text/html; charset=utf-8" if name.endswith(".html") else (
+            "text/css; charset=utf-8" if name.endswith(".css") else "text/javascript; charset=utf-8")
+        self.send_response(200)
+        self.send_header("content-type", content_type)
+        self.send_header("cache-control", "no-store")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _team_route(self, method, path, principal, owner):
+        store = self._team_store()
+        if path == "/v1/teams":
+            if method == "GET":
+                if not owner:
+                    return self._json(403, {"error": "forbidden"})
+                return self._json(200, {"teams": store.list_runs()})
+            if method != "POST":
+                return self._json(405, {"error": "method_not_allowed"})
+            if not owner:
+                return self._json(403, {"error": "forbidden"})
+            error, body = self._read_json_body()
+            if error:
+                return self._json(error, body)
+            participants = body.get("participants")
+            if not isinstance(body.get("objective"), str) or not body["objective"].strip() or not isinstance(participants, list):
+                return self._json(400, {"error": "invalid_request", "message": "objective and participants are required"})
+            normalized = []
+            seen = set()
+            for item in participants:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    return self._json(400, {"error": "invalid_participant"})
+                agent_id = item.get("agentId", item["id"])
+                if not isinstance(agent_id, str):
+                    return self._json(400, {"error": "invalid_participant"})
+                if agent_id not in AGENTS:
+                    return self._json(400, {"error": "unknown_agent", "agentId": agent_id})
+                participant_id = item["id"]
+                if participant_id == "lead" or participant_id in seen:
+                    return self._json(400, {"error": "duplicate_participant", "participantId": participant_id})
+                seen.add(participant_id)
+                agent = AGENTS[agent_id]
+                normalized.append({"id": participant_id, "agentId": agent_id,
+                                   "role": item.get("role", "worker"),
+                                   "harness": agent.get("type"), "model": agent.get("model")})
+            try:
+                run = store.create_run(body["objective"], "lead", normalized, body.get("limits"))
+                return self._json(201, {"team": run})
+            except TeamError as error:
+                return self._team_error(error)
+        match = re.fullmatch(r"/v1/teams/([^/]+)(?:/([a-z]+))?", path)
+        if not match:
+            return self._json(404, {"error": "not_found"})
+        run_id, action = match.groups()
+        try:
+            run = store.get_run(run_id)
+        except TeamError as error:
+            return self._team_error(error)
+        if not owner and (principal is None or principal[0] != run_id):
+            return self._json(403, {"error": "forbidden"})
+        if action is None:
+            if method != "GET":
+                return self._json(405, {"error": "method_not_allowed"})
+            return self._json(200, {"team": run})
+        if action == "credentials":
+            if method != "POST":
+                return self._json(405, {"error": "method_not_allowed"})
+            if not owner:
+                return self._json(403, {"error": "forbidden"})
+            error, body = self._read_json_body()
+            if error:
+                return self._json(error, body)
+            participant_id = body.get("participantId")
+            if not isinstance(participant_id, str) or participant_id not in {p["id"] for p in run["participants"]}:
+                return self._json(400, {"error": "invalid_participant"})
+            if participant_id == run["lead"]:
+                return self._json(400, {"error": "invalid_participant"})
+            token = secrets.token_urlsafe(32)
+            TEAM_CREDENTIALS[hashlib.sha256(token.encode("utf-8")).hexdigest()] = (run_id, participant_id)
+            return self._json(201, {"participantId": participant_id, "token": token})
+        if action in ("assignments", "phase", "close") and not owner:
+            return self._json(403, {"error": "forbidden"})
+        if method != "POST":
+            return self._json(405, {"error": "method_not_allowed"})
+        error, body = self._read_json_body()
+        if error:
+            return self._json(error, body)
+        actor = "lead" if owner else principal[1]
+        try:
+            if action == "assignments":
+                participant_id = body.get("participantId")
+                if (not isinstance(participant_id, str)
+                        or participant_id not in {p["id"] for p in run["participants"]}
+                        or not isinstance(body.get("assignment"), str)
+                        or not isinstance(body.get("dependencies", []), list)
+                        or any(not isinstance(value, str) for value in body.get("dependencies", []))):
+                    return self._json(400, {"error": "invalid_request"})
+                store.assign(run_id, actor, participant_id, body["assignment"], body.get("dependencies"))
+            elif action == "messages":
+                optional_text = (body.get("threadId"), body.get("assignmentId"))
+                if (not isinstance(body.get("recipientId"), str) or not isinstance(body.get("body"), str)
+                        or any(value is not None and not isinstance(value, str) for value in optional_text)):
+                    return self._json(400, {"error": "invalid_request"})
+                store.post_message(run_id, actor, body.get("recipientId"), body.get("body"),
+                                   body.get("threadId"), body.get("assignmentId"), body.get("kind", "message"))
+            elif action == "conclusions":
+                if (any(not isinstance(body.get(key), str) for key in ("threadId", "summary", "rationale"))
+                        or (body.get("action") is not None and not isinstance(body.get("action"), str))
+                        or not isinstance(body.get("needsLead", False), bool)):
+                    return self._json(400, {"error": "invalid_request"})
+                store.conclude(run_id, actor, body.get("threadId"), body.get("summary"),
+                               body.get("rationale"), body.get("action"), body.get("needsLead", False))
+            elif action == "phase":
+                if (not isinstance(body.get("phase"), str)
+                        or (body.get("spec") is not None and not isinstance(body.get("spec"), str))
+                        or not isinstance(body.get("approved", False), bool)):
+                    return self._json(400, {"error": "invalid_request"})
+                store.set_phase(run_id, actor, body.get("phase"), body.get("spec"), body.get("approved", False))
+            elif action == "close":
+                if body.get("summary") is not None and not isinstance(body.get("summary"), str):
+                    return self._json(400, {"error": "invalid_request"})
+                store.close_run(run_id, actor, body.get("summary"))
+            else:
+                return self._json(404, {"error": "not_found"})
+            return self._json(200, {"ok": True, "team": store.get_run(run_id)})
+        except TeamError as error:
+            return self._team_error(error)
+
+    def _team_error(self, error):
+        return self._json(error.status, {"error": error.code, "message": error.message})
 
     def _submit(self):
         error, payload = self._read_json_body()
