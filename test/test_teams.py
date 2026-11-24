@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import os
 import tempfile
@@ -124,3 +125,74 @@ class TeamTests(unittest.TestCase):
     with self.assertRaises(TeamError) as err:
         store.assign(rid, "lead", "worker-a", "A revised", [second])
     self.assertEqual(err.exception.code, "invalid_dependencies")
+
+ def test_message_budget_is_enforced_and_assignment_count_is_not_execution_concurrency(self):
+    store = TeamStore(self.path())
+    rid = store.create_run("goal", "lead", [{"id": "a"}, {"id": "b"}],
+                           {"max_messages": 1, "max_concurrency": 1})["id"]
+    store.assign(rid, "lead", "a", "A")
+    store.assign(rid, "lead", "b", "B")
+    store.post_message(rid, "lead", "a", "One message")
+    with self.assertRaises(TeamError) as err:
+        store.post_message(rid, "lead", "b", "Over budget")
+    self.assertEqual(err.exception.code, "message_limit")
+
+ def test_recipient_delivery_ack_is_durable_and_does_not_create_an_answer(self):
+    path = self.path()
+    store, rid = team(path)
+    event_id = store.post_message(rid, "lead", "worker-a", "Please inspect", kind="request")
+    self.assertEqual([e["id"] for e in store.list_inbox(rid, "worker-a", unread_only=True)], [event_id])
+    acknowledged = store.acknowledge_delivery(rid, "worker-a", event_id)
+    reopened = TeamStore(path)
+    self.assertEqual(reopened.list_inbox(rid, "worker-a", unread_only=True), [])
+    self.assertEqual(reopened.list_inbox(rid, "worker-a")[0]["acknowledged"], acknowledged)
+    self.assertEqual(len(reopened.get_run(rid)["events"]), 2)
+
+ def test_main_view_exposes_lead_questions_only_until_answered(self):
+    store, rid = team(self.path())
+    aid = store.assign(rid, "lead", "worker-a", "Review API")
+    store.set_lead_summary(rid, "lead", "Prototype is ready")
+    store.post_message(rid, "worker-a", "lead", "Should we keep the API?", assignment_id=aid, kind="question")
+    user_question = store.ask_user_question(rid, "lead", "Keep the current API shape?")
+    artifact = store.add_artifact(rid, "lead", "prototype", "Preview", "file:///preview")
+    view = store.main_view(rid)
+    self.assertEqual(view["summary"]["text"], "Prototype is ready")
+    self.assertEqual([q["body"] for q in view["questions"]], ["Keep the current API shape?"])
+    self.assertTrue(view["questions"][0]["pending"])
+    self.assertEqual(view["artifacts"][0]["id"], artifact["id"])
+    self.assertIn("worker-a", view["inbox"])
+    store.resolve_user_question(rid, "lead", user_question, "Keep it")
+    self.assertEqual(store.main_view(rid)["questions"], [])
+
+ def test_delivery_acknowledgment_cannot_cross_run_boundary(self):
+    store, first = team(self.path())
+    event_id = store.post_message(first, "lead", "worker-a", "For first run")
+    second = store.create_run("other", "lead", [{"id": "worker-a"}])["id"]
+    with self.assertRaises(TeamError) as err:
+        store.acknowledge_delivery(second, "worker-a", event_id)
+    self.assertEqual(err.exception.code, "delivery_not_found")
+
+ def test_schema_upgrade_preserves_existing_run_and_assignment_records(self):
+    path = self.path()
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE runs(id TEXT PRIMARY KEY, objective TEXT NOT NULL, lead TEXT NOT NULL, phase TEXT NOT NULL,
+            spec TEXT, approved INTEGER NOT NULL, closed INTEGER NOT NULL, limits TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
+        CREATE TABLE participants(run_id TEXT NOT NULL, id TEXT NOT NULL, role TEXT NOT NULL, harness TEXT, model TEXT, PRIMARY KEY(run_id,id));
+        CREATE TABLE assignments(id TEXT PRIMARY KEY, run_id TEXT NOT NULL, participant_id TEXT NOT NULL, text TEXT NOT NULL, dependencies TEXT NOT NULL, updated REAL NOT NULL);
+        CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, run_id TEXT NOT NULL,
+            kind TEXT NOT NULL, actor TEXT NOT NULL, recipient TEXT, thread_id TEXT, assignment_id TEXT, body TEXT NOT NULL, created REAL NOT NULL);
+        INSERT INTO runs VALUES('legacy-run','old goal','lead','exploration',NULL,0,0,'{}',1,1);
+        INSERT INTO participants VALUES('legacy-run','lead','lead',NULL,NULL);
+        INSERT INTO participants VALUES('legacy-run','worker','worker',NULL,NULL);
+        INSERT INTO assignments VALUES('legacy-assignment','legacy-run','worker','keep this','[]',2);
+        INSERT INTO events(id,run_id,kind,actor,recipient,body,created) VALUES('legacy-event','legacy-run','request','lead','worker','still here',3);
+    """)
+    db.commit()
+    db.close()
+    store = TeamStore(path)
+    run = store.get_run("legacy-run")
+    self.assertEqual(run["assignments"][0]["text"], "keep this")
+    self.assertEqual(run["assignments"][0]["revision"], 1)
+    self.assertEqual(run["events"][0]["id"], "legacy-event")
+    self.assertEqual(store.list_inbox("legacy-run", "worker")[0]["id"], "legacy-event")
