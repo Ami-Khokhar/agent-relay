@@ -151,6 +151,31 @@ class TeamExecutionTests(unittest.TestCase):
         self.assertEqual(err.exception.code, "stale_spec")
         self.assertEqual(self.boundary.requests, [])
 
+    def test_large_history_is_bounded_for_recovery_and_replacement_dispatch(self):
+        for index in range(35):
+            self.store.post_message(self.run_id, "lead", "worker", f"Message {index}: " + "m" * 3000,
+                                    assignment_id=self.first)
+        for index in range(3):
+            prior = self.executor.dispatch(self.run_id, self.first, f"history-{index}")
+            self.boundary.tasks[prior["task_id"]].update(status="completed", output=f"Result {index}: " + "r" * 12000)
+            self.executor.refresh(self.run_id, prior["id"])
+        lost = self.executor.dispatch(self.run_id, self.first, "history-lost")
+        self.boundary.tasks.pop(lost["task_id"])
+        interrupted = self.executor.recover(self.run_id)[-1]
+        result = interrupted["result"]
+        self.assertLessEqual(len(json.dumps(result, ensure_ascii=False).encode("utf-8")), 32768)
+        context = result["replacement_context"]
+        self.assertGreater(context["omitted_older_events"], 0)
+        self.assertIn("Improve the product", context["objective"])
+        replacement = self.executor.dispatch(self.run_id, self.first, "history-replacement")
+        prompt = self.boundary.requests[-1]["input"]
+        self.assertEqual(replacement["status"], "queued")
+        self.assertLessEqual(len(prompt.encode("utf-8")), 256 * 1024)
+        self.assertIn("older events omitted:", prompt)
+        self.assertIn("retrieve the complete agreed", prompt)
+        self.assertIn("AGENT_RELAY_TEAM_ID", prompt)
+        self.assertIn('"native_session_resumed": false', prompt)
+
     def test_completed_task_eviction_does_not_rewrite_terminal_attempt(self):
         attempt = self.executor.dispatch(self.run_id, self.first, "request-1")
         self.boundary.tasks[attempt["task_id"]].update(status="completed", output="Done")

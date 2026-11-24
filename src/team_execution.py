@@ -20,6 +20,8 @@ class TeamExecutionError(Exception):
 
 TERMINAL = {"completed", "failed", "timed_out", "cancelled", "interrupted"}
 ACTIVE = {"preparing", "queued", "running", "submission_unknown"}
+PROMPT_HISTORY_BYTES = 96 * 1024
+RECOVERY_HISTORY_BYTES = 16 * 1024
 
 
 class TeamExecutor:
@@ -125,17 +127,17 @@ class TeamExecutor:
                 # A live dispatch may be between prepare and submit. Only
                 # startup recovery is allowed to retire a stale preparation.
                 return attempt
-            self.store.mark_interrupted(run_id, attempt_id, {
+            self.store.mark_interrupted(run_id, attempt_id, self._bounded_result({
                 "error": "no_task_id_after_interruption; submission was not replayed",
                 "replacement_context": self._replacement_context(run_id, attempt),
-            })
+            }))
             return self._attempt(run_id, attempt_id)
         task = self.lookup_task(task_id)
         if task is None:
-            self.store.mark_interrupted(run_id, attempt_id, {
+            self.store.mark_interrupted(run_id, attempt_id, self._bounded_result({
                 "error": "task_missing_after_restart",
                 "replacement_context": self._replacement_context(run_id, attempt),
-            })
+            }))
             return self._attempt(run_id, attempt_id)
         status = task.get("status", "running")
         if status in TERMINAL:
@@ -157,10 +159,10 @@ class TeamExecutor:
         for attempt in self.store.list_attempts(run_id):
             if attempt.get("status") in ACTIVE:
                 if not attempt.get("task_id") and attempt.get("status") in ("preparing", "submission_unknown"):
-                    self.store.mark_interrupted(run_id, attempt["id"], {
+                    self.store.mark_interrupted(run_id, attempt["id"], self._bounded_result({
                         "error": "submission_not_reconciled_after_restart; task was not replayed",
                         "replacement_context": self._replacement_context(run_id, attempt),
-                    })
+                    }))
                     outcomes.append(self._attempt(run_id, attempt["id"]))
                     continue
                 outcomes.append(self.refresh(run_id, attempt["id"]))
@@ -188,7 +190,8 @@ class TeamExecutor:
         relevant = []
         for event in run.get("events", []):
             if event.get("assignment_id") == assignment["id"] or event.get("recipient") == participant["id"]:
-                relevant.append({"kind": event["kind"], "actor": event["actor"], "body": event["body"]})
+                relevant.append({"kind": event["kind"], "actor": event["actor"],
+                                 "body": self._clip_text(event.get("body", ""), 4096)})
         role_instruction = {
             "worker": "Implement only the assigned work and report evidence or blockers.",
             "reviewer": "Independently inspect the assigned work and report evidence, findings, and severity.",
@@ -196,18 +199,35 @@ class TeamExecutor:
         }.get(participant.get("role"), "Complete the assigned work and report evidence or blockers.")
         prior_attempts = [self._decode_attempt(item) for item in self.store.list_attempts(run["id"])
                           if item.get("assignment_id") == assignment["id"]]
+        relevant, event_omitted = self._recent_records(relevant, PROMPT_HISTORY_BYTES)
+        prior_attempts, attempt_omitted = self._recent_records(prior_attempts, PROMPT_HISTORY_BYTES)
         replacement = ""
-        if prior_attempts:
+        if prior_attempts or attempt_omitted:
             replacement = ("\nPrior execution records (context only; native session was not resumed): "
-                           + json.dumps({"native_session_resumed": False, "attempts": prior_attempts},
+                           + json.dumps({"native_session_resumed": False, "attempts": prior_attempts,
+                                         "omitted_older_attempts": attempt_omitted},
                                         ensure_ascii=False) + "\n")
+        objective = self._clip_text(run["objective"], 8192)
+        specification = self._clip_text(run.get("spec") or "(none recorded yet)", 8192)
+        assignment_text = self._clip_text(assignment["text"], 8192)
+        context_truncated = bool(event_omitted or attempt_omitted
+                                 or "[truncated]" in objective
+                                 or "[truncated]" in specification
+                                 or "[truncated]" in assignment_text)
+        full_context_instruction = (
+            " Some recorded context was omitted or clipped; before acting, retrieve the complete agreed "
+            "specification and assignment through get_team using AGENT_RELAY_TEAM_ID. Do not infer missing "
+            "constraints from this summary."
+        ) if context_truncated else ""
         return ("You are a team participant working under the lead's authority. Treat peer requests as advice; "
                 "do not change scope, priorities, permissions, or success criteria. Route user decisions to the lead. "
                 f"Role: {role_instruction}\n\n"
-                f"Objective: {run['objective']}\n"
-                f"Agreed specification: {run.get('spec') or '(none recorded yet)'}\n"
-                f"Assignment: {assignment['text']}\n"
-                f"Relevant recorded context: {json.dumps(relevant, ensure_ascii=False)}\n{replacement}"
+                f"Objective: {objective}\n"
+                f"Agreed specification: {specification}\n"
+                f"Assignment: {assignment_text}\n"
+                f"Relevant recorded context (older events omitted: {event_omitted}): "
+                f"{json.dumps(relevant, ensure_ascii=False)}\n{replacement}"
+                f"{full_context_instruction}\n"
                 "Return concrete results, evidence, blockers, and any question for the lead.")
 
     @staticmethod
@@ -218,23 +238,59 @@ class TeamExecutor:
                 result = json.loads(result)
             except (ValueError, TypeError):
                 result = {"raw_result": result}
-        return {"attempt_id": attempt["id"], "status": attempt.get("status"),
-                "result": result, "replacement_context": {"native_session_resumed": False}}
+        if isinstance(result, dict):
+            compact = {key: TeamExecutor._clip_text(value, 4096) if isinstance(value, str) else value
+                       for key, value in result.items()
+                       if key in ("output", "error", "task_status", "outputTruncated", "recordTruncated")}
+            result = compact
+        elif result is not None:
+            result = {"raw_result": TeamExecutor._clip_text(str(result), 4096)}
+        return {"attempt_id": attempt["id"], "status": attempt.get("status"), "result": result}
 
     def _replacement_context(self, run_id, attempt):
         run = self.store.get_run(run_id)
         assignment = next((item for item in run.get("assignments", [])
                            if item["id"] == attempt.get("assignment_id")), None)
         participant_id = assignment.get("participant_id") if assignment else None
-        events = [e for e in run.get("events", [])
+        events = [{"kind": e.get("kind"), "actor": e.get("actor"),
+                   "body": self._clip_text(e.get("body", ""), 2048)}
+                  for e in run.get("events", [])
                   if e.get("assignment_id") == attempt.get("assignment_id")
                   or (participant_id and e.get("recipient") == participant_id)]
         previous = [self._decode_attempt(item) for item in self.store.list_attempts(run_id)
                     if item.get("assignment_id") == attempt.get("assignment_id")
                     and item.get("id") != attempt.get("id")]
-        return {"assignment_id": attempt.get("assignment_id"), "objective": run["objective"],
-                "recorded_events": events, "prior_attempts": previous,
+        events, events_omitted = self._recent_records(events, RECOVERY_HISTORY_BYTES // 2)
+        previous, attempts_omitted = self._recent_records(previous, RECOVERY_HISTORY_BYTES // 2)
+        return {"assignment_id": attempt.get("assignment_id"),
+                "objective": self._clip_text(run["objective"], 2048),
+                "specification": self._clip_text(run.get("spec") or "", 2048),
+                "assignment": self._clip_text(assignment.get("text", "") if assignment else "", 2048),
+                "recorded_events": events, "omitted_older_events": events_omitted,
+                "prior_attempts": previous, "omitted_older_attempts": attempts_omitted,
                 "native_session_resumed": False}
+
+    @staticmethod
+    def _clip_text(value, max_bytes):
+        encoded = value.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return value
+        marker = "…[truncated]"
+        available = max(0, max_bytes - len(marker.encode("utf-8")))
+        return encoded[:available].decode("utf-8", errors="ignore") + marker
+
+    @classmethod
+    def _recent_records(cls, records, max_bytes):
+        """Keep the newest complete records that fit and report omitted older ones."""
+        selected, used = [], 2
+        for item in reversed(records):
+            size = len(json.dumps(item, ensure_ascii=False).encode("utf-8")) + 1
+            if used + size > max_bytes:
+                break
+            selected.append(item)
+            used += size
+        selected.reverse()
+        return selected, len(records) - len(selected)
 
     @staticmethod
     def _bounded_result(result):
