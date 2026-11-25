@@ -1,6 +1,7 @@
 # Agent Relay team collaboration board
 
-Status: approved product specification; implementation and verification in progress.
+Status: approved product specification; initial implementation locally verified.
+Live harness validation remains outstanding.
 Date: 2026-11-24.
 
 ## Purpose
