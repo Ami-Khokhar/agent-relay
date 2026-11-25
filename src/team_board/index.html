@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Relay · Team board</title>
+  <link rel="stylesheet" href="board.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#" aria-label="Relay home"><span class="brand-mark">R</span><span>relay<span class="brand-muted"> / teams</span></span></a>
+    <div class="connection"><span class="live-dot" id="connection-dot"></span><span id="connection-status" role="status">Not connected</span><button class="quiet" id="connect-toggle" type="button">Connect</button></div>
+  </header>
+  <main class="shell">
+    <section class="connect-panel" id="connect-panel" aria-labelledby="connect-title">
+      <div><span class="eyebrow">LOCAL BOARD</span><h1 id="connect-title">Connect to Relay</h1><p>Read-only team activity from this Relay server.</p></div>
+      <form id="connect-form"><label for="token">Access token <span>(kept in memory only)</span></label><div class="token-row"><input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Bearer token" aria-describedby="token-help"><button class="button" type="submit">Connect</button></div><small id="token-help">Requests go to this page’s origin. The token is never added to a URL or saved.</small></form>
+    </section>
+    <div class="error-banner" id="error-banner" role="alert" hidden></div>
+    <section class="run-layout" id="run-layout" hidden>
+      <aside class="run-nav" aria-label="Team runs"><div class="section-heading"><span>TEAM RUNS</span><button class="icon-button" id="refresh" type="button" aria-label="Refresh runs">↻</button></div><div id="run-list" class="run-list"></div></aside>
+      <article class="run-content" id="run-content" aria-live="polite"></article>
+    </section>
+  </main>
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="conversation-drawer" aria-labelledby="drawer-title" aria-hidden="true">
+    <div class="drawer-head"><div><span class="eyebrow">READ ONLY · CONVERSATION</span><h2 id="drawer-title">Thread</h2></div><button class="icon-button close-drawer" type="button" aria-label="Close conversation">×</button></div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+  <script src="board.js" defer></script>
+</body>
+</html>
