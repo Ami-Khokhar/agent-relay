@@ -2,6 +2,11 @@
 
 One agent can submit a task to another agent through a small local HTTP service. The relay owns task IDs, status, cancellation, timeouts, and a registry of adapters. An MCP stdio entry point exposes the same service as tools to orchestrating agents.
 
+For longer projects, [agent teams](docs/team-board.md) add a lead-managed roster,
+durable assignments and addressed discussions, separate editing worktrees, and a
+read-only browser board at `/board/`. The user continues talking to the lead in
+their existing client; worker discussions are available in the board's side panel.
+
 ## Run
 
 Python 3.9 or newer is required. There are no package dependencies.

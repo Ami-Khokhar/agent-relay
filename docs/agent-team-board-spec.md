@@ -1,6 +1,6 @@
 # Agent Relay team collaboration board
 
-Status: product specification for review; implementation has not started.
+Status: approved product specification; implementation and verification in progress.
 Date: 2026-11-24.
 
 ## Purpose

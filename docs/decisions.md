@@ -266,3 +266,50 @@ Eviction used to drop a finished run and release its `requestId`, so a replay af
 #324 showed the terminal order was the wrong way round: `_write_journal` persisted `phase: rolled_back|activated` and then unlinked the barrier, so a crash in between left a finished record next to a barrier that refused every admission with `503 update_barrier_active`, and no shipped command cleared it (`recover` only re-read the same stale file and `recover-abort` refuses a terminal phase). `clear_transaction` made it worse by unlinking only the journal, so expunging the record left the barrier behind. A first correction inverted the order for every barrier-free end; review then showed that the correct order depends on what holds admission closed for the phase being left, so `_write_journal` now asks one named predicate (`_admission_held_by_journal`) and its callers pass the predecessor phase. A barrier-free end out of a live phase (`prepared` … `restarted`) unlinks the barrier and fsyncs the directory before the terminal record is replaced: the live record alone refuses admission, so a crash between the two leaves a live record with no barrier, which `recover` repairs by rebuilding the barrier from the record and rolling the interrupted activation back. A barrier-free end out of `recovery_required` — a terminal phase held closed only by its barrier — persists the terminal record first and unlinks the barrier after: a crash between the two leaves the finished record beside its barrier, which `recover` removes before expunging. The inverse for that end would open admission while the failed activation was never expunged or its drain released. `clear_transaction` removes a barrier-free record's own barrier before the journal, so no crash can strand a barrier with no record left to name it.
 
 Repair paths: `restore_barrier` rebuilds live and `recovery_required` records' barrier from the record and refuses to overwrite a barrier naming another transaction; `recover` rebuilds a missing barrier, advances an interrupted activation to `recovery_required` and rolls it back, and removes a finished record's own leftover barrier after a failed refresh; `recover-abort` rebuilds the same missing barrier before a prepared abort. `clear_transaction` and `clear_barrier` never remove another transaction's barrier, while the finishing terminal write itself discards whatever barrier is present, because this install records one transaction at a time and the record that barrier belonged to is the one ending. Consequence: a crash at any point in either direction is repaired by a shipped command, and hand-deleting `transaction.json` or `admission-barrier.json` is never the remedy.
+
+## Team collaboration separates lead authority from peer discussion
+
+The team-board specification expands task delegation into ongoing collaboration.
+The user's existing harness remains the lead conversation. Workers can propose,
+question, challenge, and conclude within addressed discussions, but only the lead
+changes assignments and scope. Participant capabilities are bound to a stored run
+and identity; a client-provided actor or role cannot grant authority. The board's
+worker conversation panel is read-only, and questions for the user pass through
+the lead. Consequence: peer disagreement is useful evidence rather than a second
+chain of command, and a worker credential cannot use legacy owner APIs.
+
+## Team coordination is durable; Git records selected project milestones
+
+Ordinary delegated tasks remain in memory for compatibility. Team runs use local
+SQLite transactions for assignments, discussions, and execution records. A durable
+dispatch intent precedes process submission; an interrupted intent is reconciled
+without blindly repeating effects. Git export writes selected specifications,
+decisions, and milestones into a dedicated private local repository. It does not
+push or commit a raw conversation for every message. Consequence: live coordination
+can recover independently of Git export, while accepted project records remain
+retrievable at explicit commit revisions.
+
+## Session replacement is explicit and editing workers have separate worktrees
+
+The existing adapter protocol does not establish native harness session continuity.
+A subsequent execution receives relevant recorded context and is represented as a
+replacement, never as proof of native memory. Editing workers use verified linked
+Git worktrees derived from an allowed source repository and explicit base commit;
+the lead coordinates integration. Existing worktrees are verified and preserved,
+not reset. Consequence: harness differences remain visible and concurrent edits
+stay attributable without moving the user's source checkout.
+
+## Addressed follow-ups use a durable sequence watermark and bounded defaults
+
+A worker can finish before a later peer question arrives. Relay records the
+assignment's verified dispatch provenance and the event sequence observed before
+initial submission. Later addressed discussion events can start one replacement
+per event using a stable request ID. The watermark precedes submission so a
+message arriving during submission is not lost; acknowledgments never start work.
+Preparation serializes active attempts for an assignment across revisions because
+those revisions reuse the same worker worktree. Default limits are 100 discussion
+messages, four active attempts, and 3600 elapsed seconds, with positive explicit
+overrides; migration fills missing defaults in old runs. Consequence: autonomous
+peer exchanges are bounded even when a caller supplies no limits, and restart or
+concurrent delivery cannot silently start duplicate editors. Conclusions marked
+as needing the lead enter the lead inbox without autonomously waking its harness.
