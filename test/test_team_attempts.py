@@ -69,6 +69,17 @@ class AttemptTests(unittest.TestCase):
         self.assertEqual(result["status"], "timed_out")
         self.assertEqual(self.store.list_attempts(self.run_id)[0]["status"], "timed_out")
 
+    def test_running_old_revision_blocks_dispatch_on_reused_assignment(self):
+        attempt = self.prepare()
+        self.store.record_attempt_submission(self.run_id, attempt["id"], "task-old", "running")
+        self.store.assign(self.run_id, "lead", "a", "revised assignment")
+        with self.assertRaises(TeamError) as err:
+            self.store.prepare_attempt(self.run_id, self.aid, "new-revision", "new prompt", 2)
+        self.assertEqual(err.exception.code, "assignment_active")
+        self.store.record_attempt_result(self.run_id, attempt["id"], "completed", {})
+        self.assertEqual(self.store.prepare_attempt(
+            self.run_id, self.aid, "new-revision", "new prompt", 2)["status"], "preparing")
+
     def test_dependency_requires_completion_of_pinned_revision(self):
         dependency = self.store.assign(self.run_id, "lead", "b", "prepare input")
         self.store.assign(self.run_id, "lead", "a", "implement", [dependency])

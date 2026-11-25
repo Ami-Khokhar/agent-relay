@@ -2,6 +2,7 @@
 import json
 import hashlib
 import math
+import os
 import sqlite3
 import time
 import uuid
@@ -24,6 +25,7 @@ def _now():
 
 class TeamStore:
     PHASES = {"exploration", "prototype", "specification", "build", "review", "complete"}
+    DEFAULT_LIMITS = {"max_messages": 100, "max_concurrency": 4, "max_elapsed_seconds": 3600}
 
     def __init__(self, path):
         self.path = str(path)
@@ -52,6 +54,10 @@ class TeamStore:
                     actor TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, uri TEXT NOT NULL,
                     created REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS user_questions(event_id TEXT PRIMARY KEY, answer_event_id TEXT);
+                CREATE TABLE IF NOT EXISTS dispatch_provenance(run_id TEXT NOT NULL, assignment_id TEXT NOT NULL,
+                    assignment_revision INTEGER NOT NULL, source_repo TEXT, base_commit TEXT,
+                    after_seq INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL,
+                    PRIMARY KEY(run_id,assignment_id,assignment_revision));
             """)
             columns = {r[1] for r in db.execute("PRAGMA table_info(assignments)")}
             if "purpose" not in columns:
@@ -63,8 +69,16 @@ class TeamStore:
             pcolumns = {r[1] for r in db.execute("PRAGMA table_info(participants)")}
             if "agent_id" not in pcolumns:
                 db.execute("ALTER TABLE participants ADD COLUMN agent_id TEXT")
-            db.execute("PRAGMA user_version=3")
+            dcolumns = {r[1] for r in db.execute("PRAGMA table_info(dispatch_provenance)")}
+            if "after_seq" not in dcolumns:
+                db.execute("ALTER TABLE dispatch_provenance ADD COLUMN after_seq INTEGER NOT NULL DEFAULT 0")
+            db.execute("PRAGMA user_version=5")
             db.execute("INSERT OR IGNORE INTO deliveries(event_id,recipient) SELECT id,recipient FROM events WHERE recipient IS NOT NULL")
+            for row in db.execute("SELECT id,limits FROM runs"):
+                limits = json.loads(row["limits"])
+                merged = dict(self.DEFAULT_LIMITS, **limits)
+                if merged != limits:
+                    db.execute("UPDATE runs SET limits=? WHERE id=?", (json.dumps(merged), row["id"]))
 
     @contextmanager
     def _db(self):
@@ -140,6 +154,7 @@ class TeamStore:
             raise TeamError(400, "invalid_limits", "Configured limits must be positive numbers")
         if any(k in limits and not isinstance(limits[k], int) for k in ("max_messages", "max_concurrency")):
             raise TeamError(400, "invalid_limits", "Message and concurrency limits must be integers")
+        limits = dict(self.DEFAULT_LIMITS, **limits)
         run_id, now = _id(), _now()
         with self._db() as db:
             db.execute("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?)", (run_id, objective.strip(), lead, "exploration", None, 0, 0, json.dumps(limits), now, now))
@@ -273,6 +288,9 @@ class TeamStore:
                 prior = db.execute("SELECT a.revision, t.assignment_revision, t.status FROM assignments a LEFT JOIN attempts t ON t.assignment_id=a.id AND t.assignment_revision=a.revision WHERE a.run_id=? AND a.id=? ORDER BY t.updated DESC LIMIT 1", (run_id, dep)).fetchone()
                 if not prior or prior["revision"] != dependency_revisions.get(dep) or prior["status"] != "completed":
                     raise TeamError(409, "dependency_not_ready", "Assignment dependencies must complete before dispatch")
+            active_assignment = db.execute("SELECT 1 FROM attempts WHERE run_id=? AND assignment_id=? AND status IN ('preparing','queued','running','submission_unknown') LIMIT 1", (run_id, assignment_id)).fetchone()
+            if active_assignment:
+                raise TeamError(409, "assignment_active", "This assignment already has an active execution")
             cap = json.loads(run["limits"]).get("max_concurrency")
             if cap is not None:
                 active = db.execute("SELECT count(*) FROM attempts WHERE run_id=? AND status IN ('preparing','queued','running','submission_unknown')", (run_id,)).fetchone()[0]
@@ -336,6 +354,49 @@ class TeamStore:
         with self._db() as db:
             self._run(db, run_id)
             return [self._present_attempt(dict(row)) for row in db.execute("SELECT * FROM attempts WHERE run_id=? ORDER BY created,id", (run_id,))]
+
+    def record_dispatch_provenance(self, run_id, assignment_id, assignment_revision,
+                                   source_repo=None, base_commit=None, after_seq=0):
+        self._require_ids(run_id=run_id, assignment_id=assignment_id)
+        if not isinstance(assignment_revision, int) or isinstance(assignment_revision, bool) or assignment_revision < 1:
+            raise TeamError(400, "invalid_provenance", "Assignment revision must be a positive integer")
+        if not isinstance(after_seq, int) or isinstance(after_seq, bool) or after_seq < 0:
+            raise TeamError(400, "invalid_provenance", "Event sequence watermark must be a nonnegative integer")
+        bad_repo = source_repo is not None and (not isinstance(source_repo, str) or not os.path.isabs(source_repo))
+        bad_commit = base_commit is not None and (
+            not isinstance(base_commit, str) or len(base_commit) not in (40, 64)
+            or any(c not in "0123456789abcdefABCDEF" for c in base_commit))
+        if (source_repo is None) != (base_commit is None) or bad_repo or bad_commit:
+            raise TeamError(400, "invalid_provenance", "Repository path and full base commit must be provided together")
+        with self._db() as db:
+            self._run(db, run_id)
+            assignment = db.execute("SELECT revision FROM assignments WHERE run_id=? AND id=?", (run_id, assignment_id)).fetchone()
+            if not assignment:
+                raise TeamError(404, "assignment_not_found", "Assignment was not found")
+            if assignment["revision"] != assignment_revision:
+                raise TeamError(409, "stale_assignment", "Assignment changed before dispatch provenance was saved")
+            dispatched = db.execute("SELECT created FROM attempts WHERE run_id=? AND assignment_id=? AND assignment_revision=? AND task_id IS NOT NULL ORDER BY created DESC LIMIT 1", (run_id, assignment_id, assignment_revision)).fetchone()
+            if not dispatched:
+                raise TeamError(409, "attempt_not_dispatched", "Dispatch provenance requires a recorded Relay task")
+            prior = db.execute("SELECT source_repo,base_commit,after_seq FROM dispatch_provenance WHERE run_id=? AND assignment_id=? AND assignment_revision=?", (run_id, assignment_id, assignment_revision)).fetchone()
+            if prior:
+                if (prior["source_repo"], prior["base_commit"], prior["after_seq"]) != (source_repo, base_commit, after_seq):
+                    raise TeamError(409, "provenance_conflict", "Dispatch context for this assignment revision is immutable")
+                return dict(run_id=run_id, assignment_id=assignment_id, assignment_revision=assignment_revision,
+                            source_repo=source_repo, base_commit=base_commit, after_seq=after_seq)
+            db.execute("INSERT INTO dispatch_provenance(run_id,assignment_id,assignment_revision,source_repo,base_commit,after_seq,created) VALUES(?,?,?,?,?,?,?)",
+                       (run_id, assignment_id, assignment_revision, source_repo, base_commit, after_seq, _now()))
+            return dict(run_id=run_id, assignment_id=assignment_id, assignment_revision=assignment_revision,
+                        source_repo=source_repo, base_commit=base_commit, after_seq=after_seq)
+
+    def get_dispatch_provenance(self, run_id, assignment_id, assignment_revision):
+        self._require_ids(run_id=run_id, assignment_id=assignment_id)
+        if not isinstance(assignment_revision, int) or isinstance(assignment_revision, bool) or assignment_revision < 1:
+            raise TeamError(400, "invalid_provenance", "Assignment revision must be a positive integer")
+        with self._db() as db:
+            self._run(db, run_id)
+            row = db.execute("SELECT * FROM dispatch_provenance WHERE run_id=? AND assignment_id=? AND assignment_revision=?", (run_id, assignment_id, assignment_revision)).fetchone()
+            return dict(row) if row else None
 
     @staticmethod
     def _present_attempt(attempt):
@@ -492,7 +553,9 @@ class TeamStore:
         run = self.get_run(run_id)
         events = run["events"]
         run["summary"] = next(({"text": e["body"], "updated": e["created"]} for e in reversed(events) if e["kind"] == "summary"), None)
-        run["questions"] = [{**e, "pending": True} for e in events if e["kind"] == "user_question" and not any(a["kind"] == "user_answer" and a["thread_id"] == e["id"] for a in events)]
+        answered = {e["thread_id"] for e in events if e["kind"] == "user_answer"}
+        run["questions"] = [{**e, "pending": True} for e in events
+                            if e["kind"] == "user_question" and e["id"] not in answered]
         run["artifacts"] = []
         run["attempts"] = self.list_attempts(run_id)
         run["inbox"] = {p["id"]: self.list_inbox(run_id, p["id"]) for p in run["participants"]}

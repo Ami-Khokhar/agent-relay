@@ -34,7 +34,7 @@ class TeamTests(unittest.TestCase):
 
     reopened = TeamStore(path)
     run = reopened.get_run(rid)
-    assert run["limits"] == {"max_concurrency": 2}
+    assert run["limits"] == {"max_messages": 100, "max_concurrency": 2, "max_elapsed_seconds": 3600}
     assert [(p["id"], p["harness"], p["model"]) for p in run["participants"] if p["role"] != "lead"] == [
         ("worker-a", "claude", "m1"), ("worker-b", "codex", "m2")]
     self.assertEqual(next(p["agentId"] for p in run["participants"] if p["id"] == "worker-a"), "configured-a")
@@ -182,7 +182,7 @@ class TeamTests(unittest.TestCase):
         CREATE TABLE assignments(id TEXT PRIMARY KEY, run_id TEXT NOT NULL, participant_id TEXT NOT NULL, text TEXT NOT NULL, dependencies TEXT NOT NULL, updated REAL NOT NULL);
         CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, run_id TEXT NOT NULL,
             kind TEXT NOT NULL, actor TEXT NOT NULL, recipient TEXT, thread_id TEXT, assignment_id TEXT, body TEXT NOT NULL, created REAL NOT NULL);
-        INSERT INTO runs VALUES('legacy-run','old goal','lead','exploration',NULL,0,0,'{}',1,1);
+        INSERT INTO runs VALUES('legacy-run','old goal','lead','exploration',NULL,0,0,'{"max_messages":8}',1,1);
         INSERT INTO participants VALUES('legacy-run','lead','lead',NULL,NULL);
         INSERT INTO participants VALUES('legacy-run','worker','worker',NULL,NULL);
         INSERT INTO assignments VALUES('legacy-assignment','legacy-run','worker','keep this','[]',2);
@@ -196,3 +196,14 @@ class TeamTests(unittest.TestCase):
     self.assertEqual(run["assignments"][0]["revision"], 1)
     self.assertEqual(run["events"][0]["id"], "legacy-event")
     self.assertEqual(store.list_inbox("legacy-run", "worker")[0]["id"], "legacy-event")
+    self.assertEqual(run["limits"], {"max_messages": 8, "max_concurrency": 4, "max_elapsed_seconds": 3600})
+
+ def test_omitted_limits_receive_bounded_defaults(self):
+    store = TeamStore(self.path())
+    rid = store.create_run("goal", "lead", [{"id": "worker"}])["id"]
+    self.assertEqual(store.get_run(rid)["limits"], TeamStore.DEFAULT_LIMITS)
+    for index in range(100):
+        store.post_message(rid, "lead", "worker", "Update {}".format(index))
+    with self.assertRaises(TeamError) as err:
+        store.post_message(rid, "lead", "worker", "Over limit")
+    self.assertEqual(err.exception.code, "message_limit")
