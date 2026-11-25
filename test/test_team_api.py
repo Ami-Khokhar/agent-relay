@@ -20,10 +20,16 @@ class TeamAPI(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.old = {name: getattr(server, name) for name in
-                    ("TOKEN", "STATE_DIR", "TEAM_STORE", "TEAM_CREDENTIALS", "AGENTS", "ALLOWED_ORIGINS")}
+                    ("TOKEN", "STATE_DIR", "TEAM_STORE", "TEAM_EXECUTOR", "TEAM_WAKER",
+                     "TEAM_CREDENTIALS", "TEAM_RECONCILER_STARTED", "TEAM_RECOVERY_DONE",
+                     "AGENTS", "ALLOWED_ORIGINS")}
         server.TOKEN = "owner-secret"
         server.STATE_DIR = self.tmp.name
         server.TEAM_STORE = TeamStore(os.path.join(self.tmp.name, "teams.sqlite3"))
+        server.TEAM_EXECUTOR = None
+        server.TEAM_WAKER = None
+        server.TEAM_RECONCILER_STARTED = True
+        server.TEAM_RECOVERY_DONE = True
         server.TEAM_CREDENTIALS = {}
         server.AGENTS = {"worker-config": {"id": "worker-config", "type": "codex", "model": "m"}}
         server.ALLOWED_ORIGINS = set()

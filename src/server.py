@@ -37,6 +37,7 @@ from teams import TeamError
 from team_execution import TeamExecutionError, TeamExecutor
 from team_history import TeamHistoryError, export_run_history
 from team_worktrees import WorktreeError, provision_edit_worktree
+from team_wake import TeamWake
 from workflows import STEP_ID_RE, WORKFLOW_STATUSES, WorkflowEngine
 
 # The exact starting revision a drain acquire must name, so an updater that
@@ -231,6 +232,7 @@ ACTIVE = 0
 TEAM_CREDENTIALS = {}
 TEAM_STORE = None
 TEAM_EXECUTOR = None
+TEAM_WAKER = None
 TEAM_RECONCILER_STARTED = False
 TEAM_RECOVERY_DONE = False
 TEAM_RECONCILER_STOP = threading.Event()
@@ -2168,6 +2170,23 @@ def _team_executor(store):
     return TEAM_EXECUTOR
 
 
+def _team_waker(store):
+    global TEAM_WAKER
+    if TEAM_WAKER is None or TEAM_WAKER.store is not store:
+        TEAM_WAKER = TeamWake(store, lambda run_id, assignment_id, request_id, provenance:
+                              _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance))
+    return TEAM_WAKER
+
+
+def _wake_team(store, run_id, participant_id=None):
+    outcomes = _team_waker(store).wake(run_id, participant_id)
+    for result in outcomes:
+        if result.get("status") == "failed":
+            logging.warning("team wake failed run=%s assignment=%s reason=%s",
+                            run_id, result.get("assignment_id"), result.get("reason"))
+    return outcomes
+
+
 def _team_create_child(request):
     """Submit using the per-call participant capability and optional owned worktree."""
     task_request = dict(request)
@@ -2177,6 +2196,65 @@ def _team_create_child(request):
                         _team_token=TEAM_DISPATCH_CONTEXT.token,
                         _team_cwd=TEAM_DISPATCH_CONTEXT.cwd,
                         _team_participant=TEAM_DISPATCH_CONTEXT.participant_id)
+
+
+def _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance=None):
+    run = store.get_run(run_id)
+    after_seq = max((event.get("seq", 0) for event in run.get("events", [])), default=0)
+    assignment = next((item for item in run["assignments"] if item["id"] == assignment_id), None)
+    if assignment is None:
+        raise TeamExecutionError(404, "assignment_not_found", "Assignment was not found")
+    prior_provenance = store.get_dispatch_provenance(run_id, assignment_id, assignment["revision"])
+    if prior_provenance is not None:
+        if provenance is None:
+            provenance = prior_provenance
+        after_seq = prior_provenance.get("after_seq", after_seq)
+    elif provenance and isinstance(provenance.get("after_seq"), int):
+        after_seq = provenance["after_seq"]
+    participant = next(p for p in run["participants"] if p["id"] == assignment["participant_id"])
+    agent = AGENTS.get(participant.get("agentId"))
+    if agent is None:
+        raise TeamExecutionError(409, "agent_not_configured", "Assignment participant has no configured agent")
+    cwd = None
+    source, base = None, None
+    if provenance:
+        source, base = provenance.get("source_repo"), provenance.get("base_commit")
+        if source and base:
+            roots = [os.path.realpath(root) for root in (agent.get("allowedRoots") or []) if isinstance(root, str)]
+            if agent.get("cwd"):
+                roots.append(os.path.realpath(agent["cwd"]))
+            source = os.path.realpath(source)
+            if not any(_within(root, source) for root in roots):
+                raise TeamExecutionError(403, "source_repo_not_allowed", "Recorded source repository is outside configured roots")
+            try:
+                cwd = provision_edit_worktree(source, STATE_DIR, run_id, participant["id"], base, TRUSTED_GIT)["cwd"]
+            except WorktreeError as exc:
+                raise TeamExecutionError(400, "worktree_failed", str(exc)) from exc
+    if assignment.get("purpose") in ("prototype", "implementation") and cwd is None:
+        raise TeamExecutionError(409, "worktree_provenance_missing", "Editing assignment has no recorded worktree context")
+    token = secrets.token_urlsafe(32)
+    TEAM_CREDENTIALS[hashlib.sha256(token.encode("utf-8")).hexdigest()] = (run_id, participant["id"])
+    TEAM_DISPATCH_CONTEXT.token = token
+    TEAM_DISPATCH_CONTEXT.cwd = cwd
+    TEAM_DISPATCH_CONTEXT.participant_id = participant["id"]
+    TEAM_DISPATCH_CONTEXT.read_only = assignment.get("purpose") in ("research", "review")
+    try:
+        attempt = _team_executor(store).dispatch(run_id, assignment_id, request_id)
+    except Exception:
+        TEAM_CREDENTIALS.pop(hashlib.sha256(token.encode("utf-8")).hexdigest(), None)
+        raise
+    finally:
+        TEAM_DISPATCH_CONTEXT.token = TEAM_DISPATCH_CONTEXT.cwd = None
+        TEAM_DISPATCH_CONTEXT.participant_id = None
+        TEAM_DISPATCH_CONTEXT.read_only = False
+    task = lookup_task(attempt.get("task_id")) if attempt.get("task_id") else None
+    if not task or task.get("_team_token") != token:
+        TEAM_CREDENTIALS.pop(hashlib.sha256(token.encode("utf-8")).hexdigest(), None)
+    if attempt.get("task_id"):
+        store.record_dispatch_provenance(run_id, assignment_id, assignment["revision"], source, base,
+                                         after_seq=after_seq)
+    _drain()
+    return attempt
 
 
 def _refresh_team_run(store, run_id):
@@ -2199,6 +2277,7 @@ def _team_reconcile_loop():
         try:
             for run in store.list_runs():
                 _refresh_team_run(store, run["id"])
+                _wake_team(store, run["id"])
         except Exception:
             logging.exception("team run reconciliation failed")
             continue
@@ -2805,46 +2884,21 @@ class Handler(BaseHTTPRequestHandler):
                 assignment = next((item for item in run["assignments"] if item["id"] == assignment_id), None)
                 if assignment is None:
                     return self._json(404, {"error": "assignment_not_found"})
-                participant = next(p for p in run["participants"] if p["id"] == assignment["participant_id"])
-                agent = AGENTS.get(participant.get("agentId"))
-                if agent is None:
-                    return self._json(409, {"error": "agent_not_configured"})
-                cwd = None
                 editing = assignment.get("purpose") in ("prototype", "implementation")
                 if editing and (body.get("sourceRepo") is None or body.get("baseCommit") is None):
                     return self._json(400, {"error": "worktree_required",
                                             "message": "Editing assignments require sourceRepo and baseCommit"})
+                provenance = None
                 if body.get("sourceRepo") is not None or body.get("baseCommit") is not None:
                     source = body.get("sourceRepo")
                     base_commit = body.get("baseCommit")
                     if not isinstance(source, str) or not os.path.isabs(source) or not isinstance(base_commit, str):
                         return self._json(400, {"error": "invalid_worktree"})
-                    source = os.path.realpath(source)
-                    roots = [os.path.realpath(root) for root in (agent.get("allowedRoots") or []) if isinstance(root, str)]
-                    if agent.get("cwd"):
-                        roots.append(os.path.realpath(agent["cwd"]))
-                    if not any(_within(root, source) for root in roots):
-                        return self._json(403, {"error": "source_repo_not_allowed"})
-                    try:
-                        context = provision_edit_worktree(source, STATE_DIR, run_id, participant["id"],
-                                                          base_commit, TRUSTED_GIT)
-                    except WorktreeError as exc:
-                        return self._json(400, {"error": "worktree_failed", "message": str(exc)})
-                    cwd = context["cwd"]
-                token = secrets.token_urlsafe(32)
-                TEAM_CREDENTIALS[hashlib.sha256(token.encode("utf-8")).hexdigest()] = (run_id, participant["id"])
-                TEAM_DISPATCH_CONTEXT.token, TEAM_DISPATCH_CONTEXT.cwd = token, cwd
-                TEAM_DISPATCH_CONTEXT.participant_id = participant["id"]
-                TEAM_DISPATCH_CONTEXT.read_only = assignment.get("purpose") in ("research", "review")
+                    provenance = {"source_repo": source, "base_commit": base_commit}
                 try:
-                    attempt = _team_executor(store).dispatch(run_id, assignment_id, request_id)
+                    attempt = _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance)
                 except TeamExecutionError as exc:
                     return self._json(exc.status, {"error": exc.code, "message": exc.message})
-                finally:
-                    TEAM_DISPATCH_CONTEXT.token = TEAM_DISPATCH_CONTEXT.cwd = None
-                    TEAM_DISPATCH_CONTEXT.participant_id = None
-                    TEAM_DISPATCH_CONTEXT.read_only = False
-                _drain()
                 return self._json(202 if attempt.get("status") in ("queued", "running", "preparing") else 200,
                                   {"attempt": attempt})
             elif action == "ack":
@@ -2885,6 +2939,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(400, {"error": "invalid_request"})
                 store.post_message(run_id, actor, body.get("recipientId"), body.get("body"),
                                    body.get("threadId"), body.get("assignmentId"), body.get("kind", "message"))
+                wake = _wake_team(store, run_id, body.get("recipientId"))
+                return self._json(200, {"ok": True, "wake": wake,
+                                        "team": _team_view(store, run_id, principal, owner)})
             elif action == "conclusions":
                 if (any(not isinstance(body.get(key), str) for key in ("threadId", "summary", "rationale"))
                         or (body.get("action") is not None and not isinstance(body.get("action"), str))

@@ -442,7 +442,8 @@ class TeamStore:
             if actor != run["lead"] and not db.execute("SELECT 1 FROM events WHERE run_id=? AND thread_id=? AND (actor=? OR recipient=?)", (run_id, thread_id, actor, actor)).fetchone():
                 raise TeamError(403, "not_in_thread", "Only thread participants or the lead may conclude it")
             payload = json.dumps({"summary": summary, "rationale": rationale, "action": action, "needs_lead": bool(needs_lead)})
-            return self._event(db, run_id, "conclusion", actor, payload, thread_id=thread_id)
+            return self._event(db, run_id, "conclusion", actor, payload,
+                               recipient=run["lead"] if needs_lead else None, thread_id=thread_id)
 
     def set_phase(self, run_id, actor, phase, spec=None, approved=False):
         self._require_ids(run_id=run_id, actor=actor)

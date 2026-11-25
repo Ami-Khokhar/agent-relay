@@ -70,6 +70,10 @@ class TeamTests(unittest.TestCase):
     assert json.loads(conclusion["body"]) == {
         "summary": "Keep the implementation", "rationale": "Review found no defect",
         "action": "worker-a keeps ownership", "needs_lead": False}
+    self.assertNotIn(cid, [e["id"] for e in store.list_inbox(rid, "lead")])
+    escalated = store.conclude(rid, "worker-b", root, "Need a scope decision", "Two valid alternatives",
+                               needs_lead=True)
+    self.assertIn(escalated, [e["id"] for e in store.list_inbox(rid, "lead", unread_only=True)])
 
 
  def test_build_requires_lead_approved_spec_and_close_stops_mutation(self):
