@@ -17,11 +17,11 @@ _GIT_TIMEOUT = 15
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
-def _git(git_path, repo, *args):
+def _git(git_path, repo, *args, allow=(0,)):
     if team_git.executable(git_path) is None:
         raise TeamHistoryError("git_path must be an absolute path to an executable git")
     try:
-        result = team_git.run(git_path, repo, *args, timeout=_GIT_TIMEOUT)
+        result = team_git.run(git_path, repo, *args, timeout=_GIT_TIMEOUT, allow=allow)
     except team_git.GitCommandError as exc:
         if exc.code is None:
             raise TeamHistoryError("git history operation failed: {}".format(exc.detail)) from exc
@@ -94,20 +94,31 @@ def export_run_history(store, run_id, history_repo, git_path):
         raise TeamHistoryError("invalid team run id")
     if not isinstance(git_path, str) or not os.path.isabs(git_path) or not os.path.isfile(git_path) or not os.access(git_path, os.X_OK):
         raise TeamHistoryError("git_path must be an absolute path to an executable git")
+    if not isinstance(history_repo, (str, os.PathLike)) or not str(history_repo).strip():
+        raise TeamHistoryError("history_repo must be a nonempty path")
+    requested = Path(history_repo).expanduser()
+    if not requested.is_absolute():
+        raise TeamHistoryError("history_repo must be an absolute path")
+    if requested.is_symlink():
+        raise TeamHistoryError("history_repo must not be a symlink")
     run = store.get_run(run_id)
     files = _records(run)
-    repo = Path(history_repo).expanduser().absolute()
+    repo = Path(os.path.realpath(requested))
     repo.parent.mkdir(parents=True, exist_ok=True)
     with _repo_lock(repo):
-        repo.mkdir(parents=True, exist_ok=True)
-        os.chmod(repo, 0o700)
+        repo.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not (repo / ".git").exists():
             _git(git_path, repo, "init", "--quiet")
         if _git(git_path, repo, "remote"):
             raise TeamHistoryError("history repository has configured remotes; refusing export")
+        os.chmod(repo, 0o700)
         for relative, content in files.items():
             destination = repo / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.is_symlink():
+                raise TeamHistoryError("history export destination is a symlink: {}".format(relative))
+            if not destination.parent.resolve().is_relative_to(repo):
+                raise TeamHistoryError("history export path escapes the repository: {}".format(relative))
             if destination.exists() and destination.read_bytes() == content:
                 continue
             fd, temp_name = tempfile.mkstemp(prefix=".history-", dir=str(destination.parent))
@@ -121,23 +132,35 @@ def export_run_history(store, run_id, history_repo, git_path):
                 if os.path.exists(temp_name):
                     os.unlink(temp_name)
         paths = sorted(files)
-        if paths:
-            _git(git_path, repo, "add", "--", *paths)
-        prior = _git(git_path, repo, "ls-files", "--", "runs/{}/".format(run_id)).splitlines()
-        obsolete = sorted(set(prior) - set(paths))
-        if obsolete:
-            _git(git_path, repo, "rm", "--quiet", "--", *obsolete)
-        # Never accidentally commit another run's pre-staged work.
+        prefix = "runs/{}/".format(run_id)
+        # Refuse any staged content this export will not write. Committed files
+        # under this run may legitimately be staged for deletion by a retry;
+        # a hand-staged or foreign file is not generated content.
+        try:
+            head = team_git.run(git_path, repo, "rev-parse", "--verify", "--quiet", "HEAD",
+                                timeout=_GIT_TIMEOUT, allow=(0, 1))
+        except team_git.GitCommandError as exc:
+            raise TeamHistoryError("git HEAD check failed: {}".format(exc.detail)) from exc
+        committed = set()
+        if head.returncode == 0:
+            committed = set(_git(git_path, repo, "ls-tree", "-r", "--name-only", "HEAD", "--", prefix).splitlines())
+        generated = set(paths)
+        allowed = generated | (committed - generated)
         try:
             staged = team_git.run(git_path, repo, "diff", "--cached", "--name-only", "-z",
                                   timeout=_GIT_TIMEOUT)
         except team_git.GitCommandError as exc:
             raise TeamHistoryError("git staged path check failed: {}".format(exc.detail)) from exc
-        prefix = "runs/{}/".format(run_id)
         staged_paths = staged.stdout.decode("utf-8", "surrogateescape").split("\0")
-        unrelated = [path for path in staged_paths if path and not path.startswith(prefix)]
-        if unrelated:
-            raise TeamHistoryError("history repository has staged files outside this run: {}".format(", ".join(unrelated)))
+        unexpected = [path for path in staged_paths if path and path not in allowed]
+        if unexpected:
+            raise TeamHistoryError("history repository has staged files outside this export: {}".format(", ".join(unexpected)))
+        if paths:
+            _git(git_path, repo, "add", "--", *paths)
+        prior = _git(git_path, repo, "ls-files", "--", prefix).splitlines()
+        obsolete = sorted(set(prior) - set(paths))
+        if obsolete:
+            _git(git_path, repo, "rm", "--quiet", "--", *obsolete)
         try:
             diff = team_git.run(git_path, repo, "diff", "--cached", "--quiet",
                                 timeout=_GIT_TIMEOUT, allow=(0, 1))

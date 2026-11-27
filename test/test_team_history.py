@@ -80,9 +80,30 @@ class TeamHistoryTests(unittest.TestCase):
         outside = self.repo / "unrelated.txt"
         outside.write_text("keep separate")
         subprocess.check_call([self.git, "-C", str(self.repo), "add", "unrelated.txt"])
-        with self.assertRaisesRegex(TeamHistoryError, "outside this run"):
+        with self.assertRaisesRegex(TeamHistoryError, "outside this export"):
             export_run_history(self.store, run["id"], self.repo, self.git)
         self.assertFalse(subprocess.check_output([self.git, "-C", str(self.repo), "status", "--porcelain"], text=True) == "")
+
+    def test_refuses_a_hand_staged_file_inside_the_run_prefix(self):
+        run = self.store.create_run("Build", "lead", [])
+        export_run_history(self.store, run["id"], self.repo, self.git)
+        manual = self.repo / "runs" / run["id"] / "manual.md"
+        manual.write_text("not generated")
+        subprocess.check_call([self.git, "-C", str(self.repo), "add",
+                               str(manual.relative_to(self.repo))])
+        with self.assertRaisesRegex(TeamHistoryError, "outside this export"):
+            export_run_history(self.store, run["id"], self.repo, self.git)
+
+    def test_repository_path_is_validated_before_touching_the_filesystem(self):
+        run = self.store.create_run("Build", "lead", [])
+        for bad in ("", "relative/history"):
+            with self.assertRaises(TeamHistoryError):
+                export_run_history(self.store, run["id"], bad, self.git)
+        link = self.root / "history-link"
+        link.symlink_to(self.root / "elsewhere")
+        with self.assertRaisesRegex(TeamHistoryError, "must not be a symlink"):
+            export_run_history(self.store, run["id"], link, self.git)
+        self.assertFalse((self.root / "elsewhere").exists())
 
     def test_commit_does_not_run_repository_hooks(self):
         run = self.store.create_run("Build", "lead", [])

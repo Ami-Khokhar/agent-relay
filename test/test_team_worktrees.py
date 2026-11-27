@@ -87,6 +87,17 @@ class TeamWorktreeTests(unittest.TestCase):
             self.provision("worker")
         self.assertEqual(self.git_run(first["cwd"], "rev-parse", "HEAD"), self.base)
 
+    def test_state_path_that_is_a_file_is_refused(self):
+        self.state.write_text("not a directory")
+        with self.assertRaisesRegex(WorktreeError, "state_dir must be a usable directory"):
+            self.provision("worker")
+
+    def test_detached_owned_worktree_is_reported(self):
+        first = self.provision("worker")
+        self.git_run(first["cwd"], "checkout", "--quiet", "--detach", self.base)
+        with self.assertRaisesRegex(WorktreeError, "detached HEAD"):
+            self.provision("worker")
+
     def test_worktree_creation_does_not_run_checkout_hooks(self):
         marker = self.root / "hook-ran"
         hook = self.source / ".git" / "hooks" / "post-checkout"

@@ -63,14 +63,15 @@ def _verify_existing(git_path, target, common, branch, base, hooks_path):
         raise WorktreeError("existing worktree resolves to a different checkout: {}".format(target))
     if _common_dir(git_path, target, hooks_path) != common:
         raise WorktreeError("existing worktree belongs to a different Git repository")
-    _, current_branch = _git(git_path, target, "symbolic-ref", "--quiet", "--short", "HEAD", hooks_path=hooks_path)
+    rc, current_branch = _git(git_path, target, "symbolic-ref", "--quiet", "--short", "HEAD",
+                              allow=(0, 1), hooks_path=hooks_path)
+    if rc != 0:
+        raise WorktreeError("existing worktree has a detached HEAD; expected branch {}".format(branch))
     if current_branch != branch:
         raise WorktreeError("existing worktree is on unexpected branch {}".format(current_branch))
     rc, _ = _git(git_path, target, "merge-base", "--is-ancestor", base, "HEAD", allow=(0, 1), hooks_path=hooks_path)
     if rc == 1:
         raise WorktreeError("existing worktree does not descend from requested base revision")
-    _, head = _git(git_path, target, "rev-parse", "HEAD", hooks_path=hooks_path)
-    return head
 
 
 def provision_edit_worktree(source_repo, state_dir, run_id, participant_id, base_commit, git_path):
@@ -89,7 +90,7 @@ def provision_edit_worktree(source_repo, state_dir, run_id, participant_id, base
     source_input = Path(source_repo)
     try:
         source = source_input.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         raise WorktreeError("source repository does not exist: {}".format(source_input)) from exc
     if not source.is_dir():
         raise WorktreeError("source_repo is not a directory")
@@ -102,15 +103,23 @@ def provision_edit_worktree(source_repo, state_dir, run_id, participant_id, base
         raise WorktreeError("state_dir must be a usable filesystem path") from exc
     if state == source or state.is_relative_to(source):
         raise WorktreeError("state_dir must be outside the source checkout")
-    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise WorktreeError("state_dir must be a usable directory: {}".format(exc)) from exc
     worktrees = state / "worktrees"
-    worktrees.mkdir(mode=0o700, exist_ok=True)
-    if worktrees.is_symlink() or not worktrees.is_dir():
-        raise WorktreeError("worktrees state path must be a real directory")
-    os.chmod(worktrees, 0o700)
     hooks_path = state / ".team-empty-hooks"
-    hooks_path.mkdir(mode=0o700, exist_ok=True)
-    if hooks_path.is_symlink() or not hooks_path.is_dir() or any(hooks_path.iterdir()):
+    for path, label in ((worktrees, "worktrees state path"), (hooks_path, "hook suppression path")):
+        if path.is_symlink():
+            raise WorktreeError("{} must be a real directory".format(label))
+        try:
+            path.mkdir(mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise WorktreeError("{} must be a real directory: {}".format(label, exc)) from exc
+        if not path.is_dir():
+            raise WorktreeError("{} must be a real directory".format(label))
+        os.chmod(path, 0o700)
+    if any(hooks_path.iterdir()):
         raise WorktreeError("hook suppression path must be an empty directory")
     target = _owned_path(state, run_id, participant_id)
     run_key, participant_key = _digest(run_id), _digest(participant_id)

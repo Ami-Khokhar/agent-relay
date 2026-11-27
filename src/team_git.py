@@ -5,6 +5,7 @@ binary and serialize access with an exclusive lock file. Keeping that logic in
 one place means the environment scrub, timeouts and Windows fallback cannot
 drift between the two callers.
 """
+import errno
 import os
 import subprocess
 import time
@@ -39,11 +40,26 @@ def executable(git_path):
     return git_path
 
 
-def environment(home=None):
+def environment():
     """The minimal environment a trusted Git call receives."""
     return {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
-            "HOME": home if home is not None else os.environ.get("HOME", "/")}
+            "HOME": os.environ.get("HOME", "/")}
+
+
+def _label(args):
+    """The Git subcommand for an error message, skipping ``-c`` values."""
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg == "-c":
+            skip = True
+            continue
+        if isinstance(arg, str) and not arg.startswith("-"):
+            return arg
+    return "git"
 
 
 def run(git_path, cwd, *args, timeout, allow=(0,), hooks_path=None):
@@ -60,10 +76,10 @@ def run(git_path, cwd, *args, timeout, allow=(0,), hooks_path=None):
                                 stderr=subprocess.PIPE, timeout=timeout,
                                 env=environment(), check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GitCommandError(args[0] if args else "git", None, str(exc)) from exc
+        raise GitCommandError(_label(args), None, str(exc)) from exc
     if result.returncode not in allow:
         detail = result.stderr.decode("utf-8", "replace").strip()
-        raise GitCommandError(args[0] if args else "git", result.returncode, detail)
+        raise GitCommandError(_label(args), result.returncode, detail)
     return result
 
 
@@ -72,6 +88,7 @@ def exclusive_lock(path, timeout, busy_message):
     """Hold an advisory exclusive lock on ``path`` or fail after ``timeout``."""
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
     deadline = time.monotonic() + timeout
+    acquired = False
     try:
         while True:
             try:
@@ -83,15 +100,21 @@ def exclusive_lock(path, timeout, busy_message):
                     os.lseek(fd, 0, os.SEEK_SET)
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 break
-            except (BlockingIOError, OSError):
+            except OSError as exc:
+                # Only contention is retried; EBADF/ENOLCK/EINVAL mean the lock
+                # itself cannot work and must surface immediately.
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
                 if time.monotonic() >= deadline:
-                    raise LockTimeout(busy_message)
+                    raise LockTimeout(busy_message) from None
                 time.sleep(0.05)
+        acquired = True
         yield
     finally:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        else:  # pragma: no cover - exercised on Windows
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        if acquired:
+            if fcntl:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            else:  # pragma: no cover - exercised on Windows
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         os.close(fd)
