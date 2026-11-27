@@ -154,6 +154,20 @@ def _token():
         return None
 
 
+def _team_token():
+    """Participant credential; never use it outside the team API namespace."""
+    return (_env("AGENT_RELAY_TEAM_TOKEN") or "").strip() or None
+
+
+def _token_for_path(path):
+    # Team credentials are run/participant scoped and must never reach legacy APIs.
+    if path == "/v1/teams" or path.startswith("/v1/teams/"):
+        return _team_token() or _token()
+    if _team_token():
+        return None
+    return _token()
+
+
 # The relay validates workflow documents itself. This schema exists so an agent authoring a
 # run can see the accepted shape from tools/list, without reading the HTTP reference.
 WORKFLOW_SPEC = {
@@ -476,6 +490,81 @@ TOOLS = [
     },
 ]
 
+# Team operations are additive to the legacy task and workflow tools. There is
+# intentionally no tool for minting participant credentials: tokens are secrets,
+# and the owner provisions them out of band for the worker process.
+TOOLS.extend([
+    {"name": "create_team", "description": "Create a durable team run with an objective and configured participants. This creates coordination records only; it does not dispatch agents.",
+     "inputSchema": {"type": "object", "required": ["objective", "participants"], "additionalProperties": False,
+                     "properties": {"objective": {"type": "string", "minLength": 1},
+                                    "participants": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id"], "additionalProperties": False, "properties": {"id": {"type": "string", "minLength": 1}, "agentId": {"type": "string", "description": "Registered relay agent ID; defaults to id."}, "role": {"type": "string"}, "harness": {"type": "string"}, "model": {"type": "string"}}}},
+                                    "limits": {"type": "object"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "list_teams", "description": "List durable team runs using the owner credential. Participant credentials cannot list runs.",
+     "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+    {"name": "get_team", "description": "Read a team run, including assignments, discussions, conclusions, and execution records.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+    {"name": "assign_team_work", "description": "Create or revise an assignment. Assignment and scope changes are lead-only.",
+     "inputSchema": {"type": "object", "required": ["teamId", "participantId", "assignment"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "participantId": {"type": "string", "minLength": 1}, "assignment": {"type": "string", "minLength": 1}, "dependencies": {"type": "array", "items": {"type": "string"}}, "purpose": {"type": "string", "enum": ["research", "prototype", "implementation", "review"]}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "post_team_message", "description": "Post an addressed team message relevant to an assignment. A peer message is advice or a request, not authority to change another assignment.",
+     "inputSchema": {"type": "object", "required": ["teamId", "recipientId", "body"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "recipientId": {"type": "string", "minLength": 1}, "body": {"type": "string", "minLength": 1}, "threadId": {"type": "string"}, "assignmentId": {"type": "string"}, "kind": {"type": "string"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "conclude_team_discussion", "description": "Record a discussion conclusion and rationale, including action and whether the lead must decide a scope question.",
+     "inputSchema": {"type": "object", "required": ["teamId", "threadId", "summary", "rationale"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "threadId": {"type": "string", "minLength": 1}, "summary": {"type": "string", "minLength": 1}, "rationale": {"type": "string", "minLength": 1}, "action": {"type": "string"}, "needsLead": {"type": "boolean"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "set_team_phase", "description": "Record the discovery, prototype, specification, build, or review phase. Approval fields require the lead.",
+     "inputSchema": {"type": "object", "required": ["teamId", "phase"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "phase": {"type": "string", "enum": ["exploration", "prototype", "specification", "build", "review"]}, "spec": {"type": "string"}, "approved": {"type": "boolean"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "close_team", "description": "Close a team run and stop new autonomous team activity. A follow-up must explicitly reopen work.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "summary": {"type": "string"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "reopen_team", "description": "Reopen a closed team run for an explicitly requested follow-up. Only the lead may reopen, and the working phase must be named.",
+     "inputSchema": {"type": "object", "required": ["teamId", "phase"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "phase": {"type": "string", "enum": ["exploration", "prototype", "specification", "build", "review"]}, "summary": {"type": "string"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "dispatch_team_assignment", "description": "Dispatch an assigned team task to its configured worker. Editing work requires an allowed source repository and base commit.",
+     "inputSchema": {"type": "object", "required": ["teamId", "assignmentId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "assignmentId": {"type": "string", "minLength": 1}, "requestId": {"type": "string"}, "sourceRepo": {"type": "string"}, "baseCommit": {"type": "string"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "get_team_inbox", "description": "Read messages addressed to the authenticated lead or participant. The unreadOnly filter is optional.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "unreadOnly": {"type": "boolean"}}},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+    {"name": "wait_team_messages", "description": "Poll the authenticated lead or participant inbox for unread messages. Waits at most maxWaitMs (1–30000 ms); omit it for an immediate read. Messages are not acknowledged automatically.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "maxWaitMs": {"type": "integer", "minimum": 1, "maximum": 30000}}},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+    {"name": "ack_team_delivery", "description": "Acknowledge receipt of an addressed team event as the authenticated participant.",
+     "inputSchema": {"type": "object", "required": ["teamId", "eventId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "eventId": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "get_team_attempts", "description": "Read recorded execution attempts for a team run.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+    {"name": "set_team_summary", "description": "Record the lead-authored summary shown on the team board.",
+     "inputSchema": {"type": "object", "required": ["teamId", "summary"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "summary": {"type": "string"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "get_team_summary", "description": "Read the current lead-authored team summary.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+    {"name": "get_team_questions", "description": "Read questions awaiting user input, routed through the lead.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+    {"name": "ask_team_user_question", "description": "Record a question for the user to be routed through the lead.",
+     "inputSchema": {"type": "object", "required": ["teamId", "question"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "question": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "answer_team_user_question", "description": "Resolve a recorded user question. Only the lead may answer it.",
+     "inputSchema": {"type": "object", "required": ["teamId", "questionId", "answer"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "questionId": {"type": "string", "minLength": 1}, "answer": {"type": "string"}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "get_team_artifacts", "description": "Read the artifacts recorded for a team run.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+    {"name": "add_team_artifact", "description": "Record a team artifact by kind, title, and URI. Only the lead may add artifacts.",
+     "inputSchema": {"type": "object", "required": ["teamId", "kind", "title", "uri"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}, "kind": {"type": "string", "minLength": 1}, "title": {"type": "string", "minLength": 1}, "uri": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+    {"name": "export_team_history", "description": "Export the durable team run history to its configured local Git history. Only the lead may export.",
+     "inputSchema": {"type": "object", "required": ["teamId"], "additionalProperties": False, "properties": {"teamId": {"type": "string", "minLength": 1}}},
+     "annotations": {"readOnlyHint": False, "openWorldHint": False}},
+])
+
 
 class RpcError(Exception):
     def __init__(self, code, message):
@@ -630,7 +719,7 @@ def _http_request(base_url, path, method="GET", body=None, timeout=10.0):
 
     data = None
     headers = {}
-    token = _token()
+    token = _token_for_path(path)
     if token:
         parsed = urlsplit(base_url)
         if parsed.scheme != "https" and not _loopback(base_url):
@@ -1077,6 +1166,100 @@ def create_http_handler(base_url=None, timeout=None):
                 wait_ms = args.get("waitMs")
                 if wait_ms and value.get("status") in ("queued", "running"):
                     value = _wait_workflow(base_url, args["workflowId"], wait_ms, timeout)
+            elif name in ("create_team", "list_teams", "get_team", "assign_team_work",
+                          "post_team_message", "conclude_team_discussion", "set_team_phase",
+                          "close_team", "reopen_team", "dispatch_team_assignment", "get_team_inbox",
+                          "wait_team_messages",
+                          "ack_team_delivery", "get_team_attempts", "set_team_summary",
+                          "get_team_summary", "get_team_questions", "ask_team_user_question",
+                          "answer_team_user_question", "get_team_artifacts",
+                          "add_team_artifact", "export_team_history"):
+                if name == "create_team":
+                    args = _arguments_for(rpc, ["objective", "participants", "limits"])
+                    _non_empty(args, "objective")
+                    participants = args.get("participants")
+                    if (not isinstance(participants, list) or not participants
+                            or any(not isinstance(item, dict) for item in participants)):
+                        _invalid("participants must be a non-empty array of participant objects")
+                    body = {key: args[key] for key in ("objective", "participants", "limits") if key in args}
+                    value = _relay_request(base_url, "/v1/teams", method="POST", body=body, timeout=timeout)
+                elif name == "list_teams":
+                    _arguments_for(rpc, [])
+                    value = _relay_request(base_url, "/v1/teams", timeout=timeout)
+                else:
+                    route_args = {
+                        "get_team": (["teamId"], "", "GET", ()),
+                        "assign_team_work": (["teamId", "participantId", "assignment", "dependencies", "purpose"], "/assignments", "POST", ("participantId", "assignment")),
+                        "post_team_message": (["teamId", "recipientId", "body", "threadId", "assignmentId", "kind"], "/messages", "POST", ("recipientId", "body")),
+                        "conclude_team_discussion": (["teamId", "threadId", "summary", "rationale", "action", "needsLead"], "/conclusions", "POST", ("threadId", "summary", "rationale")),
+                        "set_team_phase": (["teamId", "phase", "spec", "approved"], "/phase", "POST", ("phase",)),
+                        "close_team": (["teamId", "summary"], "/close", "POST", ()),
+                        "reopen_team": (["teamId", "phase", "summary"], "/reopen", "POST", ("phase",)),
+                        "dispatch_team_assignment": (["teamId", "assignmentId", "requestId", "sourceRepo", "baseCommit"], "/dispatch", "POST", ("assignmentId",)),
+                        "get_team_inbox": (["teamId", "unreadOnly"], "/inbox", "GET", ()),
+                        "ack_team_delivery": (["teamId", "eventId"], "/ack", "POST", ("eventId",)),
+                        "get_team_attempts": (["teamId"], "/attempts", "GET", ()),
+                        "set_team_summary": (["teamId", "summary"], "/summary", "POST", ("summary",)),
+                        "get_team_summary": (["teamId"], "/summary", "GET", ()),
+                        "get_team_questions": (["teamId"], "/questions", "GET", ()),
+                        "ask_team_user_question": (["teamId", "question"], "/questions", "POST", ("question",)),
+                        "answer_team_user_question": (["teamId", "questionId", "answer"], "/questions", "POST", ("questionId", "answer")),
+                        "get_team_artifacts": (["teamId"], "/artifacts", "GET", ()),
+                        "add_team_artifact": (["teamId", "kind", "title", "uri"], "/artifacts", "POST", ("kind", "title", "uri")),
+                        "export_team_history": (["teamId"], "/history", "POST", ()),
+                    }
+                    if name == "wait_team_messages":
+                        args = _arguments_for(rpc, ["teamId", "maxWaitMs"])
+                        _non_empty(args, "teamId", 128)
+                        max_wait = args.get("maxWaitMs")
+                        if max_wait is not None and (isinstance(max_wait, bool)
+                                or not isinstance(max_wait, int) or not 1 <= max_wait <= 30000):
+                            _invalid("maxWaitMs must be an integer from 1 to 30000")
+                        started = time.monotonic()
+                        deadline = started + (max_wait or 0) / 1000
+                        attempted = False
+                        team_path = "/v1/teams/" + quote(args["teamId"], safe="") + "/inbox?unreadOnly=true"
+                        while True:
+                            remaining = deadline - time.monotonic() if max_wait is not None else 0
+                            if attempted and max_wait is not None and remaining <= 0:
+                                value.update(waitExpired=True, waitedMs=round((time.monotonic() - started) * 1000))
+                                break
+                            request_timeout = timeout if max_wait is None else min(timeout, max(0.001, remaining))
+                            attempted = True
+                            value = _relay_request(base_url, team_path, timeout=request_timeout)
+                            events = value.get("events")
+                            if not isinstance(events, list) or events or max_wait is None:
+                                break
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                value.update(waitExpired=True, waitedMs=round((time.monotonic() - started) * 1000))
+                                break
+                            time.sleep(min(0.25, remaining))
+                        if isinstance(value.get("events"), list) and value["events"]:
+                            value.update(waitExpired=False, waitedMs=round((time.monotonic() - started) * 1000))
+                        return {"content": [{"type": "text", "text": json.dumps(value)}], "structuredContent": value}
+                    allowed, suffix, verb, required = route_args[name]
+                    args = _arguments_for(rpc, allowed)
+                    _non_empty(args, "teamId", 128)
+                    for key in required:
+                        _non_empty(args, key)
+                    team_path = "/v1/teams/" + quote(args["teamId"], safe="")
+                    if name in ("get_team", "get_team_inbox", "get_team_attempts", "get_team_summary",
+                                "get_team_questions", "get_team_artifacts"):
+                        suffix = "" if name == "get_team" else suffix
+                        query = ""
+                        if name == "get_team_inbox" and args.get("unreadOnly") is not None:
+                            if not isinstance(args["unreadOnly"], bool):
+                                _invalid("unreadOnly must be a boolean")
+                            query = "?" + urlencode({"unreadOnly": str(args["unreadOnly"]).lower()})
+                        value = _relay_request(base_url, team_path + suffix + query, timeout=timeout)
+                    else:
+                        body = {key: value for key, value in args.items() if key != "teamId"}
+                        if name == "answer_team_user_question":
+                            suffix += "/" + quote(args["questionId"], safe="")
+                            body = {"answer": args["answer"]}
+                        value = _relay_request(base_url, team_path + suffix, method=verb,
+                                               body=body, timeout=timeout)
             elif name == "get_pressure":
                 _arguments_for(rpc, [])
                 value = _relay_request(base_url, "/v1/pressure", timeout=timeout)

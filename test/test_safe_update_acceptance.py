@@ -127,10 +127,12 @@ class _World:
         """An ordinary, clean, user-owned checkout with the canonical remote."""
         install = self.base / "install"
         (install / "src").mkdir(parents=True)
-        source_dir = Path(__file__).resolve().parent.parent / "src"
+        source_root = Path(__file__).resolve().parent.parent
+        source_dir = source_root / "src"
         for name in sorted(os.listdir(source_dir)):
             if name.endswith(".py"):
                 shutil.copy2(source_dir / name, install / "src" / name)
+        shutil.copy2(source_root / ".gitignore", install / ".gitignore")
         (install / "README.md").write_text("# agent-relay synthetic install\n")
         _fixture_git(install, "init", "-q", "-b", "main")
         _fixture_git(install, "add", "-A")

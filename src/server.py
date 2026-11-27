@@ -12,6 +12,7 @@ import hmac
 import http.client
 import ipaddress
 import json
+import logging
 import ntpath
 import os
 import re
@@ -32,6 +33,11 @@ from urllib.parse import parse_qs, urlsplit
 
 import pressure
 import update_transaction
+from teams import TeamError
+from team_execution import TeamExecutionError, TeamExecutor
+from team_history import TeamHistoryError, export_run_history
+from team_worktrees import WorktreeError, provision_edit_worktree
+from team_wake import TeamWake
 from workflows import STEP_ID_RE, WORKFLOW_STATUSES, WorkflowEngine
 
 # The exact starting revision a drain acquire must name, so an updater that
@@ -221,6 +227,16 @@ TASKS = {}
 REQUEST_IDS = {}
 QUEUE = []
 ACTIVE = 0
+# Team credentials are deliberately process-local capabilities. A restart invalidates them;
+# the owner can mint a replacement for one participant without exposing the owner token.
+TEAM_CREDENTIALS = {}
+TEAM_STORE = None
+TEAM_EXECUTOR = None
+TEAM_WAKER = None
+TEAM_RECONCILER_STARTED = False
+TEAM_RECOVERY_DONE = False
+TEAM_RECONCILER_STOP = threading.Event()
+TEAM_DISPATCH_CONTEXT = threading.local()
 # The held shared lock during a safe update: None when no drain is held, else a
 # dict bound to one transaction, one exact starting revision and one opaque
 # capability. Guarded by LOCK, so admission and drain decisions share it.
@@ -696,6 +712,15 @@ def environment(agent):
 
 def task_environment(agent, task):
     env = environment(agent)
+    team_token = task.get("_team_token")
+    if team_token:
+        # A team task needs its participant capability, never the Relay owner capability,
+        # even when the registry asks to inherit or set one of those variables.
+        for name in (*TOKEN_ENV, "AGENT_RELAY_TEAM_TOKEN"):
+            env.pop(name, None)
+        env["AGENT_RELAY_TEAM_TOKEN"] = team_token
+        env["AGENT_RELAY_TEAM_ID"] = task["_team_id"]
+        env["AGENT_RELAY_TEAM_PARTICIPANT_ID"] = task["_team_participant_id"]
     if task.get("_sandbox"):
         # A read-only agent must not hold the relay credential, even when the owner passes it
         # through (inheritEnv or env) for the agent's ordinary runs.
@@ -2138,7 +2163,146 @@ def _internal_create_task(request):
     return _create_task(request, _internal=True)
 
 
-def _create_task(request, _internal=False):
+def _team_executor(store):
+    global TEAM_EXECUTOR
+    if TEAM_EXECUTOR is None or TEAM_EXECUTOR.store is not store:
+        TEAM_EXECUTOR = TeamExecutor(store, _team_create_child, lookup_task)
+    return TEAM_EXECUTOR
+
+
+def _team_waker(store):
+    global TEAM_WAKER
+    if TEAM_WAKER is None or TEAM_WAKER.store is not store:
+        TEAM_WAKER = TeamWake(store, lambda run_id, assignment_id, request_id, provenance:
+                              _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance))
+    return TEAM_WAKER
+
+
+def _wake_team(store, run_id, participant_id=None):
+    outcomes = _team_waker(store).wake(run_id, participant_id)
+    for result in outcomes:
+        if result.get("status") == "failed":
+            logging.warning("team wake failed run=%s assignment=%s reason=%s",
+                            run_id, result.get("assignment_id"), result.get("reason"))
+    return outcomes
+
+
+def _team_create_child(request):
+    """Submit using the per-call participant capability and optional owned worktree."""
+    task_request = dict(request)
+    if getattr(TEAM_DISPATCH_CONTEXT, "read_only", False):
+        task_request["readOnly"] = True
+    return _create_task(task_request, _internal=True,
+                        _team_token=TEAM_DISPATCH_CONTEXT.token,
+                        _team_cwd=TEAM_DISPATCH_CONTEXT.cwd,
+                        _team_participant=TEAM_DISPATCH_CONTEXT.participant_id)
+
+
+def _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance=None):
+    run = store.get_run(run_id)
+    after_seq = max((event.get("seq", 0) for event in run.get("events", [])), default=0)
+    assignment = next((item for item in run["assignments"] if item["id"] == assignment_id), None)
+    if assignment is None:
+        raise TeamExecutionError(404, "assignment_not_found", "Assignment was not found")
+    prior_provenance = store.get_dispatch_provenance(run_id, assignment_id, assignment["revision"])
+    if prior_provenance is not None:
+        if provenance is None:
+            provenance = prior_provenance
+        after_seq = prior_provenance.get("after_seq", after_seq)
+    elif provenance and isinstance(provenance.get("after_seq"), int):
+        after_seq = provenance["after_seq"]
+    participant = next(p for p in run["participants"] if p["id"] == assignment["participant_id"])
+    agent = AGENTS.get(participant.get("agentId"))
+    if agent is None:
+        raise TeamExecutionError(409, "agent_not_configured", "Assignment participant has no configured agent")
+    cwd = None
+    branch = None
+    source, base = None, None
+    if provenance:
+        source, base = provenance.get("source_repo"), provenance.get("base_commit")
+        if source and base:
+            roots = [os.path.realpath(root) for root in (agent.get("allowedRoots") or []) if isinstance(root, str)]
+            if agent.get("cwd"):
+                roots.append(os.path.realpath(agent["cwd"]))
+            source = os.path.realpath(source)
+            if not any(_within(root, source) for root in roots):
+                raise TeamExecutionError(403, "source_repo_not_allowed", "Recorded source repository is outside configured roots")
+            try:
+                worktree = provision_edit_worktree(source, STATE_DIR, run_id, participant["id"], base, TRUSTED_GIT)
+            except WorktreeError as exc:
+                raise TeamExecutionError(400, "worktree_failed", str(exc)) from exc
+            cwd, branch = worktree["cwd"], worktree["branch"]
+    if assignment.get("purpose") in ("prototype", "implementation") and cwd is None:
+        raise TeamExecutionError(409, "worktree_provenance_missing", "Editing assignment has no recorded worktree context")
+    token = secrets.token_urlsafe(32)
+    TEAM_CREDENTIALS[hashlib.sha256(token.encode("utf-8")).hexdigest()] = (run_id, participant["id"])
+    TEAM_DISPATCH_CONTEXT.token = token
+    TEAM_DISPATCH_CONTEXT.cwd = cwd
+    TEAM_DISPATCH_CONTEXT.participant_id = participant["id"]
+    TEAM_DISPATCH_CONTEXT.read_only = assignment.get("purpose") in ("research", "review")
+    try:
+        attempt = _team_executor(store).dispatch(run_id, assignment_id, request_id)
+    except Exception:
+        TEAM_CREDENTIALS.pop(hashlib.sha256(token.encode("utf-8")).hexdigest(), None)
+        raise
+    finally:
+        TEAM_DISPATCH_CONTEXT.token = TEAM_DISPATCH_CONTEXT.cwd = None
+        TEAM_DISPATCH_CONTEXT.participant_id = None
+        TEAM_DISPATCH_CONTEXT.read_only = False
+    task = lookup_task(attempt.get("task_id")) if attempt.get("task_id") else None
+    if not task or task.get("_team_token") != token:
+        TEAM_CREDENTIALS.pop(hashlib.sha256(token.encode("utf-8")).hexdigest(), None)
+    if attempt.get("task_id"):
+        store.record_dispatch_provenance(run_id, assignment_id, assignment["revision"], source, base,
+                                         branch=branch, worktree=cwd, after_seq=after_seq)
+    _drain()
+    return attempt
+
+
+def _refresh_team_run(store, run_id):
+    executor = _team_executor(store)
+    for attempt in store.list_attempts(run_id):
+        if attempt.get("status") in ("preparing", "queued", "running", "submission_unknown"):
+            updated = executor.refresh(run_id, attempt["id"])
+            if updated.get("status") in ("completed", "failed", "timed_out", "cancelled", "interrupted"):
+                task = lookup_task(updated.get("task_id")) if updated.get("task_id") else None
+                token = task.get("_team_token") if task else None
+                if token:
+                    TEAM_CREDENTIALS.pop(hashlib.sha256(token.encode("utf-8")).hexdigest(), None)
+
+
+def _team_reconcile_loop():
+    while not TEAM_RECONCILER_STOP.wait(2):
+        store = TEAM_STORE
+        if store is None:
+            continue
+        try:
+            for run in store.list_runs():
+                _refresh_team_run(store, run["id"])
+                _wake_team(store, run["id"])
+        except Exception:
+            logging.exception("team run reconciliation failed")
+            continue
+
+
+def _team_view(store, run_id, principal, owner):
+    view = store.main_view(run_id)
+    inbox = view.pop("inbox", {})
+    if owner:
+        view["inbox"] = inbox
+    else:
+        participant_id = principal[1]
+        view["inbox"] = {participant_id: inbox.get(participant_id, [])}
+        view["events"] = [event for event in view["events"]
+                           if event.get("actor") in (participant_id, "lead")
+                           or event.get("recipient") == participant_id]
+        # Dispatch provenance carries host paths for every assignment; only the
+        # owner's view spans the whole run.
+        view.pop("provenance", None)
+    return view
+
+
+def _create_task(request, _internal=False, _team_token=None, _team_cwd=None, _team_participant=None):
     """Validate one task request and enqueue it. Returns ``(status, body)``.
 
     Called by ``POST /v1/tasks``, so every task request is validated in one place.
@@ -2185,7 +2349,16 @@ def _create_task(request, _internal=False):
     refusal = _read_only_refusal(agent) if read_only else None
     if refusal:
         return 400, {"error": "read_only_unsupported", "message": refusal}
-    task_cwd, cwd_error = _resolve_task_cwd(agent, request.get("cwd"))
+    requested_cwd = request.get("cwd")
+    cwd_agent = agent
+    if _team_cwd is not None:
+        if requested_cwd is not None and os.path.realpath(requested_cwd) != os.path.realpath(_team_cwd):
+            return 400, {"error": "invalid_cwd", "message": "team worktree cwd is server selected"}
+        requested_cwd = _team_cwd
+        # The source checkout was checked against this agent's configured roots before worktree
+        # provisioning. Admit only the exact server-created worktree for this one child task.
+        cwd_agent = {**agent, "allowedRoots": [*(agent.get("allowedRoots") or []), _team_cwd]}
+    task_cwd, cwd_error = _resolve_task_cwd(cwd_agent, requested_cwd)
     if cwd_error:
         message = (f"cwd is not inside an allowed root for agent {agent['id']}"
                    if cwd_error == "cwd_not_allowed"
@@ -2273,6 +2446,12 @@ def _create_task(request, _internal=False):
             task["options"] = options
         if read_only:
             task["readOnly"] = True
+        if _team_token is not None:
+            if not isinstance(_team_token, str) or not _team_token:
+                return 500, {"error": "invalid_internal_team_token"}
+            task["_team_token"] = _team_token
+            task["_team_id"] = request.get("sessionId")
+            task["_team_participant_id"] = _team_participant
         role = active_role(agent)
         if role is not None:
             # The prompt text itself is never stored on the task: inputChars and the digest tell a
@@ -2354,6 +2533,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(value).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        self.send_header("cache-control", "no-store")
         if status >= 400:
             # An error may leave the request body unread; never parse it as a next request.
             self.close_connection = True
@@ -2390,11 +2570,20 @@ class Handler(BaseHTTPRequestHandler):
                 # The body is left unread, so drop the connection rather than parse it as a request.
                 self.close_connection = True
                 return self._json(403, {"error": "origin_not_allowed"})
-            if path.startswith("/v1/") and not self._authorized():
+            if path == "/board" or path.startswith("/board/"):
+                if method == "GET":
+                    return self._board_file(path)
+                return self._json(405, {"error": "method_not_allowed"})
+            principal = self._team_principal()
+            owner = self._authorized()
+            team_path = path == "/v1/teams" or path.startswith("/v1/teams/")
+            if path.startswith("/v1/") and not owner and principal is None:
                 self.close_connection = True
                 return self._json(401, {"error": "unauthorized",
                                         "message": unauthorized_message()},
                                   headers={"www-authenticate": "Bearer"})
+            if path.startswith("/v1/") and not owner and (not team_path or principal is None):
+                return self._json(403, {"error": "forbidden"})
             if path.startswith("/v1/"):
                 with LOCK:
                     _purge_expired()
@@ -2410,6 +2599,8 @@ class Handler(BaseHTTPRequestHandler):
                                             "revision": REVISION,
                                             "update": update_status(CHECKOUT_ROOT)})
                 return self._json(405, {"error": "method_not_allowed"})
+            if team_path:
+                return self._team_route(method, path, principal, owner, query)
             if path == "/v1/agents":
                 if method == "GET":
                     # Re-read the query with blank values kept, so "?tag=" names a tag no
@@ -2526,6 +2717,271 @@ class Handler(BaseHTTPRequestHandler):
         scheme, _, supplied = header.partition(" ")
         return scheme.lower() == "bearer" and hmac.compare_digest(
             supplied.strip().encode("utf-8"), TOKEN.encode("utf-8"))
+
+    def _team_principal(self):
+        header = self.headers.get("authorization") or ""
+        scheme, _, supplied = header.partition(" ")
+        if scheme.lower() != "bearer" or not supplied.strip():
+            return None
+        key = hashlib.sha256(supplied.strip().encode("utf-8")).hexdigest()
+        return TEAM_CREDENTIALS.get(key)
+
+    def _team_store(self):
+        global TEAM_STORE, TEAM_RECONCILER_STARTED, TEAM_RECOVERY_DONE
+        with LOCK:
+            if TEAM_STORE is None:
+                from teams import TeamStore
+                STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+                TEAM_STORE = TeamStore(STATE_DIR / "teams.sqlite3")
+            if not TEAM_RECONCILER_STARTED:
+                if not TEAM_RECOVERY_DONE:
+                    executor = _team_executor(TEAM_STORE)
+                    for existing in TEAM_STORE.list_runs():
+                        executor.recover(existing["id"])
+                    TEAM_RECOVERY_DONE = True
+                threading.Thread(target=_team_reconcile_loop, name="team-reconcile", daemon=True).start()
+                TEAM_RECONCILER_STARTED = True
+            return TEAM_STORE
+
+    def _board_file(self, path):
+        if path == "/board":
+            self.send_response(301)
+            self.send_header("location", "/board/")
+            self.send_header("cache-control", "no-store")
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        names = {"/board": "index.html", "/board/": "index.html",
+                 "/board/index.html": "index.html", "/board/board.css": "board.css",
+                 "/board/board.js": "board.js"}
+        name = names.get(path)
+        if name is None:
+            return self._json(404, {"error": "not_found"})
+        target = Path(__file__).resolve().parent / "team_board" / name
+        try:
+            body = target.read_bytes()
+        except FileNotFoundError:
+            return self._json(404, {"error": "not_found"})
+        content_type = "text/html; charset=utf-8" if name.endswith(".html") else (
+            "text/css; charset=utf-8" if name.endswith(".css") else "text/javascript; charset=utf-8")
+        self.send_response(200)
+        self.send_header("content-type", content_type)
+        self.send_header("cache-control", "no-store")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _team_route(self, method, path, principal, owner, query=None):
+        store = self._team_store()
+        if path == "/v1/teams":
+            if method == "GET":
+                if not owner:
+                    return self._json(403, {"error": "forbidden"})
+                return self._json(200, {"teams": store.list_runs()})
+            if method != "POST":
+                return self._json(405, {"error": "method_not_allowed"})
+            if not owner:
+                return self._json(403, {"error": "forbidden"})
+            error, body = self._read_json_body()
+            if error:
+                return self._json(error, body)
+            participants = body.get("participants")
+            if not isinstance(body.get("objective"), str) or not body["objective"].strip() or not isinstance(participants, list):
+                return self._json(400, {"error": "invalid_request", "message": "objective and participants are required"})
+            normalized = []
+            seen = set()
+            for item in participants:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    return self._json(400, {"error": "invalid_participant"})
+                agent_id = item.get("agentId", item["id"])
+                if not isinstance(agent_id, str):
+                    return self._json(400, {"error": "invalid_participant"})
+                if agent_id not in AGENTS:
+                    return self._json(400, {"error": "unknown_agent", "agentId": agent_id})
+                participant_id = item["id"]
+                if participant_id == "lead" or participant_id in seen:
+                    return self._json(400, {"error": "duplicate_participant", "participantId": participant_id})
+                seen.add(participant_id)
+                agent = AGENTS[agent_id]
+                normalized.append({"id": participant_id, "agentId": agent_id,
+                                   "role": item.get("role", "worker"),
+                                   "harness": agent.get("type"), "model": agent.get("model")})
+            try:
+                run = store.create_run(body["objective"], "lead", normalized, body.get("limits"))
+                return self._json(201, {"team": run})
+            except TeamError as error:
+                return self._team_error(error)
+        question_match = re.fullmatch(r"/v1/teams/([^/]+)/questions/([^/]+)", path)
+        question_id = question_match.group(2) if question_match else None
+        match = question_match or re.fullmatch(r"/v1/teams/([^/]+)(?:/([a-z]+))?", path)
+        if not match:
+            return self._json(404, {"error": "not_found"})
+        run_id = match.group(1)
+        action = "question_answer" if question_id else (match.group(2) if len(match.groups()) > 1 else None)
+        try:
+            run = store.get_run(run_id)
+        except TeamError as error:
+            return self._team_error(error)
+        if not owner and (principal is None or principal[0] != run_id):
+            return self._json(403, {"error": "forbidden"})
+        if action is None:
+            if method != "GET":
+                return self._json(405, {"error": "method_not_allowed"})
+            _refresh_team_run(store, run_id)
+            run = store.get_run(run_id)
+            return self._json(200, {"team": _team_view(store, run_id, principal, owner)})
+        if action == "credentials":
+            if method != "POST":
+                return self._json(405, {"error": "method_not_allowed"})
+            if not owner:
+                return self._json(403, {"error": "forbidden"})
+            error, body = self._read_json_body()
+            if error:
+                return self._json(error, body)
+            participant_id = body.get("participantId")
+            if not isinstance(participant_id, str) or participant_id not in {p["id"] for p in run["participants"]}:
+                return self._json(400, {"error": "invalid_participant"})
+            if participant_id == run["lead"]:
+                return self._json(400, {"error": "invalid_participant"})
+            # Minting is a replacement: any earlier credential for this participant
+            # stops working, so a leaked token does not outlive its rotation.
+            for key, scope in list(TEAM_CREDENTIALS.items()):
+                if scope == (run_id, participant_id):
+                    TEAM_CREDENTIALS.pop(key, None)
+            token = secrets.token_urlsafe(32)
+            TEAM_CREDENTIALS[hashlib.sha256(token.encode("utf-8")).hexdigest()] = (run_id, participant_id)
+            return self._json(201, {"participantId": participant_id, "token": token})
+        if action in ("attempts", "inbox", "summary", "questions", "artifacts") and method == "GET":
+            view = _team_view(store, run_id, principal, owner)
+            if action == "attempts":
+                return self._json(200, {"attempts": view["attempts"]})
+            if action == "inbox":
+                unread = (query or {}).get("unreadOnly", ["false"])[0]
+                if unread not in ("true", "false"):
+                    return self._json(400, {"error": "invalid_unread_only"})
+                recipient = "lead" if owner else principal[1]
+                return self._json(200, {"events": store.list_inbox(run_id, recipient, unread == "true")})
+            if action == "summary":
+                return self._json(200, {"summary": view["summary"]})
+            if action == "questions":
+                return self._json(200, {"questions": view["questions"]})
+            if action == "artifacts":
+                return self._json(200, {"artifacts": view["artifacts"]})
+        if action in ("assignments", "phase", "close", "reopen", "dispatch", "summary", "artifacts", "history", "question_answer") and not owner:
+            return self._json(403, {"error": "forbidden"})
+        if method != "POST":
+            return self._json(405, {"error": "method_not_allowed"})
+        error, body = self._read_json_body()
+        if error:
+            return self._json(error, body)
+        actor = "lead" if owner else principal[1]
+        try:
+            if action == "assignments":
+                participant_id = body.get("participantId")
+                if (not isinstance(participant_id, str)
+                        or participant_id not in {p["id"] for p in run["participants"]}
+                        or not isinstance(body.get("assignment"), str)
+                        or not isinstance(body.get("dependencies", []), list)
+                        or body.get("purpose", "implementation") not in ("research", "prototype", "implementation", "review")
+                        or any(not isinstance(value, str) for value in body.get("dependencies", []))):
+                    return self._json(400, {"error": "invalid_request"})
+                store.assign(run_id, actor, participant_id, body["assignment"],
+                             body.get("dependencies"), body.get("purpose", "implementation"))
+            elif action == "dispatch":
+                assignment_id, request_id = body.get("assignmentId"), body.get("requestId")
+                if not isinstance(assignment_id, str) or (request_id is not None and not isinstance(request_id, str)):
+                    return self._json(400, {"error": "invalid_request"})
+                assignment = next((item for item in run["assignments"] if item["id"] == assignment_id), None)
+                if assignment is None:
+                    return self._json(404, {"error": "assignment_not_found"})
+                editing = assignment.get("purpose") in ("prototype", "implementation")
+                if editing and (body.get("sourceRepo") is None or body.get("baseCommit") is None):
+                    return self._json(400, {"error": "worktree_required",
+                                            "message": "Editing assignments require sourceRepo and baseCommit"})
+                provenance = None
+                if body.get("sourceRepo") is not None or body.get("baseCommit") is not None:
+                    source = body.get("sourceRepo")
+                    base_commit = body.get("baseCommit")
+                    if not isinstance(source, str) or not os.path.isabs(source) or not isinstance(base_commit, str):
+                        return self._json(400, {"error": "invalid_worktree"})
+                    provenance = {"source_repo": source, "base_commit": base_commit}
+                try:
+                    attempt = _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance)
+                except TeamExecutionError as exc:
+                    return self._json(exc.status, {"error": exc.code, "message": exc.message})
+                return self._json(202 if attempt.get("status") in ("queued", "running", "preparing") else 200,
+                                  {"attempt": attempt})
+            elif action == "ack":
+                event_id = body.get("eventId")
+                if not isinstance(event_id, str):
+                    return self._json(400, {"error": "invalid_request"})
+                recipient = "lead" if owner else principal[1]
+                acknowledged = store.acknowledge_delivery(run_id, recipient, event_id)
+                return self._json(200, {"eventId": event_id, "acknowledged": acknowledged})
+            elif action == "summary":
+                if not isinstance(body.get("summary"), str):
+                    return self._json(400, {"error": "invalid_request"})
+                store.set_lead_summary(run_id, actor, body["summary"])
+            elif action == "artifacts":
+                if any(not isinstance(body.get(key), str) for key in ("kind", "title", "uri")):
+                    return self._json(400, {"error": "invalid_request"})
+                store.add_artifact(run_id, actor, body["kind"], body["title"], body["uri"])
+            elif action == "questions":
+                question = body.get("question")
+                if not isinstance(question, str):
+                    return self._json(400, {"error": "invalid_request"})
+                store.ask_user_question(run_id, actor, question)
+            elif action == "question_answer":
+                answer = body.get("answer")
+                if not isinstance(answer, str):
+                    return self._json(400, {"error": "invalid_request"})
+                store.resolve_user_question(run_id, actor, question_id, answer)
+            elif action == "history":
+                try:
+                    result = export_run_history(store, run_id, STATE_DIR / "team-history", TRUSTED_GIT)
+                    return self._json(200, result)
+                except TeamHistoryError as exc:
+                    return self._json(500, {"error": "history_export_failed", "message": str(exc)})
+            elif action == "messages":
+                optional_text = (body.get("threadId"), body.get("assignmentId"))
+                if (not isinstance(body.get("recipientId"), str) or not isinstance(body.get("body"), str)
+                        or any(value is not None and not isinstance(value, str) for value in optional_text)):
+                    return self._json(400, {"error": "invalid_request"})
+                store.post_message(run_id, actor, body.get("recipientId"), body.get("body"),
+                                   body.get("threadId"), body.get("assignmentId"), body.get("kind", "message"))
+                wake = _wake_team(store, run_id, body.get("recipientId"))
+                return self._json(200, {"ok": True, "wake": wake,
+                                        "team": _team_view(store, run_id, principal, owner)})
+            elif action == "conclusions":
+                if (any(not isinstance(body.get(key), str) for key in ("threadId", "summary", "rationale"))
+                        or (body.get("action") is not None and not isinstance(body.get("action"), str))
+                        or not isinstance(body.get("needsLead", False), bool)):
+                    return self._json(400, {"error": "invalid_request"})
+                store.conclude(run_id, actor, body.get("threadId"), body.get("summary"),
+                               body.get("rationale"), body.get("action"), body.get("needsLead", False))
+            elif action == "phase":
+                if (not isinstance(body.get("phase"), str)
+                        or (body.get("spec") is not None and not isinstance(body.get("spec"), str))
+                        or not isinstance(body.get("approved", False), bool)):
+                    return self._json(400, {"error": "invalid_request"})
+                store.set_phase(run_id, actor, body.get("phase"), body.get("spec"), body.get("approved", False))
+            elif action == "close":
+                if body.get("summary") is not None and not isinstance(body.get("summary"), str):
+                    return self._json(400, {"error": "invalid_request"})
+                store.close_run(run_id, actor, body.get("summary"))
+            elif action == "reopen":
+                if (not isinstance(body.get("phase"), str)
+                        or (body.get("summary") is not None and not isinstance(body.get("summary"), str))):
+                    return self._json(400, {"error": "invalid_request"})
+                store.reopen_run(run_id, actor, body["phase"], body.get("summary"))
+            else:
+                return self._json(404, {"error": "not_found"})
+            return self._json(200, {"ok": True, "team": _team_view(store, run_id, principal, owner)})
+        except TeamError as error:
+            return self._team_error(error)
+
+    def _team_error(self, error):
+        return self._json(error.status, {"error": error.code, "message": error.message})
 
     def _submit(self):
         error, payload = self._read_json_body()

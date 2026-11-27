@@ -188,7 +188,13 @@ class McpHandlerTests(unittest.TestCase):
                              ["check_updates", "prepare_feedback", "list_agents", "delegate", "wait_task", "get_task", "list_tasks",
                               "cancel_task", "run_workflow", "get_workflow",
                               "wait_workflow_events", "list_workflows", "cancel_workflow",
-                              "resume_workflow", "get_pressure"])
+                              "resume_workflow", "get_pressure", "create_team", "list_teams",
+                              "get_team", "assign_team_work", "post_team_message",
+                              "conclude_team_discussion", "set_team_phase", "close_team", "reopen_team",
+                              "dispatch_team_assignment", "get_team_inbox", "wait_team_messages", "ack_team_delivery",
+                              "get_team_attempts", "set_team_summary", "get_team_summary",
+                              "get_team_questions", "ask_team_user_question", "answer_team_user_question",
+                              "get_team_artifacts", "add_team_artifact", "export_team_history"])
             agents = handle({"method": "tools/call", "params": {"name": "list_agents", "arguments": {}}})
             self.assertEqual(agents["structuredContent"]["agents"][0]["id"], "fake")
             submitted = handle({"method": "tools/call", "params": {
