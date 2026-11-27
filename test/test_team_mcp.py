@@ -79,6 +79,14 @@ class TeamMcpTests(unittest.TestCase):
         self.assertEqual(self.calls[1][3], {"participantId": "worker", "assignment": "Implement the API"})
         self.assertEqual(self.calls[2][3], {"recipientId": "lead", "body": "I found a concern", "kind": "question"})
 
+    def test_reopen_team_requires_a_phase_and_posts_it(self):
+        with patch.dict(os.environ, {"AGENT_RELAY_TOKEN": "owner-secret"}):
+            self.call("reopen_team", {"teamId": "team-1", "phase": "review", "summary": "Follow-up"})
+            self.assertEqual(self.calls[0][1], "/v1/teams/team-1/reopen")
+            self.assertEqual(self.calls[0][3], {"phase": "review", "summary": "Follow-up"})
+            with self.assertRaises(mcp_server.RpcError):
+                self.call("reopen_team", {"teamId": "team-1"})
+
     def test_team_credential_never_authenticates_legacy_routes_and_no_mint_tool(self):
         with tempfile.TemporaryDirectory() as directory:
             token_file = os.path.join(directory, "token")

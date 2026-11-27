@@ -2,16 +2,10 @@
 import hashlib
 import os
 import re
-import subprocess
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - exercised on Windows
-    fcntl = None
-    import msvcrt
+import team_git
 
 
 _TIMEOUT = 20
@@ -23,23 +17,15 @@ class WorktreeError(RuntimeError):
 
 
 def _git(git_path, cwd, *args, allow=(0,), hooks_path=None):
-    if not isinstance(git_path, str) or not os.path.isabs(git_path) or not os.path.isfile(git_path) or not os.access(git_path, os.X_OK):
+    if team_git.executable(git_path) is None:
         raise WorktreeError("git_path must be an absolute path to an executable git")
-    env = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1",
-           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
-           "HOME": os.environ.get("HOME", "/")}
     try:
-        command = [git_path, "-C", str(cwd)]
-        if hooks_path is not None:
-            command.extend(("-c", "core.hooksPath={}".format(hooks_path)))
-        result = subprocess.run([*command, *args],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                timeout=_TIMEOUT, env=env, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise WorktreeError("git worktree operation failed: {}".format(exc)) from exc
-    if result.returncode not in allow:
-        detail = result.stderr.decode("utf-8", "replace").strip()
-        raise WorktreeError("git {} failed ({}): {}".format(args[0], result.returncode, detail))
+        result = team_git.run(git_path, cwd, *args, timeout=_TIMEOUT,
+                              allow=allow, hooks_path=hooks_path)
+    except team_git.GitCommandError as exc:
+        if exc.code is None:
+            raise WorktreeError("git worktree operation failed: {}".format(exc.detail)) from exc
+        raise WorktreeError("git {} failed ({}): {}".format(exc.command, exc.code, exc.detail)) from exc
     return result.returncode, result.stdout.decode("utf-8", "replace").strip()
 
 
@@ -54,31 +40,11 @@ def _owned_path(state_dir, run_id, participant_id):
 @contextmanager
 def _lock(state_dir):
     lock = Path(state_dir) / ".team-worktrees.lock"
-    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
-    deadline = time.monotonic() + _TIMEOUT
     try:
-        while True:
-            try:
-                if fcntl:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                else:  # pragma: no cover - exercised on Windows
-                    if os.fstat(fd).st_size == 0:
-                        os.write(fd, b"\0")
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                break
-            except (BlockingIOError, OSError):
-                if time.monotonic() >= deadline:
-                    raise WorktreeError("timed out waiting for team worktree lock")
-                time.sleep(0.05)
-        yield
-    finally:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        else:  # pragma: no cover - exercised on Windows
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        os.close(fd)
+        with team_git.exclusive_lock(lock, _TIMEOUT, "timed out waiting for team worktree lock"):
+            yield
+    except team_git.LockTimeout as exc:
+        raise WorktreeError(str(exc)) from exc
 
 
 def _common_dir(git_path, repo, hooks_path):

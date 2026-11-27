@@ -2,16 +2,11 @@
 import json
 import os
 import re
-import subprocess
 import tempfile
-import time
 from contextlib import contextmanager
 from pathlib import Path
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - exercised on Windows
-    fcntl = None
-    import msvcrt
+
+import team_git
 
 
 class TeamHistoryError(RuntimeError):
@@ -22,54 +17,27 @@ _GIT_TIMEOUT = 15
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
-def _env():
-    return {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
-            "HOME": os.environ.get("HOME", "/")}
-
-
 def _git(git_path, repo, *args):
-    if not os.path.isabs(git_path) or not os.path.isfile(git_path) or not os.access(git_path, os.X_OK):
+    if team_git.executable(git_path) is None:
         raise TeamHistoryError("git_path must be an absolute path to an executable git")
     try:
-        result = subprocess.run([git_path, "-C", str(repo), *args], stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, timeout=_GIT_TIMEOUT, env=_env(), check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise TeamHistoryError("git history operation failed: {}".format(exc)) from exc
-    if result.returncode:
-        detail = result.stderr.decode("utf-8", "replace").strip()
-        raise TeamHistoryError("git {} failed ({}): {}".format(args[0], result.returncode, detail))
+        result = team_git.run(git_path, repo, *args, timeout=_GIT_TIMEOUT)
+    except team_git.GitCommandError as exc:
+        if exc.code is None:
+            raise TeamHistoryError("git history operation failed: {}".format(exc.detail)) from exc
+        raise TeamHistoryError("git {} failed ({}): {}".format(exc.command, exc.code, exc.detail)) from exc
     return result.stdout.decode("utf-8", "strict").strip()
 
 
 @contextmanager
 def _repo_lock(repo):
     lock = repo.parent / (repo.name + ".export-lock")
-    deadline = time.monotonic() + _GIT_TIMEOUT
-    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        while True:
-            try:
-                if fcntl:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                else:
-                    if os.fstat(fd).st_size == 0:
-                        os.write(fd, b"\0")
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                break
-            except (BlockingIOError, OSError):
-                if time.monotonic() >= deadline:
-                    raise TeamHistoryError("timed out waiting for history export lock: {}".format(lock))
-                time.sleep(0.05)
-        yield
-    finally:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        else:  # pragma: no cover - exercised on Windows
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        os.close(fd)
+        with team_git.exclusive_lock(lock, _GIT_TIMEOUT,
+                                     "timed out waiting for history export lock: {}".format(lock)):
+            yield
+    except team_git.LockTimeout as exc:
+        raise TeamHistoryError(str(exc)) from exc
 
 
 def _decision(event):
@@ -107,11 +75,17 @@ def _records(run):
     if milestones:
         files[root + "milestones.json"] = (json.dumps(milestones, ensure_ascii=False, sort_keys=True,
                                                          indent=2, allow_nan=False) + "\n").encode("utf-8")
+    artifacts = [{"id": a["id"], "actor": a["actor"], "kind": a["kind"], "title": a["title"],
+                  "uri": a["uri"], "created": a["created"]}
+                 for a in run.get("artifacts", [])]
+    if artifacts:
+        files[root + "artifacts.json"] = (json.dumps(artifacts, ensure_ascii=False, sort_keys=True,
+                                                         indent=2, allow_nan=False) + "\n").encode("utf-8")
     return files
 
 
 def export_run_history(store, run_id, history_repo, git_path):
-    """Export specification, decisions and closure milestones; return SHA and paths.
+    """Export specification, decisions, artifacts and closure milestones; return SHA and paths.
 
     ``history_repo`` is the service's dedicated state location, separate from source
     checkouts. Operations are local Git init/add/commit only; this never pushes.
@@ -155,26 +129,20 @@ def export_run_history(store, run_id, history_repo, git_path):
             _git(git_path, repo, "rm", "--quiet", "--", *obsolete)
         # Never accidentally commit another run's pre-staged work.
         try:
-            staged = subprocess.run([git_path, "-C", str(repo), "diff", "--cached", "--name-only", "-z"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=_GIT_TIMEOUT,
-                                    env=_env(), check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise TeamHistoryError("git staged path check failed: {}".format(exc)) from exc
-        if staged.returncode:
-            raise TeamHistoryError("git staged path check failed: {}".format(staged.stderr.decode("utf-8", "replace").strip()))
+            staged = team_git.run(git_path, repo, "diff", "--cached", "--name-only", "-z",
+                                  timeout=_GIT_TIMEOUT)
+        except team_git.GitCommandError as exc:
+            raise TeamHistoryError("git staged path check failed: {}".format(exc.detail)) from exc
         prefix = "runs/{}/".format(run_id)
         staged_paths = staged.stdout.decode("utf-8", "surrogateescape").split("\0")
         unrelated = [path for path in staged_paths if path and not path.startswith(prefix)]
         if unrelated:
             raise TeamHistoryError("history repository has staged files outside this run: {}".format(", ".join(unrelated)))
         try:
-            diff = subprocess.run([git_path, "-C", str(repo), "diff", "--cached", "--quiet"],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                  timeout=_GIT_TIMEOUT, env=_env(), check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise TeamHistoryError("git staged diff failed: {}".format(exc)) from exc
-        if diff.returncode not in (0, 1):
-            raise TeamHistoryError("git staged diff failed: {}".format(diff.stderr.decode("utf-8", "replace").strip()))
+            diff = team_git.run(git_path, repo, "diff", "--cached", "--quiet",
+                                timeout=_GIT_TIMEOUT, allow=(0, 1))
+        except team_git.GitCommandError as exc:
+            raise TeamHistoryError("git staged diff failed: {}".format(exc.detail)) from exc
         changed = diff.returncode == 1
         if changed:
             _git(git_path, repo, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",

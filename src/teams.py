@@ -23,6 +23,13 @@ def _now():
     return time.time()
 
 
+# One source for the purpose-to-phase gate: the execution boundary imports
+# this map instead of repeating it.
+PURPOSE_PHASES = {"research": ("exploration", "specification", "review"),
+                  "prototype": ("prototype",), "implementation": ("build",),
+                  "review": ("build", "review")}
+
+
 class TeamStore:
     PHASES = {"exploration", "prototype", "specification", "build", "review", "complete"}
     DEFAULT_LIMITS = {"max_messages": 100, "max_concurrency": 4, "max_elapsed_seconds": 3600}
@@ -56,6 +63,7 @@ class TeamStore:
                 CREATE TABLE IF NOT EXISTS user_questions(event_id TEXT PRIMARY KEY, answer_event_id TEXT);
                 CREATE TABLE IF NOT EXISTS dispatch_provenance(run_id TEXT NOT NULL, assignment_id TEXT NOT NULL,
                     assignment_revision INTEGER NOT NULL, source_repo TEXT, base_commit TEXT,
+                    branch TEXT, worktree TEXT,
                     after_seq INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL,
                     PRIMARY KEY(run_id,assignment_id,assignment_revision));
             """)
@@ -72,7 +80,11 @@ class TeamStore:
             dcolumns = {r[1] for r in db.execute("PRAGMA table_info(dispatch_provenance)")}
             if "after_seq" not in dcolumns:
                 db.execute("ALTER TABLE dispatch_provenance ADD COLUMN after_seq INTEGER NOT NULL DEFAULT 0")
-            db.execute("PRAGMA user_version=5")
+            if "branch" not in dcolumns:
+                db.execute("ALTER TABLE dispatch_provenance ADD COLUMN branch TEXT")
+            if "worktree" not in dcolumns:
+                db.execute("ALTER TABLE dispatch_provenance ADD COLUMN worktree TEXT")
+            db.execute("PRAGMA user_version=6")
             db.execute("INSERT OR IGNORE INTO deliveries(event_id,recipient) SELECT id,recipient FROM events WHERE recipient IS NOT NULL")
             for row in db.execute("SELECT id,limits FROM runs"):
                 limits = json.loads(row["limits"])
@@ -183,6 +195,10 @@ class TeamStore:
                 participant["agentId"] = participant.pop("agent_id")
             r["assignments"] = [dict(a, dependencies=json.loads(a["dependencies"]), dependency_revisions=json.loads(a["dependency_revisions"])) for a in db.execute("SELECT * FROM assignments WHERE run_id=? ORDER BY updated,id", (run_id,))]
             r["events"] = [dict(e) for e in db.execute("SELECT * FROM events WHERE run_id=? ORDER BY seq", (run_id,))]
+            r["artifacts"] = [dict(a) for a in db.execute("SELECT * FROM artifacts WHERE run_id=? ORDER BY created,id", (run_id,))]
+            r["provenance"] = [dict(p) for p in db.execute(
+                "SELECT * FROM dispatch_provenance WHERE run_id=? ORDER BY created,assignment_id,assignment_revision",
+                (run_id,))]
             return r
 
     def assign(self, run_id, actor, participant_id, assignment, dependencies=None, purpose="implementation"):
@@ -275,9 +291,7 @@ class TeamStore:
                 raise TeamError(409, "stale_assignment", "Assignment changed; prepare a new attempt with its current revision")
             if assignment["purpose"] != purpose:
                 raise TeamError(409, "purpose_mismatch", "Attempt purpose must match the lead-assigned purpose")
-            required_phase = {"research": ("exploration", "specification", "review"),
-                              "prototype": ("prototype",), "implementation": ("build",),
-                              "review": ("build", "review")}[purpose]
+            required_phase = PURPOSE_PHASES[purpose]
             if run["phase"] not in required_phase:
                 raise TeamError(409, "phase_gate", "Run phase does not permit this assignment purpose")
             if purpose == "implementation" and not run["approved"]:
@@ -356,7 +370,8 @@ class TeamStore:
             return [self._present_attempt(dict(row)) for row in db.execute("SELECT * FROM attempts WHERE run_id=? ORDER BY created,id", (run_id,))]
 
     def record_dispatch_provenance(self, run_id, assignment_id, assignment_revision,
-                                   source_repo=None, base_commit=None, after_seq=0):
+                                   source_repo=None, base_commit=None, after_seq=0,
+                                   branch=None, worktree=None):
         self._require_ids(run_id=run_id, assignment_id=assignment_id)
         if not isinstance(assignment_revision, int) or isinstance(assignment_revision, bool) or assignment_revision < 1:
             raise TeamError(400, "invalid_provenance", "Assignment revision must be a positive integer")
@@ -368,6 +383,11 @@ class TeamStore:
             or any(c not in "0123456789abcdefABCDEF" for c in base_commit))
         if (source_repo is None) != (base_commit is None) or bad_repo or bad_commit:
             raise TeamError(400, "invalid_provenance", "Repository path and full base commit must be provided together")
+        if any(value is not None and (not isinstance(value, str) or not value.strip())
+               for value in (branch, worktree)):
+            raise TeamError(400, "invalid_provenance", "Branch and worktree must be nonempty strings")
+        if (branch is None) != (worktree is None):
+            raise TeamError(400, "invalid_provenance", "Branch and worktree must be provided together")
         with self._db() as db:
             self._run(db, run_id)
             assignment = db.execute("SELECT revision FROM assignments WHERE run_id=? AND id=?", (run_id, assignment_id)).fetchone()
@@ -378,16 +398,27 @@ class TeamStore:
             dispatched = db.execute("SELECT created FROM attempts WHERE run_id=? AND assignment_id=? AND assignment_revision=? AND task_id IS NOT NULL ORDER BY created DESC LIMIT 1", (run_id, assignment_id, assignment_revision)).fetchone()
             if not dispatched:
                 raise TeamError(409, "attempt_not_dispatched", "Dispatch provenance requires a recorded Relay task")
-            prior = db.execute("SELECT source_repo,base_commit,after_seq FROM dispatch_provenance WHERE run_id=? AND assignment_id=? AND assignment_revision=?", (run_id, assignment_id, assignment_revision)).fetchone()
+            prior = db.execute("SELECT * FROM dispatch_provenance WHERE run_id=? AND assignment_id=? AND assignment_revision=?", (run_id, assignment_id, assignment_revision)).fetchone()
             if prior:
                 if (prior["source_repo"], prior["base_commit"], prior["after_seq"]) != (source_repo, base_commit, after_seq):
                     raise TeamError(409, "provenance_conflict", "Dispatch context for this assignment revision is immutable")
+                stored_branch = prior["branch"] or branch
+                stored_worktree = prior["worktree"] or worktree
+                if ((prior["branch"] is not None and prior["branch"] != branch)
+                        or (prior["worktree"] is not None and prior["worktree"] != worktree)):
+                    raise TeamError(409, "provenance_conflict", "Dispatch context for this assignment revision is immutable")
+                if (stored_branch, stored_worktree) != (prior["branch"], prior["worktree"]):
+                    db.execute("UPDATE dispatch_provenance SET branch=?,worktree=? WHERE run_id=? AND assignment_id=? AND assignment_revision=?",
+                               (stored_branch, stored_worktree, run_id, assignment_id, assignment_revision))
                 return dict(run_id=run_id, assignment_id=assignment_id, assignment_revision=assignment_revision,
-                            source_repo=source_repo, base_commit=base_commit, after_seq=after_seq)
-            db.execute("INSERT INTO dispatch_provenance(run_id,assignment_id,assignment_revision,source_repo,base_commit,after_seq,created) VALUES(?,?,?,?,?,?,?)",
-                       (run_id, assignment_id, assignment_revision, source_repo, base_commit, after_seq, _now()))
+                            source_repo=source_repo, base_commit=base_commit, branch=stored_branch,
+                            worktree=stored_worktree, after_seq=after_seq)
+            db.execute("INSERT INTO dispatch_provenance(run_id,assignment_id,assignment_revision,source_repo,base_commit,branch,worktree,after_seq,created) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (run_id, assignment_id, assignment_revision, source_repo, base_commit, branch, worktree,
+                        after_seq, _now()))
             return dict(run_id=run_id, assignment_id=assignment_id, assignment_revision=assignment_revision,
-                        source_repo=source_repo, base_commit=base_commit, after_seq=after_seq)
+                        source_repo=source_repo, base_commit=base_commit, branch=branch,
+                        worktree=worktree, after_seq=after_seq)
 
     def get_dispatch_provenance(self, run_id, assignment_id, assignment_revision):
         self._require_ids(run_id=run_id, assignment_id=assignment_id)
@@ -417,13 +448,16 @@ class TeamStore:
             self._check_messages(db, run)
             if not db.execute("SELECT 1 FROM participants WHERE run_id=? AND id=?", (run_id, recipient_id)).fetchone():
                 raise TeamError(400, "invalid_recipient", "Recipient must be a participant in this run")
+            if assignment_id is not None and not db.execute(
+                    "SELECT 1 FROM assignments WHERE run_id=? AND id=?", (run_id, assignment_id)).fetchone():
+                raise TeamError(404, "assignment_not_found", "Assignment was not found in this run")
             if actor != run["lead"]:
                 own = db.execute("SELECT id FROM assignments WHERE run_id=? AND participant_id=?", (run_id, actor)).fetchone()
                 if thread_id:
                     participant = db.execute("SELECT 1 FROM events WHERE run_id=? AND thread_id=? AND (actor=? OR recipient=?)", (run_id, thread_id, actor, actor)).fetchone()
                     if not participant:
                         raise TeamError(403, "not_in_thread", "Workers may reply only in threads they started or were addressed in")
-                elif not own or (assignment_id is not None and assignment_id != own[0]):
+                elif not own or assignment_id != own[0]:
                     raise TeamError(403, "assignment_required", "Workers must start a thread tied to their assignment")
             if thread_id and not db.execute("SELECT 1 FROM events WHERE run_id=? AND (id=? OR thread_id=?)", (run_id, thread_id, thread_id)).fetchone():
                 raise TeamError(404, "thread_not_found", "Thread was not found in this run")
@@ -475,6 +509,26 @@ class TeamStore:
                 raise TeamError(403, "lead_required", "Only the stored lead may close the run")
             db.execute("UPDATE runs SET closed=1,phase='complete',updated=? WHERE id=?", (_now(), run_id))
             self._event(db, run_id, "closed", actor, summary or "")
+
+    def reopen_run(self, run_id, actor, phase, summary=None):
+        """Reopen a closed run for an explicitly requested follow-up."""
+        self._require_ids(run_id=run_id, actor=actor)
+        if not isinstance(phase, str) or phase not in self.PHASES or phase == "complete":
+            raise TeamError(400, "invalid_phase", "Reopen requires a supported working phase")
+        if summary is not None and not isinstance(summary, str):
+            raise TeamError(400, "invalid_summary", "Reopen summary must be a string")
+        with self._db() as db:
+            run = self._run(db, run_id)
+            self._actor(db, run, actor)
+            if actor != run["lead"]:
+                raise TeamError(403, "lead_required", "Only the stored lead may reopen the run")
+            if not run["closed"]:
+                raise TeamError(409, "run_open", "Only a closed run can be reopened")
+            if phase == "build" and not run["approved"]:
+                raise TeamError(409, "spec_not_approved", "Build requires an approved specification")
+            db.execute("UPDATE runs SET closed=0,phase=?,updated=? WHERE id=?", (phase, _now(), run_id))
+            self._event(db, run_id, "reopened", actor, json.dumps({"phase": phase, "summary": summary}))
+        return self.get_run(run_id)
 
     def list_inbox(self, run_id, recipient, unread_only=False):
         self._require_ids(run_id=run_id, recipient=recipient)
@@ -557,9 +611,15 @@ class TeamStore:
         answered = {e["thread_id"] for e in events if e["kind"] == "user_answer"}
         run["questions"] = [{**e, "pending": True} for e in events
                             if e["kind"] == "user_question" and e["id"] not in answered]
-        run["artifacts"] = []
-        run["attempts"] = self.list_attempts(run_id)
-        run["inbox"] = {p["id"]: self.list_inbox(run_id, p["id"]) for p in run["participants"]}
         with self._db() as db:
-            run["artifacts"] = [dict(a) for a in db.execute("SELECT * FROM artifacts WHERE run_id=? ORDER BY created,id", (run_id,))]
+            run["attempts"] = [self._present_attempt(dict(row)) for row in db.execute(
+                "SELECT * FROM attempts WHERE run_id=? ORDER BY created,id", (run_id,))]
+            inbox = {p["id"]: [] for p in run["participants"]}
+            for row in db.execute(
+                    "SELECT e.*, d.acknowledged, d.recipient AS delivery_recipient "
+                    "FROM deliveries d JOIN events e ON e.id=d.event_id "
+                    "WHERE e.run_id=? ORDER BY e.seq", (run_id,)):
+                delivery = dict(row)
+                inbox.setdefault(delivery.pop("delivery_recipient"), []).append(delivery)
+            run["inbox"] = inbox
             return run

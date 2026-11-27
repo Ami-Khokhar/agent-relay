@@ -9,7 +9,7 @@ import json
 import time
 import uuid
 
-from teams import TeamError
+from teams import PURPOSE_PHASES, TeamError
 
 
 class TeamExecutionError(Exception):
@@ -33,11 +33,10 @@ class TeamExecutor:
     and assignment revision before returning.
     """
 
-    def __init__(self, store, create_task, lookup_task, cancel_task=None, clock=time.time):
+    def __init__(self, store, create_task, lookup_task, clock=time.time):
         self.store = store
         self.create_task = create_task
         self.lookup_task = lookup_task
-        self.cancel_task = cancel_task
         self.clock = clock
 
     def dispatch(self, run_id, assignment_id, request_id=None):
@@ -67,10 +66,7 @@ class TeamExecutor:
         if run["closed"]:
             raise TeamExecutionError(409, "run_closed", "Closed team runs cannot dispatch work")
         purpose = assignment.get("purpose", "implementation")
-        allowed_phases = {"research": ("exploration", "specification", "review"),
-                          "prototype": ("prototype",), "implementation": ("build",),
-                          "review": ("build", "review")}
-        if run["phase"] not in allowed_phases.get(purpose, ()):
+        if run["phase"] not in PURPOSE_PHASES.get(purpose, ()):
             raise TeamExecutionError(409, "phase_gate", "Run phase does not permit this assignment purpose")
         if purpose == "implementation" and not run["approved"]:
             raise TeamExecutionError(409, "spec_not_approved", "Implementation requires an approved specification")
@@ -167,19 +163,6 @@ class TeamExecutor:
                     continue
                 outcomes.append(self.refresh(run_id, attempt["id"]))
         return outcomes
-
-    def cancel(self, run_id, attempt_id):
-        if self.cancel_task is None:
-            raise TeamExecutionError(501, "cancellation_unavailable", "Task cancellation is not configured")
-        attempt = self._attempt(run_id, attempt_id)
-        if attempt.get("task_id"):
-            task = self.lookup_task(attempt["task_id"])
-            if task is None:
-                return self.refresh(run_id, attempt_id)
-            self.cancel_task(task)
-            return self.refresh(run_id, attempt_id)
-        self.store.record_attempt_result(run_id, attempt_id, "cancelled", {"error": "cancelled_before_submission"})
-        return self._attempt(run_id, attempt_id)
 
     def _check_elapsed(self, run):
         maximum = run.get("limits", {}).get("max_elapsed_seconds")

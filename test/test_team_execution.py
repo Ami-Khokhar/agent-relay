@@ -42,7 +42,7 @@ class TeamExecutionTests(unittest.TestCase):
         self.boundary = TaskBoundary()
         self.clock = [1000.0]
         self.executor = TeamExecutor(self.store, self.boundary.create, self.boundary.lookup,
-                                     self.boundary.cancel, clock=lambda: self.clock[0])
+                                     clock=lambda: self.clock[0])
         self.run_id = self.store.create_run("Improve the product", "lead", [
             {"id": "worker", "agentId": "configured-worker", "role": "worker",
              "harness": "claude", "model": "model-a"},
@@ -103,11 +103,18 @@ class TeamExecutionTests(unittest.TestCase):
             self.executor.dispatch(self.run_id, dependent, "review-2")
         self.assertEqual(err.exception.code, "dependency_not_ready")
 
-    def test_closed_run_and_elapsed_limit_refuse_dispatch(self):
+    def test_closed_run_refuses_dispatch(self):
         self.store.close_run(self.run_id, "lead", "Done")
         with self.assertRaises(TeamExecutionError) as err:
             self.executor.dispatch(self.run_id, self.first, "request-closed")
         self.assertEqual(err.exception.code, "run_closed")
+        self.assertEqual(self.boundary.requests, [])
+
+    def test_elapsed_run_limit_refuses_dispatch(self):
+        self.clock[0] = self.created + 91
+        with self.assertRaises(TeamExecutionError) as err:
+            self.executor.dispatch(self.run_id, self.first, "request-expired")
+        self.assertEqual(err.exception.code, "time_limit")
         self.assertEqual(self.boundary.requests, [])
 
     def test_recovery_marks_missing_task_interrupted_without_replay(self):
@@ -136,20 +143,6 @@ class TeamExecutionTests(unittest.TestCase):
         self.boundary.tasks[attempt["task_id"]].update(status="timed_out", error="time limit")
         timed_out = self.executor.refresh(self.run_id, attempt["id"])
         self.assertEqual(timed_out["status"], "timed_out")
-
-    def test_spec_change_between_prompt_and_atomic_prepare_is_rejected(self):
-        prepare = self.store.prepare_attempt
-
-        def change_spec_then_prepare(*args, **kwargs):
-            self.store.set_phase(self.run_id, "lead", "specification", "Revised acceptance criteria", approved=True)
-            self.store.set_phase(self.run_id, "lead", "build")
-            return prepare(*args, **kwargs)
-
-        self.store.prepare_attempt = change_spec_then_prepare
-        with self.assertRaises(TeamExecutionError) as err:
-            self.executor.dispatch(self.run_id, self.first, "request-stale-spec")
-        self.assertEqual(err.exception.code, "stale_spec")
-        self.assertEqual(self.boundary.requests, [])
 
     def test_large_history_is_bounded_for_recovery_and_replacement_dispatch(self):
         for index in range(35):

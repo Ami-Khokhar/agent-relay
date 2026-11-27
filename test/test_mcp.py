@@ -190,7 +190,7 @@ class McpHandlerTests(unittest.TestCase):
                               "wait_workflow_events", "list_workflows", "cancel_workflow",
                               "resume_workflow", "get_pressure", "create_team", "list_teams",
                               "get_team", "assign_team_work", "post_team_message",
-                              "conclude_team_discussion", "set_team_phase", "close_team",
+                              "conclude_team_discussion", "set_team_phase", "close_team", "reopen_team",
                               "dispatch_team_assignment", "get_team_inbox", "wait_team_messages", "ack_team_delivery",
                               "get_team_attempts", "set_team_summary", "get_team_summary",
                               "get_team_questions", "ask_team_user_question", "answer_team_user_question",

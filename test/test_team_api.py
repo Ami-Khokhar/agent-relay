@@ -131,6 +131,27 @@ class TeamAPI(unittest.TestCase):
         self.assertEqual(self.call("GET", "/v1/teams/%s" % first, token=token)[0], 401)
         self.assertEqual(self.call("GET", "/v1/teams", token="owner-secret")[1]["teams"][0]["id"], first)
 
+    def test_minting_replaces_the_participants_previous_credential(self):
+        run_id = self.create_team()
+        first = self.credential(run_id)
+        second = self.credential(run_id)
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.call("GET", "/v1/teams/%s" % run_id, token=first)[0], 401)
+        self.assertEqual(self.call("GET", "/v1/teams/%s" % run_id, token=second)[0], 200)
+
+    def test_reopen_is_owner_only_and_requires_a_working_phase(self):
+        run_id = self.create_team()
+        token = self.credential(run_id)
+        self.assertEqual(self.call("POST", "/v1/teams/%s/close" % run_id, body={})[0], 200)
+        self.assertEqual(self.call("POST", "/v1/teams/%s/reopen" % run_id, token=token,
+                                   body={"phase": "review"})[0], 403)
+        self.assertEqual(self.call("POST", "/v1/teams/%s/reopen" % run_id, body={})[0], 400)
+        self.assertEqual(self.call("POST", "/v1/teams/%s/reopen" % run_id,
+                                   body={"phase": "complete"})[0], 400)
+        status, reopened = self.call("POST", "/v1/teams/%s/reopen" % run_id, body={"phase": "review"})
+        self.assertEqual(status, 200, reopened)
+        self.assertFalse(reopened["team"]["closed"])
+
     def test_board_static_allowlist_is_same_origin_read_only_and_not_cached(self):
         status, page = self.call("GET", "/board/")
         self.assertEqual(status, 200)

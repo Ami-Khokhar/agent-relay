@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 import sys
-import time
+from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from teams import TeamError, TeamStore
 
@@ -57,6 +57,42 @@ class TeamTests(unittest.TestCase):
     with self.assertRaises(TeamError) as err:
         store.post_message(rid, "worker-a", "worker-b", "Unrelated thread", thread_id="made-up")
     self.assertEqual(err.exception.code, "not_in_thread")
+
+ def test_worker_thread_start_requires_own_existing_assignment(self):
+    store, rid = team(self.path())
+    store.assign(rid, "lead", "worker-a", "Implement")
+    with self.assertRaises(TeamError) as err:
+        store.post_message(rid, "worker-a", "worker-b", "Starting up")
+    assert (err.exception.status, err.exception.code) == (403, "assignment_required")
+    with self.assertRaises(TeamError) as err:
+        store.post_message(rid, "worker-a", "worker-b", "Starting up", assignment_id="unknown")
+    assert (err.exception.status, err.exception.code) == (404, "assignment_not_found")
+    with self.assertRaises(TeamError) as err:
+        store.post_message(rid, "worker-b", "worker-a", "Starting without an assignment")
+    assert (err.exception.status, err.exception.code) == (403, "assignment_required")
+    aid = store.get_run(rid)["assignments"][0]["id"]
+    event = store.post_message(rid, "worker-a", "worker-b", "Starting up", assignment_id=aid)
+    stored = next(e for e in store.get_run(rid)["events"] if e["id"] == event)
+    assert stored["assignment_id"] == aid and stored["thread_id"] == event
+
+ def test_reopen_is_lead_only_and_keeps_the_approval_gate(self):
+    store, rid = team(self.path())
+    store.set_phase(rid, "lead", "specification", "Acceptance: works", approved=True)
+    store.close_run(rid, "lead", "Delivered")
+    with self.assertRaises(TeamError) as err:
+        store.reopen_run(rid, "worker-a", "build")
+    assert err.exception.code == "lead_required"
+    reopened = store.reopen_run(rid, "lead", "build", "Follow-up request")
+    assert reopened["closed"] is False and reopened["phase"] == "build"
+    assert reopened["events"][-1]["kind"] == "reopened"
+    with self.assertRaises(TeamError) as err:
+        store.reopen_run(rid, "lead", "build")
+    assert err.exception.code == "run_open"
+    other, other_id = team(self.path())
+    other.close_run(other_id, "lead")
+    with self.assertRaises(TeamError) as err:
+        other.reopen_run(other_id, "lead", "build")
+    assert err.exception.code == "spec_not_approved"
 
 
  def test_addressed_thread_conclusion_records_rationale(self):
@@ -111,10 +147,10 @@ class TeamTests(unittest.TestCase):
     self.assertEqual(err.exception.code, "invalid_limits")
     store = TeamStore(self.path())
     rid = store.create_run("goal", "lead", [], {"max_elapsed_seconds": 1})["id"]
-    with store._db() as db:
-        db.execute("UPDATE runs SET created=? WHERE id=?", (time.time() - 2, rid))
-    with self.assertRaises(TeamError) as err:
-        store.set_phase(rid, "lead", "prototype")
+    created = store.get_run(rid)["created"]
+    with mock.patch("teams._now", return_value=created + 2):
+        with self.assertRaises(TeamError) as err:
+            store.set_phase(rid, "lead", "prototype")
     self.assertEqual(err.exception.code, "time_limit")
     store.close_run(rid, "lead", "Stopped after limit")
     self.assertTrue(store.get_run(rid)["closed"])

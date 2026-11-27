@@ -43,6 +43,22 @@ class AttemptTests(unittest.TestCase):
             self.store.prepare_attempt(self.run_id, self.aid, "new", "prompt", 1)
         self.assertEqual(err.exception.code, "stale_assignment")
 
+    def test_dispatch_provenance_records_branch_and_worktree(self):
+        attempt = self.prepare()
+        self.store.record_attempt_submission(self.run_id, attempt["id"], "task-1", "queued")
+        worktree = os.path.join(self.temp.name, "worktree")
+        self.store.record_dispatch_provenance(
+            self.run_id, self.aid, 1, os.path.abspath(self.temp.name), "a" * 40, 5,
+            branch="relay/team/abc/def", worktree=worktree)
+        saved = self.store.get_dispatch_provenance(self.run_id, self.aid, 1)
+        self.assertEqual((saved["branch"], saved["worktree"]), ("relay/team/abc/def", worktree))
+        self.assertEqual(self.store.get_run(self.run_id)["provenance"][0]["worktree"], worktree)
+        with self.assertRaises(TeamError) as err:
+            self.store.record_dispatch_provenance(
+                self.run_id, self.aid, 1, os.path.abspath(self.temp.name), "a" * 40, 5,
+                branch="relay/team/other/branch", worktree=worktree)
+        self.assertEqual(err.exception.code, "provenance_conflict")
+
     def test_preparation_rejects_spec_changed_since_prompt_was_built(self):
         expected = hashlib.sha256(b"acceptance").hexdigest()
         self.store.set_phase(self.run_id, "lead", "specification", "changed and reapproved", approved=True)

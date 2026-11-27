@@ -1,12 +1,15 @@
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from src.team_history import TeamHistoryError, export_run_history
-from src.teams import TeamStore
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+from team_history import TeamHistoryError, export_run_history
+from teams import TeamStore
 
 
 class TeamHistoryTests(unittest.TestCase):
@@ -27,12 +30,16 @@ class TeamHistoryTests(unittest.TestCase):
         self.store.set_phase(run["id"], "lead", "specification", "Approved design", approved=True)
         thread = self.store.post_message(run["id"], "lead", "worker", "PRIVATE TRANSCRIPT bearer_secret")
         self.store.conclude(run["id"], "lead", thread, "Choose local storage", "It is durable", action="implement")
+        self.store.add_artifact(run["id"], "lead", "review", "Review evidence", "https://local.example/review")
         result = export_run_history(self.store, run["id"], self.repo, self.git)
 
         self.assertTrue(result["changed"])
         self.assertEqual(len(result["commit"]), 40)
         self.assertIn("runs/{}/specification.md".format(run["id"]), result["paths"])
         self.assertIn("runs/{}/decisions.json".format(run["id"]), result["paths"])
+        self.assertIn("runs/{}/artifacts.json".format(run["id"]), result["paths"])
+        artifacts = json.loads((self.repo / "runs" / run["id"] / "artifacts.json").read_text())
+        self.assertEqual([item["title"] for item in artifacts], ["Review evidence"])
         shown = subprocess.check_output([self.git, "-C", str(self.repo), "show", result["commit"]], text=True)
         self.assertIn("Approved design", shown)
         self.assertIn("Choose local storage", shown)

@@ -3,8 +3,8 @@ import hashlib
 import sys
 import tempfile
 import threading
-import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from team_execution import TeamExecutor
@@ -137,10 +137,10 @@ class TeamWakeTests(unittest.TestCase):
     def test_elapsed_run_limit_stops_wake(self):
         self.record_prior_dispatch()
         self.message()
-        with self.store._db() as db:
-            db.execute("UPDATE runs SET created=? WHERE id=?", (time.time() - 4000, self.run_id))
+        created = self.store.get_run(self.run_id)["created"]
         wake = TeamWake(self.store, lambda *args: self.fail("expired run dispatched"))
-        self.assertEqual(wake.wake(self.run_id)[0]["reason"], "time_limit")
+        with mock.patch("team_wake.time.time", return_value=created + 4000):
+            self.assertEqual(wake.wake(self.run_id)[0]["reason"], "time_limit")
 
 
 if __name__ == "__main__":

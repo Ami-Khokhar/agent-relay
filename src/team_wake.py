@@ -31,6 +31,10 @@ class TeamWake:
         if participant_id is not None:
             participants &= {participant_id}
         results = []
+        attempts = self.store.list_attempts(run_id)
+        by_request = {attempt["request_id"]: attempt for attempt in attempts}
+        active_by_assignment = {attempt["assignment_id"]: attempt for attempt in attempts
+                                if attempt["status"] in ACTIVE}
         for recipient in sorted(participants):
             assignment = assignments.get(recipient)
             if not assignment:
@@ -44,14 +48,11 @@ class TeamWake:
                 if event["kind"] not in DISCUSSION_KINDS or event["seq"] <= provenance["after_seq"]:
                     continue
                 request_id = self._request_id(run_id, assignment["id"], revision, event["id"])
-                existing = next((a for a in self.store.list_attempts(run_id)
-                                 if a["request_id"] == request_id), None)
+                existing = by_request.get(request_id)
                 if existing:
                     results.append(self._result(event, assignment, "skipped", "already_processed", existing))
                     continue
-                active = next((a for a in self.store.list_attempts(run_id)
-                               if a["assignment_id"] == assignment["id"]
-                               and a["status"] in ACTIVE), None)
+                active = active_by_assignment.get(assignment["id"])
                 if active:
                     results.append(self._result(event, assignment, "skipped", "assignment_active", active))
                     break

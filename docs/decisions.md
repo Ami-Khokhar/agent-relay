@@ -273,10 +273,13 @@ The team-board specification expands task delegation into ongoing collaboration.
 The user's existing harness remains the lead conversation. Workers can propose,
 question, challenge, and conclude within addressed discussions, but only the lead
 changes assignments and scope. Participant capabilities are bound to a stored run
-and identity; a client-provided actor or role cannot grant authority. The board's
-worker conversation panel is read-only, and questions for the user pass through
-the lead. Consequence: peer disagreement is useful evidence rather than a second
-chain of command, and a worker credential cannot use legacy owner APIs.
+and identity; a client-provided actor or role cannot grant authority, and minting
+again for a participant replaces the earlier capability, so rotation revokes a
+leaked token. Only the lead reopens a closed run, and reopening names the working
+phase rather than restoring an implied one. The board's worker conversation panel
+is read-only, and questions for the user pass through the lead. Consequence: peer
+disagreement is useful evidence rather than a second chain of command, and a
+worker credential cannot use legacy owner APIs.
 
 ## Team coordination is durable; Git records selected project milestones
 
@@ -284,10 +287,10 @@ Ordinary delegated tasks remain in memory for compatibility. Team runs use local
 SQLite transactions for assignments, discussions, and execution records. A durable
 dispatch intent precedes process submission; an interrupted intent is reconciled
 without blindly repeating effects. Git export writes selected specifications,
-decisions, and milestones into a dedicated private local repository. It does not
-push or commit a raw conversation for every message. Consequence: live coordination
-can recover independently of Git export, while accepted project records remain
-retrievable at explicit commit revisions.
+decisions, recorded artifacts, and milestones into a dedicated private local
+repository. It does not push or commit a raw conversation for every message.
+Consequence: live coordination can recover independently of Git export, while
+accepted project records remain retrievable at explicit commit revisions.
 
 ## Session replacement is explicit and editing workers have separate worktrees
 
@@ -295,9 +298,11 @@ The existing adapter protocol does not establish native harness session continui
 A subsequent execution receives relevant recorded context and is represented as a
 replacement, never as proof of native memory. Editing workers use verified linked
 Git worktrees derived from an allowed source repository and explicit base commit;
-the lead coordinates integration. Existing worktrees are verified and preserved,
-not reset. Consequence: harness differences remain visible and concurrent edits
-stay attributable without moving the user's source checkout.
+the branch, worktree path, source repository, and base revision are recorded with
+the dispatch, while resulting commits and review evidence stay lead-authored
+artifacts. The lead coordinates integration. Existing worktrees are verified and
+preserved, not reset. Consequence: harness differences remain visible and
+concurrent edits stay attributable without moving the user's source checkout.
 
 ## Addressed follow-ups use a durable sequence watermark and bounded defaults
 

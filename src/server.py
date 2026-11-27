@@ -2166,7 +2166,7 @@ def _internal_create_task(request):
 def _team_executor(store):
     global TEAM_EXECUTOR
     if TEAM_EXECUTOR is None or TEAM_EXECUTOR.store is not store:
-        TEAM_EXECUTOR = TeamExecutor(store, _team_create_child, lookup_task, cancel_task=cancel_task)
+        TEAM_EXECUTOR = TeamExecutor(store, _team_create_child, lookup_task)
     return TEAM_EXECUTOR
 
 
@@ -2216,6 +2216,7 @@ def _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance
     if agent is None:
         raise TeamExecutionError(409, "agent_not_configured", "Assignment participant has no configured agent")
     cwd = None
+    branch = None
     source, base = None, None
     if provenance:
         source, base = provenance.get("source_repo"), provenance.get("base_commit")
@@ -2227,9 +2228,10 @@ def _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance
             if not any(_within(root, source) for root in roots):
                 raise TeamExecutionError(403, "source_repo_not_allowed", "Recorded source repository is outside configured roots")
             try:
-                cwd = provision_edit_worktree(source, STATE_DIR, run_id, participant["id"], base, TRUSTED_GIT)["cwd"]
+                worktree = provision_edit_worktree(source, STATE_DIR, run_id, participant["id"], base, TRUSTED_GIT)
             except WorktreeError as exc:
                 raise TeamExecutionError(400, "worktree_failed", str(exc)) from exc
+            cwd, branch = worktree["cwd"], worktree["branch"]
     if assignment.get("purpose") in ("prototype", "implementation") and cwd is None:
         raise TeamExecutionError(409, "worktree_provenance_missing", "Editing assignment has no recorded worktree context")
     token = secrets.token_urlsafe(32)
@@ -2252,7 +2254,7 @@ def _team_dispatch_callback(store, run_id, assignment_id, request_id, provenance
         TEAM_CREDENTIALS.pop(hashlib.sha256(token.encode("utf-8")).hexdigest(), None)
     if attempt.get("task_id"):
         store.record_dispatch_provenance(run_id, assignment_id, assignment["revision"], source, base,
-                                         after_seq=after_seq)
+                                         branch=branch, worktree=cwd, after_seq=after_seq)
     _drain()
     return attempt
 
@@ -2294,6 +2296,9 @@ def _team_view(store, run_id, principal, owner):
         view["events"] = [event for event in view["events"]
                            if event.get("actor") in (participant_id, "lead")
                            or event.get("recipient") == participant_id]
+        # Dispatch provenance carries host paths for every assignment; only the
+        # owner's view spans the whole run.
+        view.pop("provenance", None)
     return view
 
 
@@ -2838,6 +2843,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "invalid_participant"})
             if participant_id == run["lead"]:
                 return self._json(400, {"error": "invalid_participant"})
+            # Minting is a replacement: any earlier credential for this participant
+            # stops working, so a leaked token does not outlive its rotation.
+            for key, scope in list(TEAM_CREDENTIALS.items()):
+                if scope == (run_id, participant_id):
+                    TEAM_CREDENTIALS.pop(key, None)
             token = secrets.token_urlsafe(32)
             TEAM_CREDENTIALS[hashlib.sha256(token.encode("utf-8")).hexdigest()] = (run_id, participant_id)
             return self._json(201, {"participantId": participant_id, "token": token})
@@ -2857,7 +2867,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"questions": view["questions"]})
             if action == "artifacts":
                 return self._json(200, {"artifacts": view["artifacts"]})
-        if action in ("assignments", "phase", "close", "dispatch", "summary", "artifacts", "history", "question_answer") and not owner:
+        if action in ("assignments", "phase", "close", "reopen", "dispatch", "summary", "artifacts", "history", "question_answer") and not owner:
             return self._json(403, {"error": "forbidden"})
         if method != "POST":
             return self._json(405, {"error": "method_not_allowed"})
@@ -2959,6 +2969,11 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("summary") is not None and not isinstance(body.get("summary"), str):
                     return self._json(400, {"error": "invalid_request"})
                 store.close_run(run_id, actor, body.get("summary"))
+            elif action == "reopen":
+                if (not isinstance(body.get("phase"), str)
+                        or (body.get("summary") is not None and not isinstance(body.get("summary"), str))):
+                    return self._json(400, {"error": "invalid_request"})
+                store.reopen_run(run_id, actor, body["phase"], body.get("summary"))
             else:
                 return self._json(404, {"error": "not_found"})
             return self._json(200, {"ok": True, "team": _team_view(store, run_id, principal, owner)})

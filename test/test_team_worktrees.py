@@ -2,11 +2,13 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from src.team_worktrees import WorktreeError, provision_edit_worktree
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+from team_worktrees import WorktreeError, provision_edit_worktree
 
 
 class TeamWorktreeTests(unittest.TestCase):
